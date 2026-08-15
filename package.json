@@ -1,0 +1,40 @@
+{
+  "name": "chatgpt-coding-ide",
+  "version": "0.3.0",
+  "description": "A local-first Electron IDE companion for exchanging Git patches with ChatGPT.",
+  "main": "src/main/app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "check": "node scripts/check.js",
+    "dist": "electron-builder --dir"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "build": {
+    "appId": "dev.patchwork.chatgpt-coding",
+    "productName": "Patchwork IDE",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "category": "Development"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}

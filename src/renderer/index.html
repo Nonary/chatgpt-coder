@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'"
+    />
+    <title>Patchwork IDE</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">P</div>
+          <div>
+            <strong>Patchwork</strong>
+            <span>ChatGPT patch bridge</span>
+          </div>
+        </div>
+
+        <button id="new-task-button" class="primary wide">＋ New task</button>
+        <button id="chatgpt-session-button" class="sidebar-session-button wide">
+          <span>◉</span> ChatGPT session
+        </button>
+        <button id="source-control-button" class="sidebar-session-button wide">
+          <span>⑂</span> Source control <small id="source-count" class="nav-count hidden">0</small>
+        </button>
+
+        <div class="side-heading">Recent tasks</div>
+        <nav id="task-list" class="task-list" aria-label="Recent tasks">
+          <p class="muted small">No tasks yet.</p>
+        </nav>
+
+        <div class="privacy-note">
+          <span class="privacy-dot"></span>
+          Source stays local until you upload a task package in ChatGPT.
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">LOCAL WORKSPACE</p>
+            <h1 id="page-title">Prepare a coding task</h1>
+          </div>
+          <div id="connection-pill" class="pill"><span></span> Ready</div>
+        </header>
+
+        <section id="session-view" class="session-view hidden">
+          <div class="session-browser-frame browser-frame">
+            <div class="browser-toolbar">
+              <div class="browser-controls">
+                <button id="session-back-button" title="Back" aria-label="Back">←</button>
+                <button id="session-forward-button" title="Forward" aria-label="Forward">→</button>
+                <button id="session-reload-button" title="Reload" aria-label="Reload">↻</button>
+              </div>
+              <div class="browser-location">
+                <span id="session-status-dot"></span>
+                <strong id="session-browser-title">ChatGPT</strong>
+                <small id="session-browser-status">Sign in here before creating a task</small>
+              </div>
+              <button id="session-new-chat-button" class="secondary browser-new-chat">＋ New chat</button>
+            </div>
+            <div id="session-chatgpt-surface" class="chatgpt-surface">
+              <div class="browser-placeholder">
+                <strong>Loading ChatGPT…</strong>
+                <span>Sign in here once; Patchwork will reuse this session for every task.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="source-view" class="source-view hidden">
+          <div class="source-layout">
+            <aside class="source-panel">
+              <div class="source-repository-header">
+                <select id="source-repository-select" aria-label="Source control repository"></select>
+                <button id="source-add-repository" class="icon-button" title="Add repository">＋</button>
+                <button id="source-refresh" class="icon-button" title="Refresh">↻</button>
+                <button id="source-remove-repository" class="icon-button" title="Remove from workspace">×</button>
+              </div>
+              <div id="source-branch" class="source-branch">No repository selected</div>
+
+              <div class="commit-box">
+                <label class="sr-only" for="source-commit-message">Commit message</label>
+                <textarea id="source-commit-message" rows="3" placeholder="Commit message"></textarea>
+                <button id="source-commit-button" class="primary wide">Commit staged changes</button>
+              </div>
+
+              <section class="change-section">
+                <div class="change-heading">
+                  <strong>Staged changes</strong>
+                  <span id="staged-count">0</span>
+                  <button id="unstage-all-button" title="Unstage all">−</button>
+                </div>
+                <div id="staged-files" class="git-file-list"></div>
+              </section>
+
+              <section class="change-section">
+                <div class="change-heading">
+                  <strong>Changes</strong>
+                  <span id="unstaged-count">0</span>
+                  <button id="stage-all-button" title="Stage all">＋</button>
+                </div>
+                <div id="unstaged-files" class="git-file-list"></div>
+              </section>
+
+              <section class="change-section history-section">
+                <div class="change-heading"><strong>Recent commits</strong></div>
+                <div id="commit-history" class="commit-history"></div>
+              </section>
+            </aside>
+
+            <div class="diff-panel">
+              <div class="diff-toolbar">
+                <div>
+                  <strong id="diff-title">Select a changed file</strong>
+                  <small id="diff-subtitle">Its diff will appear here.</small>
+                </div>
+                <span id="diff-kind" class="diff-kind hidden"></span>
+              </div>
+              <pre id="diff-content" class="diff-content"><code>No file selected.</code></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="composer-view" class="content-grid hidden">
+          <div class="main-column">
+            <article class="card">
+              <div class="card-heading">
+                <div>
+                  <span class="step-number">1</span>
+                  <h2>Choose repositories</h2>
+                </div>
+                <button id="add-repository-button" class="secondary">Add repositories</button>
+              </div>
+              <p class="card-copy">Committed repositories are bundled directly. Local changes and brand-new repositories are captured in an isolated snapshot without modifying your working tree.</p>
+              <div id="repository-list" class="repository-list empty-state">
+                <div class="empty-icon">⌘</div>
+                <strong>No repositories selected</strong>
+                <span>Add one or more Git repositories to begin.</span>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-heading">
+                <div>
+                  <span class="step-number">2</span>
+                  <h2>Describe the change</h2>
+                </div>
+              </div>
+              <label class="sr-only" for="task-text">Software task</label>
+              <textarea
+                id="task-text"
+                rows="9"
+                placeholder="For example: Add keyboard navigation to the command palette, update the tests, and document the shortcuts."
+              ></textarea>
+              <label class="toggle-row">
+                <input id="auto-apply" type="checkbox" checked />
+                <span class="toggle"><span></span></span>
+                <span>
+                  <strong>Apply automatically after validation</strong>
+                  <small>The app verifies task identity, base commits, and every patch before changing files.</small>
+                </span>
+              </label>
+            </article>
+
+            <button id="create-task-button" class="primary launch-button">
+              Prepare and submit with ChatGPT <span>↗</span>
+            </button>
+          </div>
+
+          <aside class="guide-card">
+            <p class="eyebrow">HOW IT WORKS</p>
+            <ol>
+              <li><span>1</span><div><strong>Snapshot</strong><small>Git bundles preserve the exact starting commits.</small></div></li>
+              <li><span>2</span><div><strong>Hand off</strong><small>You use the normal ChatGPT website and your own account.</small></div></li>
+              <li><span>3</span><div><strong>Wait</strong><small>Patchwork watches for the named result download.</small></div></li>
+              <li><span>4</span><div><strong>Validate and apply</strong><small>Unsafe, stale, or conflicting patches are stopped.</small></div></li>
+            </ol>
+            <div class="boundary-note">
+              <strong>Visible browser boundary</strong>
+              <p>Patchwork never calls ChatGPT’s private APIs or reads authentication cookies.</p>
+            </div>
+          </aside>
+        </section>
+
+        <section id="task-view" class="task-view hidden">
+          <div class="embedded-shell">
+            <aside class="embedded-controls">
+              <article class="card compact-status">
+                <div class="status-heading">
+                  <p class="eyebrow">TASK STATUS</p>
+                  <div id="status-badge" class="status-badge prepared">Prepared</div>
+                </div>
+                <h2 id="task-status-title">Package prepared</h2>
+                <p id="task-status-copy">The embedded browser is ready to receive this task.</p>
+              </article>
+
+              <article class="card handoff-card">
+                <div class="card-heading"><div><span class="step-number">1</span><h2>Automated handoff</h2></div></div>
+                <p class="automation-copy">Patchwork uploads the task package, injects the instructions, and submits a new chat through the page you can see.</p>
+                <button id="submit-task-button" class="primary wide">Submit automatically</button>
+                <div class="handoff-actions secondary-actions">
+                  <button id="copy-prompt-button" class="secondary">Copy prompt</button>
+                  <button id="reveal-package-button" class="secondary">Show package</button>
+                  <button id="import-result-button" class="secondary">Import result</button>
+                </div>
+                <div class="boundary-note browser-boundary">
+                  <strong>Browser-level automation</strong>
+                  <p>Only DOM injection and Chromium file-input controls are used. Network requests and login credentials are not intercepted.</p>
+                </div>
+              </article>
+
+              <article id="result-card" class="card hidden">
+                <div class="card-heading"><div><span class="step-number">2</span><h2>Validated changes</h2></div></div>
+                <p id="result-summary" class="result-copy"></p>
+                <div id="patch-list" class="patch-list"></div>
+                <div class="result-actions">
+                  <button id="apply-button" class="primary">Apply changes</button>
+                  <button id="rollback-button" class="danger hidden">Roll back</button>
+                </div>
+              </article>
+
+              <article class="card activity-card">
+                <p class="eyebrow">ACTIVITY</p>
+                <div id="activity-list" class="activity-list"></div>
+              </article>
+            </aside>
+
+            <div class="browser-frame">
+              <div class="browser-toolbar">
+                <div class="browser-controls">
+                  <button id="browser-back-button" title="Back" aria-label="Back">←</button>
+                  <button id="browser-forward-button" title="Forward" aria-label="Forward">→</button>
+                  <button id="browser-reload-button" title="Reload" aria-label="Reload">↻</button>
+                </div>
+                <div class="browser-location">
+                  <span id="browser-status-dot"></span>
+                  <strong id="browser-title">ChatGPT</strong>
+                  <small id="browser-status">Embedded session</small>
+                </div>
+                <button id="new-chat-button" class="secondary browser-new-chat">＋ New chat</button>
+              </div>
+              <div id="chatgpt-surface" class="chatgpt-surface">
+                <div class="browser-placeholder">
+                  <strong>Loading ChatGPT…</strong>
+                  <span>Your signed-in browser session will appear here.</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div id="toast" class="toast hidden" role="status"></div>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
