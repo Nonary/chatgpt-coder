@@ -83,6 +83,18 @@ function registerIpc() {
     return gitService.addRepositories(response.filePaths);
   });
 
+  ipcMain.handle('attachments:choose', async () => {
+    const response = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose task attachments',
+      properties: ['openFile', 'multiSelections'],
+    });
+    if (response.canceled) return [];
+    return response.filePaths.map((filePath) => ({
+      name: path.basename(filePath),
+      path: filePath,
+    }));
+  });
+
   ipcMain.handle('workspace:list', async () => gitService.listRepositories());
   ipcMain.handle('workspace:remove', async (_event, repositoryPath) => gitService.removeRepository(repositoryPath));
   ipcMain.handle('git:status', async (_event, repositoryPath) => gitService.status(repositoryPath));

@@ -88,8 +88,23 @@ The commit message first line must follow Conventional Commits: \`type(optional-
 `;
 }
 
-function buildHandoffPrompt(taskId, taskText) {
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.\n\nTask summary:\n${taskText}`;
+function buildHandoffPrompt(taskId, taskText, attachments = []) {
+  const attachmentNote = attachments.length
+    ? `\n\nI also attached these user-provided files for task context: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
+    : '';
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}\n\nTask summary:\n${taskText}`;
+}
+
+function uniqueAttachmentName(filename, usedNames) {
+  const parsed = path.parse(filename);
+  let candidate = filename;
+  let suffix = 2;
+  while (usedNames.has(candidate.toLowerCase())) {
+    candidate = `${parsed.name} (${suffix})${parsed.ext}`;
+    suffix += 1;
+  }
+  usedNames.add(candidate.toLowerCase());
+  return candidate;
 }
 
 function addStoredLocalFile(zip, localPath, archiveDirectory) {
@@ -162,6 +177,25 @@ class TaskService {
     const taskDir = this.taskDirectory(taskId);
     const bundlesDir = path.join(taskDir, 'repositories');
     await fs.mkdir(bundlesDir, { recursive: true });
+
+    const attachments = [];
+    const requestedAttachments = Array.isArray(input.attachments) ? input.attachments : [];
+    if (requestedAttachments.length > 0) {
+      const attachmentsDir = path.join(taskDir, 'attachments');
+      const usedNames = new Set();
+      await fs.mkdir(attachmentsDir, { recursive: true });
+      for (const item of requestedAttachments) {
+        const sourcePath = typeof item === 'string' ? item : item?.path;
+        if (!sourcePath) throw new Error('Choose a valid attachment file.');
+        const resolvedPath = await fs.realpath(sourcePath);
+        const stat = await fs.stat(resolvedPath);
+        if (!stat.isFile()) throw new Error(`Task attachment is not a file: ${sourcePath}`);
+        const name = uniqueAttachmentName(path.basename(resolvedPath), usedNames);
+        const attachmentPath = path.join(attachmentsDir, name);
+        await fs.copyFile(resolvedPath, attachmentPath);
+        attachments.push({ name, path: attachmentPath, size: stat.size });
+      }
+    }
 
     const conflictPatchFiles = [];
     if (input.conflictContext) {
@@ -287,7 +321,8 @@ class TaskService {
       resultFilename: `chatgpt-ide-result-${taskId}.txt`,
       sourceRepositoryPath: input.tree?.repositoryPath || null,
       packagePath,
-      handoffPrompt: buildHandoffPrompt(taskId, taskText),
+      attachments,
+      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments),
       repositories: taskRepositories,
       state: 'prepared',
       result: null,

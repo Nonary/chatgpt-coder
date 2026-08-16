@@ -37,9 +37,9 @@ Patchwork keeps task records in its local data directory after a task finishes a
 
 1. Patchwork opens directly to the embedded ChatGPT session. Sign in there before creating a task; the persistent session is reused afterward.
 2. Choose **New task**, then create a coding tree from one clean, committed Git repository or attach the task to an existing tree.
-3. Describe the software task. Every task opens a fresh chat, including follow-ups on the same tree.
+3. Describe the software task and optionally select local reference files. Patchwork copies those attachments into the task record so they remain available for submission. Every task opens a fresh chat, including follow-ups on the same tree.
 4. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, and the coding tree's full-history Git bundle under `repositories/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
-5. Patchwork opens a fresh chat inside the same embedded browser, injects the instructions, attaches the ZIP package, and clicks ChatGPT's Send button.
+5. Patchwork opens a fresh chat inside the same embedded browser, injects the instructions, attaches the ZIP package plus any user-selected reference files, waits for the attachments to finish processing, and clicks ChatGPT's Send button.
 6. ChatGPT follows the embedded protocol and attaches `chatgpt-ide-result-<task-id>.txt`, containing a marked `PATCHWORK_RESULT_V1` JSON envelope with base64-encoded `git diff --binary` patches. The envelope is not printed in the chat.
 7. Patchwork's application-level monitor activates that exact download, reads the text file locally, verifies the task ID, repository set, base commits, size limits, base64 integrity, and Conventional Commit message, then applies and commits the patch inside the coding tree. If the tree's `HEAD` advanced, Patchwork first tries a clean contextual apply and then Git's three-way merge.
 8. When **Merge tree** is chosen, Patchwork opens another fresh ChatGPT chat with the tree's commit history and diff summary. It reads the returned merge envelope, creates one squash commit on the original branch through a temporary integration worktree, and removes the coding tree.

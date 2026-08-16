@@ -9,6 +9,7 @@ const state = {
   selectedGitPath: null,
   selectedDiffKey: null,
   diffTabs: [],
+  attachments: [],
 };
 
 const elements = Object.fromEntries(
@@ -19,6 +20,7 @@ const elements = Object.fromEntries(
     'history-view', 'task-history-button', 'task-history-count', 'task-history-list',
     'task-history-search', 'task-history-state',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
+    'add-attachment-button', 'attachment-list',
     'task-tree-select', 'new-tree-fields', 'tree-name',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
@@ -112,6 +114,28 @@ function renderRepositories() {
     button.addEventListener('click', () => {
       state.repositories = state.repositories.filter((item) => item.id !== button.dataset.repositoryId);
       renderRepositories();
+    });
+  });
+}
+
+function renderAttachments() {
+  const container = elements['attachment-list'];
+  if (state.attachments.length === 0) {
+    container.className = 'attachment-list attachment-empty';
+    container.innerHTML = '<span>No task attachments selected.</span>';
+    return;
+  }
+  container.className = 'attachment-list';
+  container.innerHTML = state.attachments.map((attachment) => `
+    <div class="attachment-row">
+      <div class="attachment-icon">↥</div>
+      <div class="attachment-info"><strong>${escapeHtml(attachment.name)}</strong><span>${escapeHtml(attachment.path)}</span></div>
+      <button class="remove-attachment" data-attachment-path="${escapeHtml(attachment.path)}" aria-label="Remove ${escapeHtml(attachment.name)}">×</button>
+    </div>`).join('');
+  container.querySelectorAll('.remove-attachment').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.attachments = state.attachments.filter((item) => item.path !== button.dataset.attachmentPath);
+      renderAttachments();
     });
   });
 }
@@ -240,9 +264,26 @@ function formatElapsed(startedAt, now = Date.now()) {
 }
 
 function updateTaskElapsedTimes() {
-  elements['task-list'].querySelectorAll('.task-elapsed[data-started-at]').forEach((element) => {
+  document.querySelectorAll('.task-elapsed[data-started-at]').forEach((element) => {
     element.textContent = formatElapsed(element.dataset.startedAt);
   });
+}
+
+function taskStateLabel(task) {
+  const labels = {
+    prepared: 'Prepared',
+    submitted: 'Running',
+    ready: 'Waiting to apply',
+    applied: 'Applied',
+    'rolled-back': 'Rolled back',
+    failed: 'Needs attention',
+  };
+  return labels[task.state] || task.state;
+}
+
+function taskElapsedMarkup(task) {
+  if (task.state !== 'submitted' || !task.submittedAt) return '';
+  return `<time class="task-elapsed" data-started-at="${escapeHtml(task.submittedAt)}">${escapeHtml(formatElapsed(task.submittedAt))}</time>`;
 }
 
 function renderTaskList() {
@@ -252,8 +293,11 @@ function renderTaskList() {
   elements['task-list'].innerHTML = recentTasks.length
     ? recentTasks.map((task) => `
       <button class="task-nav-item ${state.activeTask?.taskId === task.taskId ? 'active' : ''}" data-task-id="${escapeHtml(task.taskId)}">
-        <strong>${escapeHtml(taskLabel(task))}</strong>
-        <span>${escapeHtml(task.state)} · ${escapeHtml(formatTime(task.createdAt))}</span>
+        <span class="task-name-row">
+          <strong>${escapeHtml(taskLabel(task))}</strong>
+          ${taskElapsedMarkup(task)}
+        </span>
+        <span class="task-state-row ${escapeHtml(task.state)}">${escapeHtml(taskStateLabel(task))} · ${escapeHtml(formatTime(task.createdAt))}</span>
       </button>`).join('') + (state.tasks.length > recentTasks.length
       ? `<button id="task-list-more" class="task-list-more">View all ${state.tasks.length} tasks</button>`
       : '')
@@ -310,7 +354,7 @@ function renderTaskHistory() {
           <strong>${escapeHtml(taskLabel(task))}</strong>
           <small>${escapeHtml(formatDateTime(task.createdAt))} · ${escapeHtml(context)}</small>
         </div>
-        <span class="history-state ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>
+        <span class="history-state ${escapeHtml(task.state)}">${escapeHtml(taskStateLabel(task))}${taskElapsedMarkup(task)}</span>
       </div>
       <p class="task-history-description">${escapeHtml(task.taskText || 'Untitled task')}</p>
       <div class="task-history-result">
@@ -342,8 +386,8 @@ function renderTaskHistory() {
 
 const statusText = {
   prepared: ['Package prepared', 'Attach the package in ChatGPT and send the copied instructions.'],
-  submitted: ['Task submitted', 'ChatGPT is working in the embedded browser. Patchwork is watching for the result.'],
-  ready: ['Patch validated', 'The plain-text result matches the task and is safe to commit.'],
+  submitted: ['Task is running', 'ChatGPT is still working in the embedded browser. Patchwork is actively watching for the result.'],
+  ready: ['Waiting to apply', 'The plain-text result is validated and waiting for you to apply it.'],
   applied: ['Changes committed', 'The validated patch is committed in this task’s coding tree.'],
   'rolled-back': ['Changes reverted', 'A revert commit was created in this task’s coding tree.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
@@ -380,10 +424,13 @@ function showTask(task) {
   const [title, copy] = statusText[task.state] || statusText.prepared;
   elements['task-status-title'].textContent = title;
   elements['task-status-copy'].textContent = task.error || copy;
-  elements['status-badge'].textContent = task.state;
+  elements['status-badge'].textContent = taskStateLabel(task);
   elements['status-badge'].className = `status-badge ${task.state}`;
   addActivity(`Task ${task.state}`, task.updatedAt || task.createdAt);
   addActivity(`${task.repositories.length} repository snapshot${task.repositories.length === 1 ? '' : 's'} prepared`, task.createdAt);
+  if (task.attachments?.length) {
+    addActivity(`${task.attachments.length} task attachment${task.attachments.length === 1 ? '' : 's'} prepared`, task.createdAt);
+  }
   renderResult(task);
   renderTaskList();
   window.patchwork.setBrowserVisible(true);
@@ -505,6 +552,18 @@ async function chooseRepositories() {
   } catch (error) {
     showToast(error.message, true);
     return [];
+  }
+}
+
+async function chooseAttachments() {
+  try {
+    const selected = await window.patchwork.chooseAttachments();
+    const byPath = new Map(state.attachments.map((item) => [item.path, item]));
+    for (const attachment of selected) byPath.set(attachment.path, attachment);
+    state.attachments = [...byPath.values()];
+    renderAttachments();
+  } catch (error) {
+    showToast(error.message, true);
   }
 }
 
@@ -809,7 +868,10 @@ async function createTask() {
       autoApply: true,
       treeId: elements['task-tree-select'].value || null,
       treeName: elements['tree-name'].value,
+      attachments: state.attachments,
     });
+    state.attachments = [];
+    renderAttachments();
     upsertTask(task);
     await refreshTrees();
     showTask(task);
@@ -858,6 +920,7 @@ elements['trees-new-task'].addEventListener('click', () => {
 });
 elements['task-tree-select'].addEventListener('change', renderTaskTreeOptions);
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
+elements['add-attachment-button'].addEventListener('click', chooseAttachments);
 elements['create-task-button'].addEventListener('click', createTask);
 elements['submit-task-button'].addEventListener('click', () => runTaskAction(window.patchwork.submitTask, 'Task submitted.'));
 elements['copy-prompt-button'].addEventListener('click', () => runTaskAction(window.patchwork.copyPrompt, 'Instructions copied.'));
@@ -916,6 +979,7 @@ window.addEventListener('resize', syncBrowserBounds);
 window.addEventListener('scroll', syncBrowserBounds, true);
 new ResizeObserver(syncBrowserBounds).observe(elements['chatgpt-surface']);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
+setInterval(updateTaskElapsedTimes, 1_000);
 
 window.patchwork.onTaskEvent((event) => {
   if (event.task) upsertTask(event.task);

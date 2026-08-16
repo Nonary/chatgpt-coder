@@ -230,6 +230,16 @@
                 rows="9"
                 placeholder="For example: Add keyboard navigation to the command palette, update the tests, and document the shortcuts."
               ></textarea>
+              <div class="attachment-picker">
+                <div>
+                  <strong>Task attachments</strong>
+                  <small>Optional files are uploaded to ChatGPT with the Patchwork task package before the message is sent.</small>
+                </div>
+                <button id="add-attachment-button" class="secondary" type="button">Upload attachment</button>
+              </div>
+              <div id="attachment-list" class="attachment-list attachment-empty">
+                <span>No task attachments selected.</span>
+              </div>
               <label class="toggle-row always-on">
                 <input id="auto-apply" type="checkbox" checked disabled />
                 <span class="toggle"><span></span></span>

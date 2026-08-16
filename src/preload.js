@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('patchwork', {
   chooseRepositories: () => ipcRenderer.invoke('repositories:choose'),
+  chooseAttachments: () => ipcRenderer.invoke('attachments:choose'),
   listWorkspaceRepositories: () => ipcRenderer.invoke('workspace:list'),
   removeWorkspaceRepository: (repositoryPath) => ipcRenderer.invoke('workspace:remove', repositoryPath),
   gitStatus: (repositoryPath) => ipcRenderer.invoke('git:status', repositoryPath),

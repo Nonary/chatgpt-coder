@@ -97,6 +97,30 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
 });
 
+test('task attachments are copied into task storage and named in the handoff prompt', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-attachments-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const attachmentPath = path.join(root, 'requirements.txt');
+  await fs.writeFile(attachmentPath, 'reference context\n');
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Use the attached requirements while changing the greeting.',
+    repositories: [repository],
+    attachments: [{ name: 'requirements.txt', path: attachmentPath }],
+  });
+
+  assert.equal(task.attachments.length, 1);
+  assert.equal(task.attachments[0].name, 'requirements.txt');
+  assert.notEqual(task.attachments[0].path, attachmentPath);
+  assert.equal(await fs.readFile(task.attachments[0].path, 'utf8'), 'reference context\n');
+  assert.match(task.handoffPrompt, /requirements\.txt/);
+  assert.match(task.handoffPrompt, /user-provided files/i);
+});
+
 test('dirty repositories keep their full history and capture unstaged files as a task tip', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-working-snapshot-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -396,6 +420,28 @@ test('opening a task loads its saved ChatGPT conversation', async () => {
     view.openTaskConversation({ ...task, conversationUrl: 'https://example.com/not-chatgpt' }),
     /invalid saved ChatGPT conversation URL/,
   );
+});
+
+test('ChatGPT thinking dialogs are not treated as request-limit notices', () => {
+  let clicked = false;
+  const closeButton = {
+    textContent: '',
+    disabled: false,
+    getAttribute: (name) => (name === 'aria-label' ? 'Close' : null),
+    click: () => { clicked = true; },
+  };
+  const thinkingModal = {
+    textContent: 'Thinking details Usage limit reached for deep research Close',
+    querySelectorAll: () => [closeButton],
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => (selector.includes('[role="dialog"]') ? [thinkingModal] : []),
+  };
+
+  const result = vm.runInNewContext(buildLimitNoticeDismissalScript(), { document });
+  assert.equal(result.dismissed, false);
+  assert.equal(clicked, false);
 });
 
 test('ChatGPT request-limit dialogs are recognized and dismissed without broad clicking', () => {
@@ -1024,6 +1070,20 @@ test('task upload reuses an attachment that is already in the composer', async (
 
   assert.equal(await ChatGPTView.prototype.uploadPackage.call(view, '/tasks/already-attached.txt'), true);
   assert.equal(debuggerAccessed, false);
+});
+
+test('task attachments upload after the package and before ChatGPT is sent', async () => {
+  const uploads = [];
+  const view = {
+    uploadPackage: async (filePath) => uploads.push(filePath),
+  };
+
+  await ChatGPTView.prototype.uploadAttachments.call(view, [
+    { path: '/tasks/context.png' },
+    '/tasks/specification.pdf',
+  ]);
+
+  assert.deepEqual(uploads, ['/tasks/context.png', '/tasks/specification.pdf']);
 });
 
 test('task result detection accepts only the requested text attachment after generation stops', () => {

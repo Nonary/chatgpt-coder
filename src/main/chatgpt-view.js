@@ -62,7 +62,6 @@ function buildLimitNoticeDismissalScript() {
       exactModal,
       ...document.querySelectorAll([
         '[role="alertdialog"]',
-        '[role="dialog"]',
         '[role="alert"]',
         '[data-sonner-toast]',
         '[data-testid*="toast"]',
@@ -622,6 +621,15 @@ class ChatGPTView {
     await this.waitForPackageAttachment(path.basename(packagePath));
   }
 
+  async uploadAttachments(attachments = []) {
+    for (const attachment of attachments) {
+      const attachmentPath = typeof attachment === 'string' ? attachment : attachment?.path;
+      if (!attachmentPath) continue;
+      await this.uploadPackage(attachmentPath);
+    }
+    return true;
+  }
+
   async packageAttachmentStatus(filename, dismissDuplicateNotice = false) {
     return this.view.webContents.executeJavaScript(`(() => {
       const filename = ${JSON.stringify(filename)};
@@ -744,6 +752,7 @@ class ChatGPTView {
     }
     await this.injectPrompt(task.handoffPrompt);
     await this.uploadPackage(task.packagePath);
+    await ChatGPTView.prototype.uploadAttachments.call(this, task.attachments);
     await this.clickSend();
     const conversationUrl = await this.waitForConversationUrl();
     if (!conversationUrl) {
