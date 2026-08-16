@@ -427,7 +427,7 @@ test('ChatGPT request-limit dialogs are recognized and dismissed without broad c
   assert.equal(clicked, true);
 });
 
-test('a downloaded text result validates and applies automatically', async (context) => {
+test('a downloaded text result file validates and applies automatically', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
@@ -457,9 +457,12 @@ test('a downloaded text result validates and applies automatically', async (cont
   assert.equal(parsePlainTextResult(responseText).taskId, task.taskId);
 
   const results = new ResultService(tasks);
-  const current = await results.ingestText(task.taskId, responseText);
+  const downloadedPath = path.join(root, task.resultFilename);
+  await fs.writeFile(downloadedPath, responseText);
+  const current = await results.ingestTextFile(task.taskId, downloadedPath);
   assert.equal(current.state, 'applied');
   assert.equal(current.result.transport, 'plain-text-base64');
+  assert.equal(current.result.downloadedPath, downloadedPath);
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'plain text result\n');
 });
 
@@ -1050,6 +1053,43 @@ test('task result detection accepts only the requested text attachment after gen
     },
   });
   assert.equal(visibleEnvelopeOnly.kind, 'none');
+});
+
+test('task result detection clicks ChatGPT’s download control instead of opening its file preview', () => {
+  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
+  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
+  let previewOpened = false;
+  let downloaded = false;
+  const download = {
+    disabled: false,
+    getAttribute: () => null,
+    scrollIntoView: () => {},
+    click: () => { downloaded = true; },
+  };
+  const row = {
+    parentElement: null,
+    querySelectorAll: () => [download],
+  };
+  const preview = {
+    parentElement: row,
+    getAttribute: (name) => (name === 'aria-label' ? resultFilename : null),
+    textContent: resultFilename,
+    scrollIntoView: () => {},
+    click: () => { previewOpened = true; },
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => {
+      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [preview, download];
+      if (selector === '*') return [];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildTaskResultDetectionScript(taskId), { document });
+  assert.equal(result.kind, 'download');
+  assert.equal(downloaded, true);
+  assert.equal(previewOpened, false);
 });
 
 test('merge result detection accepts the requested text file after generation stops', () => {

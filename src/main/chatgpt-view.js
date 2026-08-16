@@ -124,9 +124,28 @@ function buildTaskResultDetectionScript(taskId) {
       return label.includes(expected);
     });
     if (!match) return { kind: 'none' };
-    match.scrollIntoView({ block: 'center', inline: 'center' });
-    match.click();
-    return { kind: 'download', label: String(match.textContent || match.getAttribute('aria-label') || '').trim() };
+    let control = match;
+    let container = match;
+    for (let depth = 0; container && depth < 6; depth += 1, container = container.parentElement) {
+      const download = [...(container.querySelectorAll?.([
+        'a[download]',
+        'button[aria-label="Download file"]',
+        'button[aria-label="Download"]',
+        '[role="button"][aria-label="Download file"]',
+      ].join(', ')) || [])].find((element) => (
+        element !== match && !element.disabled && element.getAttribute('aria-disabled') !== 'true'
+      ));
+      if (download) {
+        control = download;
+        break;
+      }
+    }
+    control.scrollIntoView({ block: 'center', inline: 'center' });
+    control.click();
+    return {
+      kind: 'download',
+      label: String(match.textContent || match.getAttribute('aria-label') || '').trim(),
+    };
   })()`;
 }
 
@@ -161,9 +180,28 @@ function buildMergeResultDetectionScript(treeId) {
       return label.includes(expected);
     });
     if (!match) return { kind: 'none' };
-    match.scrollIntoView({ block: 'center', inline: 'center' });
-    match.click();
-    return { kind: 'download', label: String(match.textContent || match.getAttribute('aria-label') || '').trim() };
+    let control = match;
+    let container = match;
+    for (let depth = 0; container && depth < 6; depth += 1, container = container.parentElement) {
+      const download = [...(container.querySelectorAll?.([
+        'a[download]',
+        'button[aria-label="Download file"]',
+        'button[aria-label="Download"]',
+        '[role="button"][aria-label="Download file"]',
+      ].join(', ')) || [])].find((element) => (
+        element !== match && !element.disabled && element.getAttribute('aria-disabled') !== 'true'
+      ));
+      if (download) {
+        control = download;
+        break;
+      }
+    }
+    control.scrollIntoView({ block: 'center', inline: 'center' });
+    control.click();
+    return {
+      kind: 'download',
+      label: String(match.textContent || match.getAttribute('aria-label') || '').trim(),
+    };
   })()`;
 }
 
@@ -803,41 +841,20 @@ class ChatGPTView {
     this.monitorBusy = true;
     try {
       const expectedName = `chatgpt-ide-result-${task.taskId}.txt`;
-      const script = `(() => {
-        const expected = ${JSON.stringify(expectedName.toLowerCase())};
-        const roots = [document];
-        const candidates = [];
-        const visited = new Set();
-        while (roots.length) {
-          const root = roots.shift();
-          if (!root || visited.has(root)) continue;
-          visited.add(root);
-          candidates.push(...root.querySelectorAll('a[href], a[download], button, [role="link"], [role="button"]'));
-          for (const element of root.querySelectorAll('*')) {
-            if (element.shadowRoot) roots.push(element.shadowRoot);
-          }
-        }
-        const match = candidates.find((element) => {
-          const label = [
-            element.getAttribute('download'),
-            element.getAttribute('aria-label'),
-            element.getAttribute('title'),
-            element.textContent,
-            element.getAttribute('href'),
-          ].filter(Boolean).join(' ').toLowerCase();
-          return label.includes(expected);
-        });
-        if (!match) return { kind: 'none' };
-        match.scrollIntoView({ block: 'center', inline: 'center' });
-        match.click();
-        return { kind: 'download', label: String(match.textContent || match.getAttribute('aria-label') || '').trim() };
-      })()`;
+      this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
       // A fresh, synchronous user gesture is required for ChatGPT's generated-file link.
       // A click fired later by a page-owned timer can be silently blocked by Chromium.
-      const result = await this.view.webContents.executeJavaScript(script, true).catch(() => ({ kind: 'none' }));
-      if (result?.kind !== 'download') return false;
+      const result = await this.view.webContents.executeJavaScript(
+        buildTaskResultDetectionScript(task.taskId),
+        true,
+      ).catch(() => ({ kind: 'none' }));
+      if (result?.kind !== 'download') {
+        if (this.pendingDownload?.kind === 'task' && this.pendingDownload.taskId === task.taskId) {
+          this.pendingDownload = null;
+        }
+        return false;
+      }
       this.resultAttempts.set(task.taskId, Date.now());
-      this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
       await this.onEvent({
         type: 'result-link-activated',
         taskId: task.taskId,
@@ -855,12 +872,17 @@ class ChatGPTView {
     if (this.pendingDownload?.kind === 'merge' && this.pendingDownload.treeId === tree.id) return false;
     this.monitorBusy = true;
     try {
+      this.pendingDownload = { kind: 'merge', treeId: tree.id, startedAt: Date.now() };
       const result = await this.view.webContents.executeJavaScript(
         buildMergeResultDetectionScript(tree.id),
         true,
       ).catch(() => ({ kind: 'none' }));
-      if (result?.kind !== 'download') return false;
-      this.pendingDownload = { kind: 'merge', treeId: tree.id, startedAt: Date.now() };
+      if (result?.kind !== 'download') {
+        if (this.pendingDownload?.kind === 'merge' && this.pendingDownload.treeId === tree.id) {
+          this.pendingDownload = null;
+        }
+        return false;
+      }
       await this.onEvent({
         type: 'merge-result-link-activated',
         treeId: tree.id,

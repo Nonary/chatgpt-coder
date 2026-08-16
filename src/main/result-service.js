@@ -90,6 +90,17 @@ class ResultService {
     ));
   }
 
+  async ingestTextFile(taskId, downloadedPath) {
+    return this.ingestResult(taskId, 'Validating the downloaded text result…', async (task) => {
+      const stat = await fs.stat(downloadedPath);
+      if (stat.size > MAX_RESULT_BYTES) {
+        throw new Error('The downloaded text result is larger than the 128 MB safety limit.');
+      }
+      const text = await fs.readFile(downloadedPath, 'utf8');
+      return this.readPlainTextResult(task, text, downloadedPath);
+    });
+  }
+
   async ingestResult(taskId, message, readResult) {
     const task = await this.taskService.getTask(taskId);
     await this.onEvent({ type: 'result-processing', taskId, message });
@@ -114,7 +125,7 @@ class ResultService {
     }
   }
 
-  async readPlainTextResult(task, text) {
+  async readPlainTextResult(task, text, downloadedPath = null) {
     const manifest = parsePlainTextResult(text);
     if (manifest.taskId !== task.taskId) throw new Error('This result belongs to a different Patchwork task.');
     if (manifest.status !== 'completed') throw new Error(`ChatGPT returned task status: ${manifest.status}`);
@@ -138,7 +149,7 @@ class ResultService {
       summary: String(manifest.summary || '').trim(),
       commitMessage: task.treeId ? validateCommitMessage(manifest.commitMessage) : null,
       transport: 'plain-text-base64',
-      downloadedPath: null,
+      downloadedPath,
       patches,
     };
   }
