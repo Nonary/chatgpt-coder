@@ -1,10 +1,15 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { inspectRepository, runGit, slugify } = require('./git');
+const { fingerprintRepository, inspectRepository, runGit, slugify } = require('./git');
 
 const MERGE_RESULT_START = 'PATCHWORK_MERGE_V1';
 const MERGE_RESULT_END = 'PATCHWORK_MERGE_END';
+
+function mergeResultFilename(treeId) {
+  return `chatgpt-ide-merge-result-${treeId}.txt`;
+}
+
 const CONVENTIONAL_COMMIT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)\r\n]+\))?!?: .+/;
 
 function validateCommitMessage(value) {
@@ -39,13 +44,45 @@ function parseMergeResult(value, treeId) {
   };
 }
 
+function parseWorktreeList(output) {
+  const worktrees = [];
+  let current = null;
+  for (const token of String(output || '').split('\0')) {
+    if (!token) {
+      if (current) worktrees.push(current);
+      current = null;
+      continue;
+    }
+    const separator = token.indexOf(' ');
+    const key = separator < 0 ? token : token.slice(0, separator);
+    const value = separator < 0 ? true : token.slice(separator + 1);
+    if (key === 'worktree') {
+      if (current) worktrees.push(current);
+      current = { path: value };
+    } else if (current) {
+      current[key] = value;
+    }
+  }
+  if (current) worktrees.push(current);
+  return worktrees;
+}
+
+function branchName(value) {
+  return String(value || '').replace(/^refs\/heads\//, '') || '(detached HEAD)';
+}
+
+function discoveredTreeId(worktreePath) {
+  return `git-${crypto.createHash('sha256').update(worktreePath).digest('hex').slice(0, 12)}`;
+}
+
 class WorktreeService {
-  constructor(dataRoot, onEvent = () => {}) {
+  constructor(dataRoot, onEvent = () => {}, repositoryProvider = async () => []) {
     this.dataRoot = dataRoot;
     this.worktreesRoot = path.join(dataRoot, 'worktrees');
     this.mergesRoot = path.join(dataRoot, 'merge-workspaces');
     this.recordsFile = path.join(dataRoot, 'worktrees.json');
     this.onEvent = onEvent;
+    this.repositoryProvider = repositoryProvider;
   }
 
   async initialize() {
@@ -71,9 +108,81 @@ class WorktreeService {
   }
 
   async get(treeId) {
-    const tree = (await this.readRecords()).find((item) => item.id === treeId);
+    const tree = (await this.syncDiscoveredWorktrees()).find((item) => item.id === treeId);
     if (!tree) throw new Error('The selected coding tree no longer exists.');
     return tree;
+  }
+
+  async syncDiscoveredWorktrees() {
+    const records = await this.readRecords();
+    let repositories;
+    try {
+      repositories = await this.repositoryProvider();
+    } catch {
+      return records;
+    }
+    if (!Array.isArray(repositories) || repositories.length === 0) return records;
+
+    const byPath = new Map();
+    for (const record of records) {
+      const resolvedPath = await fs.realpath(record.path).catch(() => path.resolve(record.path));
+      byPath.set(resolvedPath, record);
+    }
+    let changed = false;
+    const scannedRepositories = new Set();
+    for (const suppliedRepository of repositories) {
+      if (!suppliedRepository?.path || suppliedRepository.unavailable) continue;
+      let worktrees;
+      try {
+        const { stdout } = await runGit(suppliedRepository.path, ['worktree', 'list', '--porcelain', '-z']);
+        worktrees = parseWorktreeList(stdout);
+      } catch {
+        continue;
+      }
+      if (worktrees.length < 2) continue;
+      const primaryPath = await fs.realpath(worktrees[0].path).catch(() => path.resolve(worktrees[0].path));
+      if (scannedRepositories.has(primaryPath)) continue;
+      scannedRepositories.add(primaryPath);
+      const source = await inspectRepository(primaryPath).catch(() => suppliedRepository);
+      const sourceBranch = branchName(worktrees[0].branch || source.branch);
+
+      for (const discovered of worktrees.slice(1)) {
+        const discoveredPath = await fs.realpath(discovered.path).catch(() => path.resolve(discovered.path));
+        const existing = byPath.get(discoveredPath);
+        if (existing && existing.managed !== false) continue;
+        const branch = branchName(discovered.branch);
+        const { stdout: mergeBaseOutput } = await runGit(discoveredPath, [
+          'merge-base', worktrees[0].HEAD, discovered.HEAD,
+        ]).catch(() => ({ stdout: discovered.HEAD || '' }));
+        const stat = await fs.stat(discoveredPath).catch(() => null);
+        const next = {
+          ...existing,
+          id: existing?.id || discoveredTreeId(discoveredPath),
+          name: existing?.name || (branch === '(detached HEAD)' ? path.basename(discoveredPath) : branch),
+          repositoryId: source.id,
+          repositoryName: source.name || path.basename(primaryPath),
+          repositoryPath: primaryPath,
+          path: discoveredPath,
+          branch,
+          sourceBranch,
+          baseCommit: mergeBaseOutput.trim() || discovered.HEAD,
+          createdAt: existing?.createdAt || stat?.birthtime?.toISOString() || new Date().toISOString(),
+          updatedAt: existing?.updatedAt || new Date().toISOString(),
+          taskIds: existing?.taskIds || [],
+          mergeState: existing?.mergeState || null,
+          mergeConversationUrl: existing?.mergeConversationUrl || null,
+          managed: false,
+          discovered: true,
+        };
+        const index = records.findIndex((item) => item.id === next.id);
+        if (index >= 0) records[index] = next;
+        else records.push(next);
+        byPath.set(discoveredPath, next);
+        changed = true;
+      }
+    }
+    if (changed) await this.writeRecords(records);
+    return records;
   }
 
   async create(repositoryPath, requestedName) {
@@ -105,6 +214,8 @@ class WorktreeService {
       taskIds: [],
       mergeState: null,
       mergeConversationUrl: null,
+      managed: true,
+      discovered: false,
     };
     const records = await this.readRecords();
     records.push(tree);
@@ -134,7 +245,7 @@ class WorktreeService {
   }
 
   async list() {
-    return Promise.all((await this.readRecords()).map((tree) => this.inspect(tree)));
+    return Promise.all((await this.syncDiscoveredWorktrees()).map((tree) => this.inspect(tree)));
   }
 
   async attachTask(treeId, taskId) {
@@ -162,8 +273,9 @@ class WorktreeService {
       ]),
       runGit(tree.path, ['diff', '--stat', tree.baseCommit, 'HEAD', '--', '.']),
     ]);
-    const prompt = `You are finalizing a Patchwork coding tree. Read the commit history and diff summary below, summarize the combined change, and write one improved Conventional Commit message for the squashed result. The first line must use the Conventional Commits form type(scope): description. Return only the marked JSON envelope.\n\nPATCHWORK_MERGE_V1\n{"schemaVersion":1,"treeId":"${tree.id}","summary":"concise combined summary","commitMessage":"type(scope): concise description\\n\\nOptional explanatory body"}\nPATCHWORK_MERGE_END\n\nTree: ${tree.name}\nRepository: ${tree.repositoryName}\n\nCommit history:\n${log.trim()}\n\nDiff summary:\n${stat.trim()}`;
-    return { treeId: tree.id, treeName: tree.name, prompt };
+    const resultFilename = mergeResultFilename(tree.id);
+    const prompt = `You are finalizing a Patchwork coding tree. Read the commit history and diff summary below, summarize the combined change, and write one improved Conventional Commit message for the squashed result. The first line must use the Conventional Commits form type(scope): description.\n\nCreate and attach a UTF-8 plain-text file named ${resultFilename}. Its complete contents must be the marked JSON envelope below, with the start and end markers on their own lines. Do not paste the PATCHWORK_MERGE_V1 envelope into the chat. Patchwork will read the text file and apply the squash merge automatically.\n\nPATCHWORK_MERGE_V1\n{"schemaVersion":1,"treeId":"${tree.id}","summary":"concise combined summary","commitMessage":"type(scope): concise description\\n\\nOptional explanatory body"}\nPATCHWORK_MERGE_END\n\nTree: ${tree.name}\nRepository: ${tree.repositoryName}\n\nCommit history:\n${log.trim()}\n\nDiff summary:\n${stat.trim()}`;
+    return { treeId: tree.id, treeName: tree.name, resultFilename, prompt };
   }
 
   async markMergeSubmitted(treeId, conversationUrl = null) {
@@ -195,12 +307,27 @@ class WorktreeService {
     return this.inspect(records[index]);
   }
 
+  async clearMergeFailure(treeId, resolvedSourceFingerprint = null) {
+    const records = await this.readRecords();
+    const index = records.findIndex((item) => item.id === treeId);
+    if (index < 0) return null;
+    records[index] = {
+      ...records[index],
+      mergeState: null,
+      mergeError: null,
+      resolvedSourceFingerprint,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.writeRecords(records);
+    return this.inspect(records[index]);
+  }
+
   async mergeFromText(treeId, text) {
     const { commitMessage, summary } = parseMergeResult(text, treeId);
     const tree = await this.get(treeId);
     const source = await inspectRepository(tree.repositoryPath);
     const working = await inspectRepository(tree.path);
-    if (!source.hasHead || !source.isClean) throw new Error('The original repository must be clean before merging a coding tree.');
+    if (!source.hasHead) throw new Error('The original repository needs an initial commit before merging a coding tree.');
     if (source.branch !== tree.sourceBranch) {
       throw new Error(`Check out ${tree.sourceBranch} in the original repository before merging this coding tree.`);
     }
@@ -210,22 +337,66 @@ class WorktreeService {
 
     const integrationId = crypto.randomUUID();
     const integrationPath = path.join(this.mergesRoot, integrationId);
+    const restoreCheckPath = path.join(this.mergesRoot, `${integrationId}-restore-check`);
     let commit = null;
+    let stashCommit = null;
+    let sourceChangesRestored = source.isClean;
+    const sourceFingerprint = source.isClean ? null : await fingerprintRepository(source.path);
+    const absorbResolvedSourceChanges = Boolean(
+      sourceFingerprint && tree.resolvedSourceFingerprint === sourceFingerprint,
+    );
     try {
+      if (!source.isClean) {
+        await runGit(source.path, [
+          'stash', 'push', '--include-untracked', '--message', `Patchwork merge ${tree.id}`,
+        ]);
+        const { stdout: stashOutput } = await runGit(source.path, ['rev-parse', '--verify', 'refs/stash']);
+        stashCommit = stashOutput.trim();
+      }
+
       await runGit(source.path, ['worktree', 'add', '--detach', integrationPath, source.baseCommit]);
       await runGit(integrationPath, ['merge', '--squash', '--no-commit', tree.branch]);
       await runGit(integrationPath, ['commit', '-m', commitMessage]);
       const { stdout } = await runGit(integrationPath, ['rev-parse', 'HEAD']);
       commit = stdout.trim();
 
+      if (stashCommit && !absorbResolvedSourceChanges) {
+        await runGit(source.path, ['worktree', 'add', '--detach', restoreCheckPath, commit]);
+        try {
+          await runGit(restoreCheckPath, ['stash', 'apply', '--index', stashCommit]);
+        } catch {
+          throw new Error('The coding tree conflicts with local changes in the original repository. The original repository was left unchanged; continue the tree with a conflict-resolution task and try merging again.');
+        } finally {
+          await runGit(source.path, ['worktree', 'remove', '--force', restoreCheckPath]).catch(() => {});
+          await fs.rm(restoreCheckPath, { recursive: true, force: true });
+        }
+      }
+
       const sourceBeforeFastForward = await inspectRepository(tree.repositoryPath);
       if (!sourceBeforeFastForward.isClean || sourceBeforeFastForward.baseCommit !== source.baseCommit) {
         throw new Error('The original repository changed while the coding tree was being merged. Try again.');
       }
       await runGit(source.path, ['merge', '--ff-only', commit]);
+      if (stashCommit) {
+        if (!absorbResolvedSourceChanges) {
+          await runGit(source.path, ['stash', 'apply', '--index', stashCommit]);
+        }
+        sourceChangesRestored = true;
+        await runGit(source.path, ['stash', 'drop', 'stash@{0}']).catch(() => {});
+      }
     } finally {
       await runGit(source.path, ['worktree', 'remove', '--force', integrationPath]).catch(() => {});
       await fs.rm(integrationPath, { recursive: true, force: true });
+      await runGit(source.path, ['worktree', 'remove', '--force', restoreCheckPath]).catch(() => {});
+      await fs.rm(restoreCheckPath, { recursive: true, force: true });
+      if (stashCommit && !sourceChangesRestored) {
+        const currentSource = await inspectRepository(source.path).catch(() => null);
+        if (currentSource?.isClean && currentSource.baseCommit === source.baseCommit) {
+          await runGit(source.path, ['stash', 'apply', '--index', stashCommit]);
+          sourceChangesRestored = true;
+          await runGit(source.path, ['stash', 'drop', 'stash@{0}']).catch(() => {});
+        }
+      }
     }
 
     await this.remove(treeId, true);
@@ -253,4 +424,10 @@ class WorktreeService {
   }
 }
 
-module.exports = { WorktreeService, parseMergeResult, validateCommitMessage };
+module.exports = {
+  WorktreeService,
+  mergeResultFilename,
+  parseMergeResult,
+  parseWorktreeList,
+  validateCommitMessage,
+};

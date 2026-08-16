@@ -8,7 +8,6 @@ const { promisify } = require('node:util');
 const execFileAsync = promisify(execFile);
 
 async function runGit(cwd, args, options = {}) {
-  const { env: extraEnvironment, ...commandOptions } = options;
   try {
     const result = await execFileAsync('git', args, {
       cwd,
@@ -17,9 +16,8 @@ async function runGit(cwd, args, options = {}) {
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',
-        ...extraEnvironment,
       },
-      ...commandOptions,
+      ...options,
     });
     return {
       stdout: result.stdout,
@@ -166,7 +164,6 @@ async function createWorkingSnapshotBundle(repository, scratchPath, outputPath) 
   if (!repository.hasHead) {
     return createSnapshotBundle(repository, path.join(scratchPath, 'repository'), outputPath);
   }
-
   const fingerprintBefore = await fingerprintRepository(repository.path);
   await fs.mkdir(scratchPath, { recursive: true });
   const temporaryIndex = path.join(scratchPath, 'index');
@@ -191,7 +188,6 @@ async function createWorkingSnapshotBundle(repository, scratchPath, outputPath) 
   if (fingerprintBefore !== fingerprintAfter) {
     throw new Error(`${repository.name} changed while Patchwork was creating its working-tree snapshot. Try again.`);
   }
-
   const snapshotRef = `refs/patchwork/task-bundles/${crypto.randomUUID()}`;
   await runGit(repository.path, ['update-ref', snapshotRef, snapshotCommit]);
   try {
@@ -199,10 +195,7 @@ async function createWorkingSnapshotBundle(repository, scratchPath, outputPath) 
   } finally {
     await runGit(repository.path, ['update-ref', '-d', snapshotRef]).catch(() => {});
   }
-  return {
-    baseCommit: snapshotCommit,
-    snapshotFingerprint: fingerprintAfter,
-  };
+  return { baseCommit: snapshotCommit, snapshotFingerprint: fingerprintAfter };
 }
 
 async function createBundle(repository, outputPath, revisions = ['HEAD']) {

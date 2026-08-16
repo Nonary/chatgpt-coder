@@ -1,14 +1,7 @@
 node_modules/
 .pnpm-store/
-
-# Electron and application build output
 dist/
 dist-*/
 release/
-out/
-
-# Test and tool output
-coverage/
-.cache/
 *.log
 .DS_Store

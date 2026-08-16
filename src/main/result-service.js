@@ -18,15 +18,6 @@ const MAX_PATCH_BYTES = 64 * 1024 * 1024;
 const TEXT_RESULT_START = 'PATCHWORK_RESULT_V1';
 const TEXT_RESULT_END = 'PATCHWORK_RESULT_END';
 
-function safeArchivePath(value) {
-  if (typeof value !== 'string' || value.length === 0) throw new Error('Result contains an invalid patch path.');
-  const normalized = path.posix.normalize(value.replaceAll('\\', '/'));
-  if (normalized.startsWith('/') || normalized.startsWith('../') || normalized.includes('/../')) {
-    throw new Error(`Result contains an unsafe path: ${value}`);
-  }
-  return normalized;
-}
-
 function parsePlainTextResult(value) {
   const text = String(value || '');
   if (Buffer.byteLength(text, 'utf8') > MAX_RESULT_BYTES) {
@@ -93,29 +84,10 @@ class ResultService {
     this.onEvent = onEvent;
   }
 
-  async ingest(taskId, downloadedPath) {
-    return this.ingestResult(taskId, 'Validating the downloaded result…', async (task) => (
-      downloadedPath.toLowerCase().endsWith('.zip')
-        ? this.readZipResult(task, downloadedPath)
-        : this.readSinglePatchResult(task, downloadedPath)
-    ));
-  }
-
   async ingestText(taskId, text) {
     return this.ingestResult(taskId, 'Decoding and validating the plain-text result…', (task) => (
       this.readPlainTextResult(task, text)
     ));
-  }
-
-  async ingestTextFile(taskId, downloadedPath) {
-    return this.ingestResult(taskId, 'Validating the downloaded text result…', async (task) => {
-      const stat = await fs.stat(downloadedPath);
-      if (stat.size > MAX_RESULT_BYTES) {
-        throw new Error('The downloaded text result is larger than the 128 MB safety limit.');
-      }
-      const text = await fs.readFile(downloadedPath, 'utf8');
-      return this.readPlainTextResult(task, text, downloadedPath);
-    });
   }
 
   async ingestResult(taskId, message, readResult) {
@@ -142,7 +114,7 @@ class ResultService {
     }
   }
 
-  async readPlainTextResult(task, text, downloadedPath = null) {
+  async readPlainTextResult(task, text) {
     const manifest = parsePlainTextResult(text);
     if (manifest.taskId !== task.taskId) throw new Error('This result belongs to a different Patchwork task.');
     if (manifest.status !== 'completed') throw new Error(`ChatGPT returned task status: ${manifest.status}`);
@@ -166,65 +138,8 @@ class ResultService {
       summary: String(manifest.summary || '').trim(),
       commitMessage: task.treeId ? validateCommitMessage(manifest.commitMessage) : null,
       transport: 'plain-text-base64',
-      downloadedPath,
+      downloadedPath: null,
       patches,
-    };
-  }
-
-  async readZipResult(task, downloadedPath) {
-    const archiveStat = await fs.stat(downloadedPath);
-    if (archiveStat.size > MAX_RESULT_BYTES) {
-      throw new Error('The downloaded result is larger than the 128 MB safety limit.');
-    }
-    const zip = new AdmZip(downloadedPath);
-    const manifestEntry = zip.getEntry('result.json');
-    if (!manifestEntry) throw new Error('The downloaded ZIP does not contain result.json at its root.');
-    if (manifestEntry.header.size > MAX_MANIFEST_BYTES) throw new Error('result.json is unexpectedly large.');
-    const manifest = JSON.parse(manifestEntry.getData().toString('utf8'));
-    if (manifest.schemaVersion !== 1) throw new Error(`Unsupported result schema: ${manifest.schemaVersion}`);
-    if (manifest.taskId !== task.taskId) throw new Error('This result belongs to a different Patchwork task.');
-    if (manifest.status !== 'completed') throw new Error(`ChatGPT returned task status: ${manifest.status}`);
-    if (!Array.isArray(manifest.repositories)) throw new Error('Result manifest has no repository list.');
-
-    const resultDir = path.join(this.taskService.taskDirectory(task.taskId), 'result');
-    await fs.mkdir(resultDir, { recursive: true });
-    const patches = [];
-    for (const item of manifest.repositories) {
-      requireTaskRepository(task, item?.id);
-      const patchFile = safeArchivePath(item.patchFile);
-      const entry = zip.getEntry(patchFile);
-      if (!entry) throw new Error(`Result is missing ${patchFile}.`);
-      if (entry.header.size > MAX_PATCH_BYTES) throw new Error(`${patchFile} exceeds the 64 MB patch limit.`);
-      const outputName = `${item.id}.patch`;
-      const outputPath = path.join(resultDir, outputName);
-      await fs.writeFile(outputPath, entry.getData());
-      patches.push({
-        id: item.id,
-        baseCommit: item.baseCommit,
-        patchFile,
-        localPath: outputPath,
-      });
-    }
-    return {
-      summary: String(manifest.summary || '').trim(),
-      downloadedPath,
-      patches,
-    };
-  }
-
-  async readSinglePatchResult(task, downloadedPath) {
-    if (task.repositories.length !== 1) {
-      throw new Error('A raw patch can only be used for a task containing one repository.');
-    }
-    const repository = task.repositories[0];
-    const resultDir = path.join(this.taskService.taskDirectory(task.taskId), 'result');
-    await fs.mkdir(resultDir, { recursive: true });
-    const outputPath = path.join(resultDir, `${repository.id}.patch`);
-    await fs.copyFile(downloadedPath, outputPath);
-    return {
-      summary: 'Patch downloaded from ChatGPT.',
-      downloadedPath,
-      patches: [{ id: repository.id, baseCommit: repository.baseCommit, localPath: outputPath }],
     };
   }
 
@@ -245,6 +160,9 @@ class ResultService {
         throw new Error(`${repository.name} patch targets the wrong base commit.`);
       }
       const patchBody = await fs.readFile(patch.localPath, 'utf8');
+      if (repository.readOnly && patchBody.length > 0) {
+        throw new Error(`${repository.name} was supplied as read-only conflict context, but ChatGPT tried to change it.`);
+      }
       if (patchBody.length === 0) {
         previews.push({ ...patch, name: repository.name, stat: 'No changes', numstat: '', preview: '' });
         continue;
@@ -304,7 +222,6 @@ class ResultService {
             `${repository.name} has new uncommitted or unmerged changes since this task was packaged.`,
           ));
         }
-
         let applyMode = 'direct';
         if (!exactState) {
           try {
@@ -315,7 +232,6 @@ class ResultService {
         } else {
           await checkPatch(repository.path, patch.localPath);
         }
-
         try {
           await applyPatch(repository.path, patch.localPath, applyMode === 'three-way'
             ? { threeWay: true, index: true }
@@ -323,13 +239,7 @@ class ResultService {
         } catch (error) {
           return this.markConflicted(task, repository, error);
         }
-        applied.push({
-          repository,
-          patch,
-          applyMode,
-          wasClean: current.isClean,
-          headBefore: current.baseCommit,
-        });
+        applied.push({ repository, patch, applyMode, wasClean: current.isClean, headBefore: current.baseCommit });
       }
       if (task.treeId) {
         for (const item of applied) {
@@ -436,4 +346,4 @@ class ResultService {
   }
 }
 
-module.exports = { ResultService, parsePlainTextResult, safeArchivePath };
+module.exports = { ResultService, parsePlainTextResult };

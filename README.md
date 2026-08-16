@@ -1,4 +1,4 @@
-# Patchwork IDE
+# ChatGPT - Coder
 
 Patchwork is a local-first Electron companion for completing coding tasks through the normal ChatGPT website. It packages Git repositories as full-history Git bundles inside a ZIP task package, embeds a persistent ChatGPT browser session directly inside the IDE, automates task submission through the visible page, downloads ChatGPT's marked text result, validates every patch against its task base, and applies the changes locally.
 
@@ -21,14 +21,17 @@ Patchwork deliberately does not expose discard, hard reset, or forced checkout a
 Every new coding stream runs in a real Git worktree on its own `patchwork/…` branch. The original checkout must have a commit, be on a branch, and be clean before a tree is created. The **Coding trees** workspace lets you:
 
 - create a named tree from a repository;
+- discover existing linked worktrees directly from repositories in the workspace;
 - attach follow-up tasks to an existing tree while opening a fresh ChatGPT chat each time;
 - inspect the tree in Source Control, reveal its directory, and see its task and commit counts;
 - discard a tree through an explicit confirmation; or
 - ask ChatGPT to summarize all tree commits and produce an improved Conventional Commit message, then squash the tree into the original branch as one commit.
 
-Task results are never applied to the original checkout. After validation, Patchwork applies the patch to the selected tree, stages it, and commits it using the Conventional Commit message included in ChatGPT's downloaded text result. A merge is first tested and committed in a temporary integration worktree. The original branch is fast-forwarded only if it stayed clean and unchanged; Patchwork then removes the task worktree and its branch.
+Task results are never applied to the original checkout. After validation, Patchwork applies the patch to the selected tree, stages it, and commits it using the Conventional Commit message included in ChatGPT's plain-text result. A merge is first tested and committed in a temporary integration worktree. The original branch is fast-forwarded only if it stayed clean and unchanged; Patchwork then removes the task worktree and its branch.
 
-Follow-up tasks may start from a dirty coding tree. Patchwork creates a synthetic task-tip commit on top of the tree's real `HEAD`, preserving the reachable repository history while capturing staged, unstaged, untracked, and conflict-marker files. The bundled instructions make ChatGPT inspect that supplied working state before editing, while the returned patch remains relative to the synthetic tip and therefore contains only ChatGPT's additional work.
+## Task history
+
+Patchwork keeps task records in its local data directory after a task finishes and after its coding tree is merged. **Task history** in the sidebar shows the complete saved history with search and status filters, including task descriptions, result summaries, commit messages, and the coding-tree or repository context. The sidebar's **Recent tasks** list stays intentionally short and links to the full history when older tasks exist.
 
 ## Current workflow
 
@@ -71,14 +74,13 @@ pnpm dist
 ## Safety boundaries
 
 - Coding trees can only be created from clean repositories with an existing `HEAD`, which keeps concurrent workstreams anchored to an unambiguous commit.
-- Each clean follow-up is pinned to the coding tree's current `HEAD`; a dirty follow-up uses a synthetic child commit that captures its exact working state without moving the local branch.
+- Each follow-up task is pinned to the coding tree's current `HEAD`.
 - Each result must name the original task and exact base commit.
-- Outbound ZIP packages contain only the task manifest, instructions, and verified Git bundles. Inbound plain-text envelopes have strict markers, schemas, size limits, repository IDs, and base64-integrity checks. Legacy result ZIP paths are treated as untrusted input and are never extracted wholesale.
-- Patches against an unchanged tree are checked before modification. Results arriving after a newer commit are merged with Git's three-way machinery and surfaced as a conflict instead of being rejected merely because `HEAD` moved.
+- Plain-text envelopes have strict markers, schemas, size limits, repository IDs, and base64-integrity checks. Legacy ZIP paths are treated as untrusted input and are never extracted wholesale.
+- All patches are checked before the first repository is modified.
+- A multi-repository failure triggers a best-effort reversal of patches already applied.
 - Applied task changes are committed only on Patchwork worktree branches. Patchwork never pushes or rewrites published history.
 - Squash merging runs in a temporary worktree first and updates the original branch only by fast-forwarding the verified integration commit.
-
-Because the bundle intentionally contains reachable history, repositories that committed large build artifacts or installer archives will produce large uploads. Patchwork shows the task-package size in the activity panel and avoids redundant ZIP compression, but repository history cleanup or Git LFS is required to make those historical objects smaller.
 
 ## Browser automation boundary
 

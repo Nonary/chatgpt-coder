@@ -1,13 +1,14 @@
 const fsSync = require('node:fs');
-const crypto = require('node:crypto');
 const path = require('node:path');
 const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('electron');
+const { mergeResultFilename } = require('./worktree-service');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
 const PARTITION = 'persist:patchwork-chatgpt';
 const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 const RESULT_RETRY_MILLISECONDS = 6_000;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
+const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 
@@ -17,6 +18,34 @@ function delay(milliseconds) {
 
 function resultTaskId(filename) {
   return RESULT_NAME_PATTERN.exec(path.basename(String(filename || '')))?.[1]?.toLowerCase() || null;
+}
+
+const MERGE_RESULT_NAME_PATTERN = /chatgpt-ide-merge-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
+
+function mergeTreeId(filename) {
+  return MERGE_RESULT_NAME_PATTERN.exec(path.basename(String(filename || '')))?.[1]?.toLowerCase() || null;
+}
+
+function isChatGPTConversationUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:'
+      && url.hostname === 'chatgpt.com'
+      && /^\/c\/[^/]+\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function recoverUnconfirmedSubmissions(taskService, tasks) {
+  return Promise.all(tasks.map((task) => {
+    if (task.state !== 'submitted' || isChatGPTConversationUrl(task.conversationUrl)) return task;
+    return taskService.updateTask(task.taskId, {
+      state: 'prepared',
+      submittedAt: null,
+      conversationUrl: null,
+    });
+  }));
 }
 
 function isDismissibleLimitNotice(value) {
@@ -64,6 +93,80 @@ function buildLimitNoticeDismissalScript() {
   })()`;
 }
 
+function buildTaskResultDetectionScript(taskId) {
+  const expectedName = `chatgpt-ide-result-${taskId}.txt`;
+  return `(() => {
+    const expected = ${JSON.stringify(expectedName.toLowerCase())};
+    const stopButton = document.querySelector('[data-testid="stop-button"]');
+    if (stopButton && !stopButton.disabled && stopButton.getAttribute('aria-disabled') !== 'true') {
+      return { kind: 'generating' };
+    }
+    const roots = [document];
+    const candidates = [];
+    const visited = new Set();
+    while (roots.length) {
+      const root = roots.shift();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      candidates.push(...root.querySelectorAll('a[href], a[download], button, [role="link"], [role="button"]'));
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+      }
+    }
+    const match = candidates.find((element) => {
+      const label = [
+        element.getAttribute('download'),
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.textContent,
+        element.getAttribute('href'),
+      ].filter(Boolean).join(' ').toLowerCase();
+      return label.includes(expected);
+    });
+    if (!match) return { kind: 'none' };
+    match.scrollIntoView({ block: 'center', inline: 'center' });
+    match.click();
+    return { kind: 'download', label: String(match.textContent || match.getAttribute('aria-label') || '').trim() };
+  })()`;
+}
+
+function buildMergeResultDetectionScript(treeId) {
+  const expectedName = mergeResultFilename(treeId);
+  return `(() => {
+    const expected = ${JSON.stringify(expectedName.toLowerCase())};
+    const stopButton = document.querySelector('[data-testid="stop-button"]');
+    if (stopButton && !stopButton.disabled && stopButton.getAttribute('aria-disabled') !== 'true') {
+      return { kind: 'generating' };
+    }
+    const roots = [document];
+    const candidates = [];
+    const visited = new Set();
+    while (roots.length) {
+      const root = roots.shift();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      candidates.push(...root.querySelectorAll('a[href], a[download], button, [role="link"], [role="button"]'));
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+      }
+    }
+    const match = candidates.find((element) => {
+      const label = [
+        element.getAttribute('download'),
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.textContent,
+        element.getAttribute('href'),
+      ].filter(Boolean).join(' ').toLowerCase();
+      return label.includes(expected);
+    });
+    if (!match) return { kind: 'none' };
+    match.scrollIntoView({ block: 'center', inline: 'center' });
+    match.click();
+    return { kind: 'download', label: String(match.textContent || match.getAttribute('aria-label') || '').trim() };
+  })()`;
+}
+
 class ChatGPTView {
   constructor(
     mainWindow,
@@ -85,7 +188,7 @@ class ChatGPTView {
       .filter((task) => !['applied', 'rolled-back'].includes(task.state))
       .map((task) => [task.taskId.toLowerCase(), task]));
     this.activeTask = restoredTasks
-      .filter((task) => task.state === 'submitted')
+      .filter((task) => task.state === 'submitted' && isChatGPTConversationUrl(task.conversationUrl))
       .sort((left, right) => String(right.updatedAt || right.createdAt)
       .localeCompare(String(left.updatedAt || left.createdAt)))[0] || null;
     this.activeMerge = restoredTrees
@@ -93,7 +196,6 @@ class ChatGPTView {
       .sort((left, right) => String(right.updatedAt || right.createdAt)
         .localeCompare(String(left.updatedAt || left.createdAt)))[0] || null;
     this.resultAttempts = new Map();
-    this.resultTextsSeen = new Map();
     this.pendingDownload = null;
     this.processingTasks = new Set();
     this.monitorBusy = false;
@@ -114,6 +216,7 @@ class ChatGPTView {
     this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
     this.installNavigationHandlers();
     this.installDownloadListener();
+    this.installMergeDownloadListener();
     this.resultMonitor = setInterval(() => this.monitorPage().catch(() => {}), 1_500);
     this.resultMonitor.unref?.();
     this.mainWindow.once('closed', () => clearInterval(this.resultMonitor));
@@ -164,7 +267,7 @@ class ChatGPTView {
         : null;
       const taskId = namedTaskId || (pending && /\.txt$/i.test(originalName) ? pending.taskId : null);
       const task = taskId ? this.knownTasks.get(taskId.toLowerCase()) : null;
-      // Downloads unrelated to an active Patchwork task use Chromium's normal behavior.
+      // Downloads unrelated to an active Patchwork task or merge use Chromium's normal behavior.
       if (!task) return;
 
       this.pendingDownload = null;
@@ -207,9 +310,66 @@ class ChatGPTView {
     });
   }
 
+
+  installMergeDownloadListener() {
+    this.view.webContents.session.on('will-download', (_event, item) => {
+      const originalName = path.basename(item.getFilename());
+      const pending = this.pendingDownload && Date.now() - this.pendingDownload.startedAt < 20_000
+        ? this.pendingDownload
+        : null;
+      const namedMergeId = mergeTreeId(originalName);
+      const pendingMergeId = pending?.kind === 'merge' && /\.txt$/i.test(originalName)
+        ? pending.treeId
+        : null;
+      const mergeId = namedMergeId || pendingMergeId;
+      const merge = mergeId && this.activeMerge?.id.toLowerCase() === mergeId.toLowerCase()
+        ? this.activeMerge
+        : null;
+      if (!merge) return;
+
+      this.pendingDownload = null;
+      this.activeMerge = { ...merge, mergeState: 'downloading' };
+      const safeName = mergeResultFilename(merge.id);
+      const incomingDir = path.join(this.worktreeService.mergesRoot, 'incoming');
+      const savePath = path.join(incomingDir, safeName);
+      try {
+        fsSync.mkdirSync(incomingDir, { recursive: true });
+        item.setSavePath(savePath);
+        this.onEvent({
+          type: 'merge-result-download-started',
+          treeId: merge.id,
+          message: `Downloading ${safeName}…`,
+        });
+      } catch (error) {
+        this.worktreeService.markMergeFailed(merge.id, error).catch(() => {});
+        this.activeMerge = null;
+        this.onEvent({ type: 'merge-failed', treeId: merge.id, message: error.message });
+        return;
+      }
+
+      item.once('done', async (_downloadEvent, state) => {
+        if (state !== 'completed') {
+          const error = new Error(`The ChatGPT download ended with status: ${state}`);
+          await this.worktreeService.markMergeFailed(merge.id, error).catch(() => {});
+          this.activeMerge = null;
+          await this.onEvent({ type: 'merge-failed', treeId: merge.id, message: error.message });
+          return;
+        }
+        try {
+          const text = fsSync.readFileSync(savePath, 'utf8');
+          await this.finishMergeResult(merge, text);
+        } catch (error) {
+          await this.worktreeService.markMergeFailed(merge.id, error).catch(() => {});
+          this.activeMerge = null;
+          await this.onEvent({ type: 'merge-failed', treeId: merge.id, message: error.message });
+        }
+      });
+    });
+  }
+
   handleNavigation(url) {
     this.onEvent({ type: 'browser-navigated', url });
-    if (this.activeMerge && /^https:\/\/chatgpt\.com\/c\//i.test(url)) {
+    if (this.activeMerge && isChatGPTConversationUrl(url)) {
       if (this.activeMerge.mergeConversationUrl !== url && this.worktreeService) {
         const treeId = this.activeMerge.id;
         this.worktreeService.markMergeSubmitted(treeId, url).then((tree) => {
@@ -244,42 +404,6 @@ class ChatGPTView {
     if (!this.visible) this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
   }
 
-  async openTaskConversation(task) {
-    const currentUrl = this.view.webContents.getURL();
-    let conversationUrl = String(task.conversationUrl || '');
-    if (!conversationUrl
-      && this.activeTask?.taskId === task.taskId
-      && /^https:\/\/chatgpt\.com\/c\//i.test(currentUrl)) {
-      task = await this.taskService.updateTask(task.taskId, { conversationUrl: currentUrl });
-      conversationUrl = currentUrl;
-    }
-    if (conversationUrl && !/^https:\/\/chatgpt\.com\/c\//i.test(conversationUrl)) {
-      throw new Error('This task has an invalid saved ChatGPT conversation URL.');
-    }
-
-    this.activeMerge = null;
-    this.activeTask = task;
-    this.knownTasks.set(task.taskId.toLowerCase(), task);
-    if (!conversationUrl) {
-      return {
-        opened: false,
-        url: currentUrl,
-        message: task.state === 'prepared'
-          ? 'This task has not been submitted to ChatGPT yet.'
-          : 'ChatGPT has not assigned this task a conversation URL yet.',
-      };
-    }
-    if (currentUrl !== conversationUrl) await this.view.webContents.loadURL(conversationUrl);
-    this.installResultWatcher();
-    await this.onEvent({
-      type: 'task-chat-opened',
-      taskId: task.taskId,
-      url: conversationUrl,
-      message: 'Opened this task’s ChatGPT conversation.',
-    });
-    return { opened: true, url: conversationUrl };
-  }
-
   async prepare(task) {
     this.activeMerge = null;
     this.activeTask = task;
@@ -292,6 +416,25 @@ class ChatGPTView {
       taskId: task.taskId,
       message: 'A fresh embedded ChatGPT chat is ready for automated submission.',
     });
+  }
+
+  async openTaskConversation(task) {
+    if (!isChatGPTConversationUrl(task?.conversationUrl)) {
+      throw new Error('This task has an invalid saved ChatGPT conversation URL.');
+    }
+    this.activeMerge = null;
+    this.activeTask = task;
+    this.knownTasks.set(task.taskId.toLowerCase(), task);
+    if (this.view.webContents.getURL() !== task.conversationUrl) {
+      await this.view.webContents.loadURL(task.conversationUrl);
+    }
+    this.installResultWatcher();
+    await this.onEvent({
+      type: 'task-chat-opened',
+      taskId: task.taskId,
+      message: 'Opened this task’s saved ChatGPT conversation.',
+    });
+    return { opened: true, task };
   }
 
   async newChat() {
@@ -377,14 +520,24 @@ class ChatGPTView {
   async findFileInputNodeId() {
     const debuggerApi = this.view.webContents.debugger;
     const documentResult = await debuggerApi.sendCommand('DOM.getDocument', { depth: -1, pierce: true });
-    const query = await debuggerApi.sendCommand('DOM.querySelector', {
-      nodeId: documentResult.root.nodeId,
-      selector: 'input[type="file"]',
-    });
-    return query.nodeId || 0;
+    for (const selector of [
+      '#upload-files',
+      'input[type="file"][multiple]:not([accept="image/*"])',
+      'input[type="file"]',
+    ]) {
+      const query = await debuggerApi.sendCommand('DOM.querySelector', {
+        nodeId: documentResult.root.nodeId,
+        selector,
+      });
+      if (query.nodeId) return query.nodeId;
+    }
+    return 0;
   }
 
   async uploadPackage(packagePath) {
+    const filename = path.basename(packagePath);
+    const existingAttachment = await this.packageAttachmentStatus(filename, true);
+    if (existingAttachment.attached && !existingAttachment.busy) return true;
     const debuggerApi = this.view.webContents.debugger;
     let attachedHere = false;
     try {
@@ -415,9 +568,99 @@ class ChatGPTView {
         files: [packagePath],
         nodeId,
       });
+      const eventDispatched = await this.view.webContents.executeJavaScript(`(() => {
+        const filename = ${JSON.stringify(filename)};
+        const input = [...document.querySelectorAll('input[type="file"]')]
+          .find((element) => [...element.files].some((file) => file.name === filename));
+        if (!input) return false;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()`, true);
+      if (!eventDispatched) throw new Error('ChatGPT did not accept the selected task package. Nothing was submitted.');
     } finally {
       if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
     }
+    await this.waitForPackageAttachment(path.basename(packagePath));
+  }
+
+  async packageAttachmentStatus(filename, dismissDuplicateNotice = false) {
+    return this.view.webContents.executeJavaScript(`(() => {
+      const filename = ${JSON.stringify(filename)};
+      const visible = (element) => {
+        const style = getComputedStyle(element);
+        const bounds = element.getBoundingClientRect();
+        return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0;
+      };
+      const notices = [...document.querySelectorAll('[role="dialog"], [role="alert"], [aria-live]')]
+        .filter(visible);
+      const duplicateNotice = notices.find((element) => /already (?:been )?uploaded|already uploaded|duplicate file/i.test(
+        [element.textContent, element.getAttribute('aria-label')].filter(Boolean).join(' '),
+      ));
+      let dismissedDuplicate = false;
+      if (duplicateNotice && ${Boolean(dismissDuplicateNotice)}) {
+        const buttons = [...duplicateNotice.querySelectorAll('button')];
+        const dismiss = buttons.find((button) => /^(?:got it|close|dismiss|ok|okay)$/i.test([
+          button.textContent, button.getAttribute('aria-label'), button.getAttribute('title'),
+        ].filter(Boolean).join(' ').trim()))
+          || duplicateNotice.querySelector('button[data-testid*="close"], button[aria-label="Close"]');
+        if (dismiss) {
+          dismiss.click();
+          dismissedDuplicate = true;
+        }
+      }
+      const candidates = [...document.querySelectorAll(
+        '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div'
+      )].filter(visible);
+      const attachment = candidates.find((element) => [
+        element.textContent,
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+      ].filter(Boolean).some((value) => String(value).includes(filename)));
+      if (!attachment) return {
+        attached: false,
+        busy: false,
+        duplicateNotice: Boolean(duplicateNotice),
+        dismissedDuplicate,
+      };
+      const card = attachment.closest('[data-testid*="file"], [data-testid*="attach"]') || attachment.parentElement;
+      const statusText = [card?.textContent, card?.getAttribute?.('aria-label')].filter(Boolean).join(' ');
+      const busy = /uploading|processing|attaching/i.test(statusText)
+        || Boolean(card?.querySelector?.('[role="progressbar"], progress, [aria-busy="true"]'));
+      return {
+        attached: true,
+        busy,
+        duplicateNotice: Boolean(duplicateNotice),
+        dismissedDuplicate,
+      };
+    })()`, true).catch(() => ({
+      attached: false,
+      busy: false,
+      duplicateNotice: false,
+      dismissedDuplicate: false,
+    }));
+  }
+
+  async waitForPackageAttachment(filename, timeoutMilliseconds = 60_000) {
+    const startedAt = Date.now();
+    let consecutiveReadyChecks = 0;
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const status = await this.packageAttachmentStatus(filename, true);
+      consecutiveReadyChecks = status.attached && !status.busy ? consecutiveReadyChecks + 1 : 0;
+      if (consecutiveReadyChecks >= 2) return true;
+      await delay(500);
+    }
+    throw new Error(`ChatGPT did not confirm the attachment ${filename}. Nothing was submitted; reload the embedded browser and try again.`);
+  }
+
+  async waitForConversationUrl(timeoutMilliseconds = SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const url = this.view.webContents.getURL();
+      if (isChatGPTConversationUrl(url)) return url;
+      await delay(250);
+    }
+    return null;
   }
 
   async clickSend(timeoutMilliseconds = 60_000) {
@@ -464,9 +707,19 @@ class ChatGPTView {
     await this.injectPrompt(task.handoffPrompt);
     await this.uploadPackage(task.packagePath);
     await this.clickSend();
+    const conversationUrl = await this.waitForConversationUrl();
+    if (!conversationUrl) {
+      await this.onEvent({
+        type: 'task-submit-unconfirmed',
+        taskId: task.taskId,
+        message: 'ChatGPT did not create a conversation after Send, so the task was not marked submitted.',
+      });
+      throw new Error('Patchwork could not confirm a ChatGPT conversation after Send. Check the embedded browser before retrying.');
+    }
     const submittedTask = await this.taskService.updateTask(task.taskId, {
       state: 'submitted',
       submittedAt: new Date().toISOString(),
+      conversationUrl,
     });
     this.activeTask = submittedTask;
     this.knownTasks.set(task.taskId.toLowerCase(), submittedTask);
@@ -584,11 +837,11 @@ class ChatGPTView {
       const result = await this.view.webContents.executeJavaScript(script, true).catch(() => ({ kind: 'none' }));
       if (result?.kind !== 'download') return false;
       this.resultAttempts.set(task.taskId, Date.now());
-      this.pendingDownload = { taskId: task.taskId, startedAt: Date.now() };
+      this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
       await this.onEvent({
         type: 'result-link-activated',
         taskId: task.taskId,
-        message: `Found ${expectedName}; downloading the completed text result…`,
+        message: `Found ${expectedName}; starting the secure download…`,
       });
       return true;
     } finally {
@@ -599,42 +852,20 @@ class ChatGPTView {
   async checkForMerge() {
     const tree = this.activeMerge;
     if (this.monitorBusy || !tree || tree.mergeState !== 'submitted') return false;
+    if (this.pendingDownload?.kind === 'merge' && this.pendingDownload.treeId === tree.id) return false;
     this.monitorBusy = true;
     try {
-      const script = `(() => {
-        const treeId = ${JSON.stringify(tree.id.toLowerCase())};
-        const startMarker = 'PATCHWORK_MERGE_V1';
-        const endMarker = 'PATCHWORK_MERGE_END';
-        const containers = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-        for (let index = containers.length - 1; index >= 0; index -= 1) {
-          const text = String(containers[index].textContent || '');
-          const start = text.indexOf(startMarker);
-          const end = text.indexOf(endMarker, start + startMarker.length);
-          if (start >= 0 && end >= 0) {
-            const payload = text.slice(start, end + endMarker.length);
-            if (payload.toLowerCase().includes(treeId)) return payload;
-          }
-        }
-        return null;
-      })()`;
-      const payload = await this.view.webContents.executeJavaScript(script).catch(() => null);
-      if (!payload) return false;
-      const fingerprint = crypto.createHash('sha256').update(payload).digest('hex');
-      if (this.resultTextsSeen.get(`merge:${tree.id}`) === fingerprint) return false;
-      this.resultTextsSeen.set(`merge:${tree.id}`, fingerprint);
+      const result = await this.view.webContents.executeJavaScript(
+        buildMergeResultDetectionScript(tree.id),
+        true,
+      ).catch(() => ({ kind: 'none' }));
+      if (result?.kind !== 'download') return false;
+      this.pendingDownload = { kind: 'merge', treeId: tree.id, startedAt: Date.now() };
       await this.onEvent({
-        type: 'merge-result-detected',
+        type: 'merge-result-link-activated',
         treeId: tree.id,
-        message: 'ChatGPT returned the squash summary; merging the coding tree…',
+        message: `Found ${mergeResultFilename(tree.id)}; starting the secure download…`,
       });
-      try {
-        await this.onMergeResult(tree.id, payload);
-        this.activeMerge = null;
-      } catch (error) {
-        await this.worktreeService.markMergeFailed(tree.id, error).catch(() => {});
-        this.activeMerge = null;
-        await this.onEvent({ type: 'merge-failed', treeId: tree.id, message: error.message });
-      }
       return true;
     } finally {
       this.monitorBusy = false;
@@ -649,13 +880,26 @@ class ChatGPTView {
     shell.showItemInFolder(task.packagePath);
   }
 
+  async finishTaskResult(task, result, transport) {
+    const completed = await this.onResult(task.taskId, result, transport);
+    this.knownTasks.delete(task.taskId.toLowerCase());
+    if (this.activeTask?.taskId === task.taskId) this.activeTask = null;
+    return completed;
+  }
+
+  async finishMergeResult(tree, resultText) {
+    const completed = await this.onMergeResult(tree.id, resultText);
+    this.pendingDownload = null;
+    if (this.activeMerge?.id === tree.id) this.activeMerge = null;
+    return completed;
+  }
+
   async importResult(task) {
     const response = await dialog.showOpenDialog(this.mainWindow, {
       title: 'Choose a saved ChatGPT result',
       properties: ['openFile'],
       filters: [
-        { name: 'Patchwork results', extensions: ['txt', 'zip', 'patch', 'diff'] },
-        { name: 'All files', extensions: ['*'] },
+        { name: 'Patchwork text results', extensions: ['txt'] },
       ],
     });
     if (response.canceled || response.filePaths.length === 0) return null;
@@ -669,6 +913,11 @@ module.exports = {
   CHATGPT_URL,
   ChatGPTView,
   buildLimitNoticeDismissalScript,
+  buildMergeResultDetectionScript,
+  buildTaskResultDetectionScript,
+  isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  recoverUnconfirmedSubmissions,
+  mergeTreeId,
   resultTaskId,
 };

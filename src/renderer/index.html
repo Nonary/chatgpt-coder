@@ -7,16 +7,16 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'"
     />
-    <title>Patchwork IDE</title>
+    <title>ChatGPT - Coder</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true">P</div>
+          <div class="brand-mark" aria-hidden="true">C</div>
           <div>
-            <strong>Patchwork</strong>
+            <strong>ChatGPT - Coder</strong>
             <span>ChatGPT patch bridge</span>
           </div>
         </div>
@@ -30,6 +30,9 @@
         </button>
         <button id="trees-button" class="sidebar-session-button wide">
           <span>⑃</span> Coding trees <small id="tree-count" class="nav-count hidden">0</small>
+        </button>
+        <button id="task-history-button" class="sidebar-session-button wide">
+          <span>◷</span> Task history <small id="task-history-count" class="nav-count hidden">0</small>
         </button>
 
         <div class="side-heading">Recent tasks</div>
@@ -118,6 +121,9 @@
             </aside>
 
             <div class="diff-panel">
+              <div id="diff-tabs" class="diff-tabs" role="tablist" aria-label="Open source control comparisons">
+                <span class="diff-tabs-empty">Open a changed file to compare it.</span>
+              </div>
               <div class="diff-toolbar">
                 <div>
                   <strong id="diff-title">Select a changed file</strong>
@@ -125,7 +131,15 @@
                 </div>
                 <span id="diff-kind" class="diff-kind hidden"></span>
               </div>
-              <pre id="diff-content" class="diff-content"><code>No file selected.</code></pre>
+              <div id="diff-compare" class="diff-compare">
+                <div class="diff-compare-header">
+                  <div class="diff-side-heading"><span>Before</span><strong id="diff-before-label">Before</strong></div>
+                  <div class="diff-side-heading"><span>After</span><strong id="diff-after-label">After</strong></div>
+                </div>
+                <div id="diff-rows" class="diff-rows">
+                  <div class="diff-empty-state">No file selected.</div>
+                </div>
+              </div>
             </div>
           </div>
         </section>
@@ -140,6 +154,31 @@
             <button id="trees-new-task" class="primary">＋ New coding tree</button>
           </div>
           <div id="trees-list" class="trees-list"></div>
+        </section>
+
+        <section id="history-view" class="history-view hidden">
+          <div class="history-header">
+            <div>
+              <p class="eyebrow">SAVED LOCALLY</p>
+              <h2>Task history</h2>
+              <p>Browse every task Patchwork has prepared, including completed and failed work from coding trees that have already been merged.</p>
+            </div>
+            <div class="history-filters">
+              <label class="sr-only" for="task-history-search">Search task history</label>
+              <input id="task-history-search" type="search" placeholder="Search tasks" />
+              <label class="sr-only" for="task-history-state">Filter task history by status</label>
+              <select id="task-history-state">
+                <option value="">All statuses</option>
+                <option value="prepared">Prepared</option>
+                <option value="submitted">Submitted</option>
+                <option value="ready">Ready</option>
+                <option value="applied">Applied</option>
+                <option value="rolled-back">Rolled back</option>
+                <option value="failed">Failed</option>
+              </select>
+            </div>
+          </div>
+          <div id="task-history-list" class="task-history-list"></div>
         </section>
 
         <section id="composer-view" class="content-grid hidden">
@@ -210,8 +249,8 @@
             <p class="eyebrow">HOW IT WORKS</p>
             <ol>
               <li><span>1</span><div><strong>Isolate</strong><small>A Git worktree and Patchwork branch keep this stream independent.</small></div></li>
-              <li><span>2</span><div><strong>Hand off</strong><small>A ZIP containing the Git bundle and task instructions is uploaded to ChatGPT.</small></div></li>
-              <li><span>3</span><div><strong>Commit</strong><small>The downloaded text result is validated, applied, and committed in the tree.</small></div></li>
+              <li><span>2</span><div><strong>Hand off</strong><small>The repository bundle crosses the browser boundary as plain text.</small></div></li>
+              <li><span>3</span><div><strong>Commit</strong><small>Validated response text is applied and committed in the tree.</small></div></li>
               <li><span>4</span><div><strong>Merge</strong><small>ChatGPT summarizes the tree before Patchwork squashes it into the original branch.</small></div></li>
             </ol>
             <div class="boundary-note">
@@ -254,7 +293,6 @@
                 <div id="patch-list" class="patch-list"></div>
                 <div class="result-actions">
                   <button id="apply-button" class="primary">Apply changes</button>
-                  <button id="resolve-conflicts-button" class="primary hidden">Resubmit to resolve conflicts</button>
                   <button id="rollback-button" class="danger hidden">Roll back</button>
                 </div>
               </article>

@@ -15,6 +15,102 @@ const STATUS_LABELS = {
   '!': 'Ignored',
 };
 
+const MAX_DIFF_PREVIEW = 500_000;
+const MAX_COMPARE_ROWS = 20_000;
+
+function splitLines(value) {
+  if (!value) return [];
+  const lines = String(value).split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+function parseDiffHunks(content) {
+  const hunks = [];
+  for (const line of String(content || '').split('\n')) {
+    const match = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+    if (!match) continue;
+    hunks.push({
+      beforeStart: Number(match[1]),
+      beforeCount: match[2] === undefined ? 1 : Number(match[2]),
+      afterStart: Number(match[3]),
+      afterCount: match[4] === undefined ? 1 : Number(match[4]),
+    });
+  }
+  return hunks;
+}
+
+function buildCompareRows(beforeText, afterText, diffContent) {
+  const beforeLines = splitLines(beforeText);
+  const afterLines = splitLines(afterText);
+  const hunks = parseDiffHunks(diffContent);
+  const rows = [];
+
+  const pushRow = (beforeIndex, afterIndex, beforeType = 'unchanged', afterType = 'unchanged') => {
+    if (rows.length >= MAX_COMPARE_ROWS) return false;
+    const hasBefore = Number.isInteger(beforeIndex) && beforeIndex >= 0 && beforeIndex < beforeLines.length;
+    const hasAfter = Number.isInteger(afterIndex) && afterIndex >= 0 && afterIndex < afterLines.length;
+    rows.push({
+      beforeNumber: hasBefore ? beforeIndex + 1 : null,
+      beforeText: hasBefore ? beforeLines[beforeIndex] : '',
+      beforeType: hasBefore ? beforeType : 'empty',
+      afterNumber: hasAfter ? afterIndex + 1 : null,
+      afterText: hasAfter ? afterLines[afterIndex] : '',
+      afterType: hasAfter ? afterType : 'empty',
+    });
+    return true;
+  };
+
+  if (hunks.length === 0 && beforeText !== afterText) {
+    const changedCount = Math.max(beforeLines.length, afterLines.length);
+    for (let index = 0; index < changedCount && rows.length < MAX_COMPARE_ROWS; index += 1) {
+      pushRow(index, index, 'removed', 'added');
+    }
+    return rows;
+  }
+
+  let beforeCursor = 0;
+  let afterCursor = 0;
+  for (const hunk of hunks) {
+    const beforeTarget = hunk.beforeStart === 0 ? 0 : hunk.beforeStart - 1;
+    const afterTarget = hunk.afterStart === 0 ? 0 : hunk.afterStart - 1;
+    if (beforeTarget >= beforeLines.length && afterTarget >= afterLines.length) break;
+
+    while (beforeCursor < beforeTarget || afterCursor < afterTarget) {
+      if (rows.length >= MAX_COMPARE_ROWS) return rows;
+      const beforeIndex = beforeCursor < beforeTarget ? beforeCursor : null;
+      const afterIndex = afterCursor < afterTarget ? afterCursor : null;
+      pushRow(beforeIndex, afterIndex);
+      if (beforeIndex !== null) beforeCursor += 1;
+      if (afterIndex !== null) afterCursor += 1;
+    }
+
+    const availableBefore = Math.max(0, Math.min(hunk.beforeCount, beforeLines.length - beforeTarget));
+    const availableAfter = Math.max(0, Math.min(hunk.afterCount, afterLines.length - afterTarget));
+    const changedCount = Math.max(availableBefore, availableAfter);
+    for (let offset = 0; offset < changedCount; offset += 1) {
+      if (!pushRow(
+        offset < availableBefore ? beforeTarget + offset : null,
+        offset < availableAfter ? afterTarget + offset : null,
+        'removed',
+        'added',
+      )) return rows;
+    }
+    beforeCursor = Math.max(beforeCursor, beforeTarget + availableBefore);
+    afterCursor = Math.max(afterCursor, afterTarget + availableAfter);
+  }
+
+  while (beforeCursor < beforeLines.length || afterCursor < afterLines.length) {
+    if (!pushRow(
+      beforeCursor < beforeLines.length ? beforeCursor : null,
+      afterCursor < afterLines.length ? afterCursor : null,
+    )) break;
+    if (beforeCursor < beforeLines.length) beforeCursor += 1;
+    if (afterCursor < afterLines.length) afterCursor += 1;
+  }
+  return rows;
+}
+
 function parsePorcelainStatus(output) {
   const tokens = output.split('\0');
   const changes = [];
@@ -192,36 +288,109 @@ class GitService {
   async diff(repositoryPath, filePath, staged = false) {
     const repository = await inspectRepository(repositoryPath);
     const [safePath] = this.validatePaths([filePath]);
-    if (!staged) {
-      const status = await this.status(repository.path);
-      const change = status.changes.find((item) => item.path === safePath);
-      if (change?.untracked) {
-        const absolutePath = path.join(repository.path, safePath);
-        const buffer = await fs.readFile(absolutePath);
-        if (buffer.includes(0)) {
-          return { path: safePath, staged: false, binary: true, content: 'Binary file — preview unavailable.' };
-        }
-        const text = buffer.toString('utf8');
-        return {
-          path: safePath,
-          staged: false,
-          binary: false,
-          content: `Untracked file: ${safePath}\n\n${text.slice(0, 500_000)}`,
-          truncated: text.length > 500_000,
-        };
-      }
-    }
-    const args = ['diff', '--no-ext-diff'];
+    const { changes } = await this.status(repository.path);
+    const change = changes.find((item) => item.path === safePath);
+    if (!staged && change?.untracked) return this.untrackedDiff(repository, safePath);
+
+    const oldPath = change?.originalPath && (
+      staged ? ['R', 'C'].includes(change.indexStatus) : ['R', 'C'].includes(change.worktreeStatus)
+    ) ? change.originalPath : safePath;
+
+    const args = ['diff', '--no-ext-diff', '--no-color', '--unified=0'];
     if (staged) args.push('--cached');
-    args.push('--', safePath);
+    args.push('--', ...new Set([oldPath, safePath]));
     const { stdout } = await runGit(repository.path, args);
+    const binary = /Binary files .* differ|GIT binary patch/.test(stdout);
+    const labels = staged
+      ? { beforeLabel: repository.hasHead ? 'HEAD' : 'Empty repository', afterLabel: 'Index' }
+      : { beforeLabel: 'Index', afterLabel: 'Working Tree' };
+    if (binary) {
+      return {
+        path: safePath,
+        staged: Boolean(staged),
+        binary: true,
+        content: 'Binary file — preview unavailable.',
+        rows: [],
+        ...labels,
+      };
+    }
+
+    const [beforeText, afterText] = staged
+      ? await Promise.all([
+        repository.hasHead ? this.readGitText(repository.path, `HEAD:${oldPath}`) : null,
+        this.readGitText(repository.path, `:${safePath}`),
+      ])
+      : await Promise.all([
+        this.readGitText(repository.path, `:${oldPath}`),
+        this.readWorktreeText(repository.path, safePath),
+      ]);
+    const beforePreview = String(beforeText || '').slice(0, MAX_DIFF_PREVIEW);
+    const afterPreview = String(afterText || '').slice(0, MAX_DIFF_PREVIEW);
+    const rows = buildCompareRows(beforePreview, afterPreview, stdout);
+    const truncated = stdout.length > MAX_DIFF_PREVIEW
+      || String(beforeText || '').length > MAX_DIFF_PREVIEW
+      || String(afterText || '').length > MAX_DIFF_PREVIEW
+      || rows.length >= MAX_COMPARE_ROWS;
     return {
       path: safePath,
       staged: Boolean(staged),
-      binary: /Binary files .* differ/.test(stdout),
-      content: stdout || 'No textual diff is available for this file.',
-      truncated: stdout.length > 500_000,
+      binary: false,
+      content: (stdout || 'No textual diff is available for this file.').slice(0, MAX_DIFF_PREVIEW),
+      rows,
+      truncated,
+      ...labels,
     };
+  }
+
+  async untrackedDiff(repository, safePath) {
+    const absolutePath = path.join(repository.path, safePath);
+    const buffer = await fs.readFile(absolutePath);
+    if (buffer.includes(0)) {
+      return {
+        path: safePath,
+        staged: false,
+        binary: true,
+        content: 'Binary file — preview unavailable.',
+        rows: [],
+        beforeLabel: 'Index',
+        afterLabel: 'Working Tree',
+      };
+    }
+    const text = buffer.toString('utf8');
+    const preview = text.slice(0, MAX_DIFF_PREVIEW);
+    return {
+      path: safePath,
+      staged: false,
+      binary: false,
+      content: `Untracked file: ${safePath}\n\n${preview}`,
+      rows: buildCompareRows('', preview, ''),
+      beforeLabel: 'Index',
+      afterLabel: 'Working Tree',
+      truncated: text.length > MAX_DIFF_PREVIEW,
+    };
+  }
+
+  async readGitText(repositoryPath, objectName) {
+    try {
+      await runGit(repositoryPath, ['cat-file', '-e', objectName]);
+    } catch {
+      return null;
+    }
+    const { stdout } = await runGit(repositoryPath, ['show', objectName]);
+    return stdout;
+  }
+
+  async readWorktreeText(repositoryPath, filePath) {
+    const absolutePath = path.join(repositoryPath, filePath);
+    try {
+      const stat = await fs.lstat(absolutePath);
+      if (stat.isSymbolicLink()) return fs.readlink(absolutePath);
+      if (!stat.isFile()) return null;
+      return fs.readFile(absolutePath, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
   }
 
   validatePaths(files) {
@@ -233,4 +402,4 @@ class GitService {
   }
 }
 
-module.exports = { GitService, parsePorcelainStatus };
+module.exports = { GitService, buildCompareRows, parsePorcelainStatus };

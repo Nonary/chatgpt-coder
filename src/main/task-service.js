@@ -12,6 +12,7 @@ const {
 const SCHEMA_VERSION = 1;
 
 function buildAgentInstructions(taskId) {
+  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
   return `# Patchwork task protocol
 
 You are working on a software task supplied by the user through Patchwork IDE.
@@ -37,11 +38,22 @@ For every manifest repository with \`workingChanges: true\`, the supplied \`base
 
 You may create commits as checkpoints. Do not rewrite the supplied base history and do not add generated dependencies, build output, credentials, or unrelated files.
 
-## Solve and verify the task
+## Sandbox constraints
 
-Follow any repository-specific \`AGENTS.md\` files found after cloning. Implement the task in \`TASK.md\`, run relevant checks when possible, and inspect the final diff. Keep changes focused on the requested task.
+The ChatGPT sandbox cannot successfully install dependencies or run this project's verification toolchain. Do not attempt any of the following:
 
-## Produce the downloadable text result
+- installing, updating, or downloading dependencies;
+- accessing package registries or other external network resources;
+- running builds, tests, linters, type checks, development servers, code generators, or packaging commands;
+- changing dependency manifests or lockfiles merely to make the sandbox environment work.
+
+These commands are prohibited even if a repository-specific instruction suggests running them. There is no value in trying and retrying commands that cannot work in this sandbox. You may inspect files, search source text, and use read-only Git commands such as \`git status\`, \`git diff\`, and \`git log\`.
+
+## Solve and inspect the task
+
+Follow repository-specific \`AGENTS.md\` files except where they conflict with the sandbox constraints above. Implement the task in \`TASK.md\`, inspect the final diff carefully, and keep changes focused. In the result summary, state that builds and tests were not run because the task protocol prohibits them in the ChatGPT sandbox; do not present this as an implementation failure.
+
+## Produce the plain-text result
 
 Generate one binary-safe patch per repository from the supplied base commit so checkpoint commits are included:
 
@@ -142,14 +154,36 @@ class TaskService {
     }
 
     const repositories = await this.inspectRepositories(input.repositories.map((item) => item.path));
+    const requestedRepositories = new Map(await Promise.all(input.repositories.map(async (item) => [
+      await fs.realpath(item.path),
+      item,
+    ])));
     const taskId = crypto.randomUUID();
     const taskDir = this.taskDirectory(taskId);
     const bundlesDir = path.join(taskDir, 'repositories');
     await fs.mkdir(bundlesDir, { recursive: true });
 
+    const conflictPatchFiles = [];
+    if (input.conflictContext) {
+      const conflictsDir = path.join(taskDir, 'conflicts');
+      await fs.mkdir(conflictsDir, { recursive: true });
+      for (const patch of input.conflictContext.patches || []) {
+        if (!patch.localPath) continue;
+        const filename = `${patch.id}.patch`;
+        const relativeFile = `conflicts/${filename}`;
+        await fs.copyFile(patch.localPath, path.join(conflictsDir, filename));
+        conflictPatchFiles.push({ id: patch.id, file: relativeFile });
+      }
+      await fs.writeFile(
+        path.join(taskDir, 'CONFLICTS.md'),
+        conflictMarkdown(input.conflictContext, conflictPatchFiles),
+      );
+    }
+
     const publicRepositories = [];
     const taskRepositories = [];
     for (const repository of repositories) {
+      const readOnly = Boolean(requestedRepositories.get(repository.path)?.readOnly);
       const bundleFile = `repositories/${repository.id}.bundle`;
       const bundlePath = path.join(taskDir, bundleFile);
       let taskRepository;
@@ -196,6 +230,7 @@ class TaskService {
           await fs.rm(snapshotPath, { recursive: true, force: true });
         }
       }
+      taskRepository.readOnly = readOnly;
       taskRepositories.push(taskRepository);
       publicRepositories.push({
         id: repository.id,
@@ -207,19 +242,8 @@ class TaskService {
         workingChanges: taskRepository.workingChanges,
         workingStatus: taskRepository.workingStatus,
         bundleFile,
+        readOnly,
       });
-    }
-
-    const conflictPatchFiles = [];
-    if (input.conflictContext) {
-      const conflictDir = path.join(taskDir, 'conflicts');
-      await fs.mkdir(conflictDir, { recursive: true });
-      for (const patch of input.conflictContext.patches || []) {
-        if (!patch?.localPath || !/^[a-z0-9._-]+$/i.test(String(patch.id || ''))) continue;
-        const file = `conflicts/${patch.id}.patch`;
-        await fs.copyFile(patch.localPath, path.join(taskDir, file));
-        conflictPatchFiles.push({ id: patch.id, file });
-      }
     }
 
     const createdAt = new Date().toISOString();
@@ -229,23 +253,13 @@ class TaskService {
       createdAt,
       repositories: publicRepositories,
     };
-    if (input.conflictContext) {
-      manifest.conflictResolution = {
-        originalTaskId: input.conflictContext.originalTaskId,
-        files: input.conflictContext.files || [],
-        patches: conflictPatchFiles,
-      };
-    }
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
-    const agentInstructions = buildAgentInstructions(taskId);
+    const agentInstructions = `${buildAgentInstructions(taskId)}\n${buildCurrentAgentAddendum(taskId)}`;
 
     await Promise.all([
       fs.writeFile(path.join(taskDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
       fs.writeFile(path.join(taskDir, 'TASK.md'), taskMarkdown),
       fs.writeFile(path.join(taskDir, 'AGENTS.md'), agentInstructions),
-      ...(input.conflictContext ? [
-        fs.writeFile(path.join(taskDir, 'CONFLICTS.md'), conflictMarkdown(input.conflictContext, conflictPatchFiles)),
-      ] : []),
     ]);
 
     const packagePath = path.join(taskDir, `chatgpt-ide-task-${taskId}.zip`);
@@ -269,15 +283,16 @@ class TaskService {
       resultTransport: 'downloaded-text-file',
       treeId: input.tree?.id || null,
       treeName: input.tree?.name || null,
+      mergeResolution: Boolean(input.mergeResolution),
+      resultFilename: `chatgpt-ide-result-${taskId}.txt`,
       sourceRepositoryPath: input.tree?.repositoryPath || null,
       packagePath,
-      packageBytes: packageStat.size,
       handoffPrompt: buildHandoffPrompt(taskId, taskText),
       repositories: taskRepositories,
       state: 'prepared',
       result: null,
-      conflictContext: input.conflictContext ? manifest.conflictResolution : null,
     };
+    record.handoffPrompt = `${record.handoffPrompt}\n\n${buildCurrentHandoffAddendum(taskId)}`;
     await this.saveTask(record);
     return record;
   }
@@ -322,3 +337,15 @@ module.exports = {
   buildAgentInstructions,
   buildHandoffPrompt,
 };
+
+function buildCurrentAgentAddendum(taskId) {
+  return `## Current ChatGPT - Coder requirements
+
+Repositories marked \`readOnly: true\` are context snapshots. Inspect them to understand the task, but never edit them. Make changes only in writable repositories and return an empty patch for each read-only repository.
+
+The required result is one attached UTF-8 text file named \`chatgpt-ide-result-${taskId}.txt\`. Never print the result envelope or patch contents in the conversation. Do not paste PATCHWORK_RESULT_V1 or its JSON payload into chat. These requirements supersede any earlier compatibility wording.`;
+}
+
+function buildCurrentHandoffAddendum(taskId) {
+  return `Do not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Create and attach the required UTF-8 result file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1, the JSON envelope, or patch contents into the conversation.`;
+}

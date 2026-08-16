@@ -8,6 +8,7 @@ const state = {
   gitStatus: null,
   selectedGitPath: null,
   selectedDiffKey: null,
+  diffTabs: [],
 };
 
 const elements = Object.fromEntries(
@@ -15,12 +16,14 @@ const elements = Object.fromEntries(
     'new-task-button', 'chatgpt-session-button', 'task-list', 'page-title',
     'composer-view', 'task-view', 'session-view', 'source-view',
     'trees-view', 'trees-button', 'tree-count', 'trees-list', 'trees-new-task',
+    'history-view', 'task-history-button', 'task-history-count', 'task-history-list',
+    'task-history-search', 'task-history-state',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
     'task-tree-select', 'new-tree-fields', 'tree-name',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'result-card', 'result-summary', 'patch-list',
-    'apply-button', 'resolve-conflicts-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
+    'apply-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
     'chatgpt-surface', 'browser-back-button', 'browser-forward-button',
     'browser-reload-button', 'new-chat-button', 'browser-title', 'browser-status',
     'browser-status-dot',
@@ -32,7 +35,8 @@ const elements = Object.fromEntries(
     'source-branch', 'source-commit-message', 'source-commit-button',
     'staged-count', 'unstaged-count', 'staged-files', 'unstaged-files',
     'stage-all-button', 'unstage-all-button', 'commit-history',
-    'diff-title', 'diff-subtitle', 'diff-kind', 'diff-content',
+    'diff-tabs', 'diff-title', 'diff-subtitle', 'diff-kind', 'diff-compare',
+    'diff-before-label', 'diff-after-label', 'diff-rows',
   ].map((id) => [id, document.getElementById(id)]),
 );
 
@@ -59,6 +63,13 @@ function showToast(message, error = false) {
 
 function formatTime(value = new Date()) {
   return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(value));
+}
+
+function formatDateTime(value) {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value));
 }
 
 function addActivity(message, timestamp = new Date()) {
@@ -110,7 +121,7 @@ function renderTaskTreeOptions() {
   const previous = select.value;
   select.innerHTML = '<option value="">Create a new coding tree</option>' + state.trees
     .filter((tree) => tree.available && tree.mergeState !== 'submitted')
-    .map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}</option>`)
+    .map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}${tree.managed === false ? ' · Git worktree' : ''}</option>`)
     .join('');
   if ([...select.options].some((option) => option.value === previous)) select.value = previous;
   const existing = Boolean(select.value);
@@ -133,18 +144,20 @@ function renderTrees() {
   container.innerHTML = state.trees.map((tree) => `<article class="tree-card">
     <div class="tree-card-heading">
       <div class="repo-icon">${escapeHtml(tree.repositoryName[0]?.toUpperCase() || 'T')}</div>
-      <div><strong>${escapeHtml(tree.name)}</strong><small>${escapeHtml(tree.branch)}</small></div>
-      <span class="tree-state ${tree.clean && tree.mergeState !== 'failed' ? '' : 'dirty'}">${tree.available ? (tree.mergeState === 'submitted' ? 'Merging' : tree.mergeState === 'failed' ? 'Merge failed' : tree.clean ? 'Clean' : 'Changes') : 'Missing'}</span>
+      <div><strong>${escapeHtml(tree.name)}</strong><small>${escapeHtml(tree.branch)}${tree.managed === false ? ' · Detected by Git' : ''}</small></div>
+      <span class="tree-state ${tree.clean && tree.mergeState !== 'failed' ? '' : 'dirty'}">${tree.available ? (tree.mergeState === 'submitted' ? 'Merging' : tree.mergeState === 'failed' ? 'Merge failed' : tree.managed === false && tree.clean ? 'Detected' : tree.clean ? 'Clean' : 'Changes') : 'Missing'}</span>
     </div>
     <div class="tree-stats">
       <div class="tree-stat"><strong>${escapeHtml(tree.commitCount || 0)}</strong><small>Tree commits</small></div>
       <div class="tree-stat"><strong>${escapeHtml((tree.taskIds || []).length)}</strong><small>Tasks</small></div>
     </div>
     <div class="tree-last">${tree.lastSubject ? `${escapeHtml(tree.lastCommit)} · ${escapeHtml(tree.lastSubject)}` : 'No task commits yet.'}</div>
+    ${tree.mergeError ? `<div class="tree-last tree-error">${escapeHtml(tree.mergeError)}</div>` : ''}
     <div class="tree-actions">
       <button class="primary tree-continue" data-tree-id="${escapeHtml(tree.id)}" ${!tree.available || tree.mergeState === 'submitted' ? 'disabled' : ''}>Continue task</button>
       <button class="secondary tree-source" data-tree-id="${escapeHtml(tree.id)}" ${!tree.available ? 'disabled' : ''}>Source control</button>
       <button class="secondary tree-merge" data-tree-id="${escapeHtml(tree.id)}" ${!tree.available || !tree.clean || !tree.commitCount || tree.mergeState === 'submitted' ? 'disabled' : ''}>Merge tree</button>
+      ${tree.mergeState === 'failed' ? `<button class="primary tree-resolve" data-tree-id="${escapeHtml(tree.id)}">Resolve with ChatGPT</button>` : ''}
       <button class="secondary tree-reveal" data-tree-id="${escapeHtml(tree.id)}">Reveal</button>
       <button class="danger tree-remove" data-tree-id="${escapeHtml(tree.id)}">Discard</button>
     </div>
@@ -172,6 +185,22 @@ function renderTrees() {
       await refreshTrees();
     } catch (error) {
       showToast(error.message, true);
+      await refreshTrees();
+    }
+  }));
+  container.querySelectorAll('.tree-resolve').forEach((button) => button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      const task = await window.patchwork.resolveTreeMerge(button.dataset.treeId);
+      if (!task) return;
+      upsertTask(task);
+      await refreshTrees();
+      showTask(task);
+      showToast('Conflict-resolution task submitted to ChatGPT.');
+    } catch (error) {
+      showToast(error.message, true);
+    } finally {
+      button.disabled = false;
     }
   }));
   container.querySelectorAll('.tree-reveal').forEach((button) => button.addEventListener('click', () => (
@@ -217,36 +246,105 @@ function updateTaskElapsedTimes() {
 }
 
 function renderTaskList() {
-  elements['task-list'].innerHTML = state.tasks.length
-    ? state.tasks.map((task) => `
+  const recentTasks = state.tasks.slice(0, 5);
+  elements['task-history-count'].textContent = String(state.tasks.length);
+  elements['task-history-count'].classList.toggle('hidden', state.tasks.length === 0);
+  elements['task-list'].innerHTML = recentTasks.length
+    ? recentTasks.map((task) => `
       <button class="task-nav-item ${state.activeTask?.taskId === task.taskId ? 'active' : ''}" data-task-id="${escapeHtml(task.taskId)}">
-        <span class="task-name-row">
-          <strong>${escapeHtml(taskLabel(task))}</strong>
-          ${task.state === 'submitted' && task.submittedAt ? `<time class="task-elapsed" data-started-at="${escapeHtml(task.submittedAt)}">${escapeHtml(formatElapsed(task.submittedAt))}</time>` : ''}
-        </span>
+        <strong>${escapeHtml(taskLabel(task))}</strong>
         <span>${escapeHtml(task.state)} · ${escapeHtml(formatTime(task.createdAt))}</span>
-      </button>`).join('')
+      </button>`).join('') + (state.tasks.length > recentTasks.length
+      ? `<button id="task-list-more" class="task-list-more">View all ${state.tasks.length} tasks</button>`
+      : '')
     : '<p class="muted small">No tasks yet.</p>';
   elements['task-list'].querySelectorAll('.task-nav-item').forEach((button) => {
     button.addEventListener('click', async () => {
       try {
-        const task = await window.patchwork.getTask(button.dataset.taskId);
-        showTask(task);
-        const opened = await window.patchwork.openTaskChat(task.taskId);
-        if (!opened.opened && opened.message) showToast(opened.message, task.state !== 'prepared');
+        showTask(await window.patchwork.openTask(button.dataset.taskId));
       } catch (error) {
         showToast(error.message, true);
       }
+    });
+  });
+  document.getElementById('task-list-more')?.addEventListener('click', showTaskHistory);
+}
+
+function taskHistorySearchText(task) {
+  return [
+    task.taskText,
+    task.treeName,
+    task.state,
+    task.error,
+    task.result?.summary,
+    task.result?.commitMessage,
+    ...(task.repositories || []).flatMap((repository) => [repository.name, repository.branch, repository.path]),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function renderTaskHistory() {
+  const search = elements['task-history-search'].value.trim().toLowerCase();
+  const stateFilter = elements['task-history-state'].value;
+  const tasks = state.tasks.filter((task) => (
+    (!stateFilter || task.state === stateFilter)
+    && (!search || taskHistorySearchText(task).includes(search))
+  ));
+
+  if (tasks.length === 0) {
+    elements['task-history-list'].className = 'task-history-list empty-state';
+    elements['task-history-list'].innerHTML = state.tasks.length
+      ? '<div class="empty-icon">⌕</div><strong>No matching tasks</strong><span>Try a different search or status filter.</span>'
+      : '<div class="empty-icon">◷</div><strong>No task history yet</strong><span>Prepared tasks will be saved here automatically.</span>';
+    return;
+  }
+
+  elements['task-history-list'].className = 'task-history-list';
+  elements['task-history-list'].innerHTML = tasks.map((task) => {
+    const repositoryNames = (task.repositories || []).map((repository) => repository.name).filter(Boolean);
+    const context = task.treeName || repositoryNames.join(', ') || 'Local task';
+    const detail = task.result?.summary || task.error || 'No result summary recorded.';
+    const commitMessage = task.result?.commitMessage?.split('\n')[0] || '';
+    return `<article class="task-history-card">
+      <div class="task-history-heading">
+        <div>
+          <strong>${escapeHtml(taskLabel(task))}</strong>
+          <small>${escapeHtml(formatDateTime(task.createdAt))} · ${escapeHtml(context)}</small>
+        </div>
+        <span class="history-state ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span>
+      </div>
+      <p class="task-history-description">${escapeHtml(task.taskText || 'Untitled task')}</p>
+      <div class="task-history-result">
+        <span>${escapeHtml(detail)}</span>
+        ${commitMessage ? `<code>${escapeHtml(commitMessage)}</code>` : ''}
+      </div>
+      <div class="task-history-actions">
+        <button class="primary history-open-task" data-task-id="${escapeHtml(task.taskId)}">View task</button>
+        ${task.packagePath ? `<button class="secondary history-reveal-package" data-task-id="${escapeHtml(task.taskId)}">Show package</button>` : ''}
+      </div>
+    </article>`;
+  }).join('');
+
+  elements['task-history-list'].querySelectorAll('.history-open-task').forEach((button) => {
+    button.addEventListener('click', async () => {
+      try {
+        showTask(await window.patchwork.openTask(button.dataset.taskId));
+      } catch (error) {
+        showToast(error.message, true);
+      }
+    });
+  });
+  elements['task-history-list'].querySelectorAll('.history-reveal-package').forEach((button) => {
+    button.addEventListener('click', () => {
+      window.patchwork.revealPackage(button.dataset.taskId).catch((error) => showToast(error.message, true));
     });
   });
 }
 
 const statusText = {
   prepared: ['Package prepared', 'Attach the package in ChatGPT and send the copied instructions.'],
-  submitted: ['Task submitted', 'ChatGPT is working in the embedded browser. Patchwork is watching for the downloadable text result.'],
-  ready: ['Patch validated', 'The downloaded text result matches the task and is safe to commit.'],
+  submitted: ['Task submitted', 'ChatGPT is working in the embedded browser. Patchwork is watching for the result.'],
+  ready: ['Patch validated', 'The plain-text result matches the task and is safe to commit.'],
   applied: ['Changes committed', 'The validated patch is committed in this task’s coding tree.'],
-  conflicted: ['Merge conflicts need resolution', 'The coding tree and ChatGPT result both contain changes that need to be reconciled.'],
   'rolled-back': ['Changes reverted', 'A revert commit was created in this task’s coding tree.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
 };
@@ -260,10 +358,8 @@ function renderResult(task) {
     <div class="patch-item">
       <strong>${escapeHtml(patch.name || patch.id)}</strong>
       <pre>${escapeHtml(patch.stat || 'No changes')}</pre>
-    </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '')
-    + (task.result.conflicts?.length ? task.result.conflicts.map((conflict) => `<div class="patch-item"><strong>Merge conflict</strong><pre>${escapeHtml((conflict.files || []).length ? conflict.files.join('\n') : conflict.error || 'The patch did not apply cleanly.')}</pre></div>`).join('') : '');
+    </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '');
   elements['apply-button'].classList.toggle('hidden', task.state !== 'ready');
-  elements['resolve-conflicts-button'].classList.toggle('hidden', task.state !== 'conflicted' || !task.treeId);
   elements['rollback-button'].classList.toggle('hidden', task.state !== 'applied');
 }
 
@@ -274,10 +370,12 @@ function showTask(task) {
   elements['session-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
   elements['trees-view'].classList.add('hidden');
+  elements['history-view'].classList.add('hidden');
   elements['task-view'].classList.remove('hidden');
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.remove('active');
   elements['trees-button'].classList.remove('active');
+  elements['task-history-button'].classList.remove('active');
   elements['page-title'].textContent = taskLabel(task);
   const [title, copy] = statusText[task.state] || statusText.prepared;
   elements['task-status-title'].textContent = title;
@@ -286,10 +384,6 @@ function showTask(task) {
   elements['status-badge'].className = `status-badge ${task.state}`;
   addActivity(`Task ${task.state}`, task.updatedAt || task.createdAt);
   addActivity(`${task.repositories.length} repository snapshot${task.repositories.length === 1 ? '' : 's'} prepared`, task.createdAt);
-  if (task.packageBytes) {
-    const packageMegabytes = task.packageBytes / (1024 * 1024);
-    addActivity(`Task package ${packageMegabytes >= 1 ? `${packageMegabytes.toFixed(1)} MB` : `${Math.ceil(task.packageBytes / 1024)} KB`}`, task.createdAt);
-  }
   renderResult(task);
   renderTaskList();
   window.patchwork.setBrowserVisible(true);
@@ -302,11 +396,13 @@ function showComposer() {
   elements['session-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
   elements['trees-view'].classList.add('hidden');
+  elements['history-view'].classList.add('hidden');
   elements['composer-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'Prepare a coding task';
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.remove('active');
   elements['trees-button'].classList.remove('active');
+  elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   renderTaskTreeOptions();
   renderTaskList();
@@ -317,11 +413,13 @@ function showSession() {
   elements['task-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
   elements['trees-view'].classList.add('hidden');
+  elements['history-view'].classList.add('hidden');
   elements['session-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'ChatGPT session';
   elements['chatgpt-session-button'].classList.add('active');
   elements['source-control-button'].classList.remove('active');
   elements['trees-button'].classList.remove('active');
+  elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(true);
   requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
   renderTaskList();
@@ -332,11 +430,13 @@ async function showSourceControl() {
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
   elements['trees-view'].classList.add('hidden');
+  elements['history-view'].classList.add('hidden');
   elements['source-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'Source control';
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.add('active');
   elements['trees-button'].classList.remove('active');
+  elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   renderSourceRepositories();
   await loadGitStatus(elements['source-repository-select'].value || state.selectedGitPath);
@@ -347,13 +447,33 @@ function showTrees() {
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
+  elements['history-view'].classList.add('hidden');
   elements['trees-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'Coding trees';
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.remove('active');
   elements['trees-button'].classList.add('active');
+  elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   refreshTrees().catch((error) => showToast(error.message, true));
+}
+
+function showTaskHistory() {
+  state.activeTask = null;
+  elements['composer-view'].classList.add('hidden');
+  elements['task-view'].classList.add('hidden');
+  elements['session-view'].classList.add('hidden');
+  elements['source-view'].classList.add('hidden');
+  elements['trees-view'].classList.add('hidden');
+  elements['history-view'].classList.remove('hidden');
+  elements['page-title'].textContent = 'Task history';
+  elements['chatgpt-session-button'].classList.remove('active');
+  elements['source-control-button'].classList.remove('active');
+  elements['trees-button'].classList.remove('active');
+  elements['task-history-button'].classList.add('active');
+  window.patchwork.setBrowserVisible(false);
+  renderTaskList();
+  renderTaskHistory();
 }
 
 function syncBrowserBounds() {
@@ -404,12 +524,143 @@ function renderSourceRepositories() {
   elements['source-remove-repository'].disabled = !select.value;
 }
 
+function gitDiffKey(filePath, staged) {
+  return `${staged ? 'staged' : 'working'}:${filePath}`;
+}
+
+function renderDiffTabs() {
+  const container = elements['diff-tabs'];
+  if (state.diffTabs.length === 0) {
+    container.innerHTML = '<span class="diff-tabs-empty">Open a changed file to compare it.</span>';
+    return;
+  }
+  container.innerHTML = state.diffTabs.map((tab) => {
+    const fileName = tab.filePath.split('/').pop();
+    const active = tab.key === state.selectedDiffKey;
+    return `<div class="diff-tab ${active ? 'active' : ''}">
+      <button class="diff-tab-open" role="tab" aria-selected="${active}" data-key="${escapeHtml(tab.key)}" title="${escapeHtml(tab.filePath)}">
+        <span class="diff-tab-status">${tab.staged ? 'S' : 'W'}</span>
+        <span class="diff-tab-name">${escapeHtml(fileName)}</span>
+      </button>
+      <button class="diff-tab-close" data-key="${escapeHtml(tab.key)}" title="Close comparison" aria-label="Close ${escapeHtml(fileName)}">×</button>
+    </div>`;
+  }).join('');
+  container.querySelectorAll('.diff-tab-open').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.selectedDiffKey = button.dataset.key;
+      renderDiffTabs();
+      renderActiveDiff();
+      renderGitStatus();
+    });
+  });
+  container.querySelectorAll('.diff-tab-close').forEach((button) => {
+    button.addEventListener('click', () => closeGitDiff(button.dataset.key));
+  });
+}
+
+function renderDiffRows(rows) {
+  if (!rows || rows.length === 0) {
+    return '<div class="diff-empty-state">No textual changes to compare.</div>';
+  }
+  return rows.map((row) => `
+    <div class="diff-line ${escapeHtml(row.beforeType)}">
+      <span class="diff-line-number">${row.beforeNumber ?? ''}</span>
+      <code>${row.beforeText ? escapeHtml(row.beforeText) : '&nbsp;'}</code>
+    </div>
+    <div class="diff-line ${escapeHtml(row.afterType)}">
+      <span class="diff-line-number">${row.afterNumber ?? ''}</span>
+      <code>${row.afterText ? escapeHtml(row.afterText) : '&nbsp;'}</code>
+    </div>
+  `).join('');
+}
+
+function renderActiveDiff() {
+  const tab = state.diffTabs.find((item) => item.key === state.selectedDiffKey);
+  if (!tab) {
+    elements['diff-title'].textContent = 'Select a changed file';
+    elements['diff-subtitle'].textContent = 'Its before and after comparison will appear here.';
+    elements['diff-kind'].classList.add('hidden');
+    elements['diff-before-label'].textContent = 'Before';
+    elements['diff-after-label'].textContent = 'After';
+    elements['diff-rows'].innerHTML = '<div class="diff-empty-state">No file selected.</div>';
+    return;
+  }
+
+  elements['diff-title'].textContent = tab.filePath;
+  elements['diff-kind'].textContent = tab.staged ? 'Staged' : 'Working tree';
+  elements['diff-kind'].classList.remove('hidden');
+  if (tab.loading) {
+    elements['diff-subtitle'].textContent = 'Loading comparison…';
+    elements['diff-before-label'].textContent = tab.staged ? 'HEAD' : 'Index';
+    elements['diff-after-label'].textContent = tab.staged ? 'Index' : 'Working Tree';
+    elements['diff-rows'].innerHTML = '<div class="diff-empty-state">Loading before and after…</div>';
+    return;
+  }
+  if (tab.error) {
+    elements['diff-subtitle'].textContent = 'Unable to load comparison';
+    elements['diff-rows'].innerHTML = `<div class="diff-empty-state error">${escapeHtml(tab.error)}</div>`;
+    return;
+  }
+
+  const diff = tab.diff;
+  elements['diff-before-label'].textContent = diff.beforeLabel || 'Before';
+  elements['diff-after-label'].textContent = diff.afterLabel || 'After';
+  if (diff.binary) {
+    elements['diff-subtitle'].textContent = 'Binary file';
+    elements['diff-rows'].innerHTML = '<div class="diff-empty-state">Binary file comparison is unavailable.</div>';
+    return;
+  }
+  elements['diff-subtitle'].textContent = diff.truncated
+    ? 'Comparison truncated to keep the preview responsive'
+    : (tab.staged ? 'HEAD compared with the staged file' : 'Index compared with the working file');
+  elements['diff-rows'].innerHTML = renderDiffRows(diff.rows);
+}
+
+function closeGitDiff(key) {
+  const index = state.diffTabs.findIndex((tab) => tab.key === key);
+  if (index === -1) return;
+  const wasSelected = state.selectedDiffKey === key;
+  state.diffTabs.splice(index, 1);
+  if (wasSelected) {
+    const next = state.diffTabs[index] || state.diffTabs[index - 1] || null;
+    state.selectedDiffKey = next?.key || null;
+  }
+  renderDiffTabs();
+  renderActiveDiff();
+  renderGitStatus();
+}
+
+function resetGitDiffTabs() {
+  state.diffTabs = [];
+  state.selectedDiffKey = null;
+  renderDiffTabs();
+  renderActiveDiff();
+}
+
+function pruneGitDiffTabs() {
+  if (!state.gitStatus) {
+    resetGitDiffTabs();
+    return;
+  }
+  const validKeys = new Set();
+  for (const change of state.gitStatus.changes) {
+    if (change.staged) validKeys.add(gitDiffKey(change.path, true));
+    if (change.unstaged) validKeys.add(gitDiffKey(change.path, false));
+  }
+  state.diffTabs = state.diffTabs.filter((tab) => validKeys.has(tab.key));
+  if (!state.diffTabs.some((tab) => tab.key === state.selectedDiffKey)) {
+    state.selectedDiffKey = state.diffTabs.at(-1)?.key || null;
+  }
+  renderDiffTabs();
+  renderActiveDiff();
+}
+
 function gitFileMarkup(change, staged) {
   const parts = change.path.split('/');
   const fileName = parts.pop();
   const directory = parts.join('/') || 'repository root';
   const status = staged ? change.indexStatus : (change.untracked ? '?' : change.worktreeStatus);
-  const key = `${staged ? 'staged' : 'working'}:${change.path}`;
+  const key = gitDiffKey(change.path, staged);
   return `<div class="git-file-row">
     <button class="git-file-open ${state.selectedDiffKey === key ? 'active' : ''}" data-path="${escapeHtml(change.path)}" data-staged="${staged}">
       <span class="git-status-letter">${escapeHtml(status)}</span>
@@ -468,9 +719,13 @@ function renderGitStatus() {
 async function loadGitStatus(repositoryPath) {
   if (!repositoryPath) {
     state.gitStatus = null;
+    state.selectedGitPath = null;
+    resetGitDiffTabs();
     renderGitStatus();
     return;
   }
+  const repositoryChanged = Boolean(state.selectedGitPath && state.selectedGitPath !== repositoryPath);
+  if (repositoryChanged) resetGitDiffTabs();
   state.selectedGitPath = repositoryPath;
   elements['source-repository-select'].value = repositoryPath;
   elements['source-branch'].textContent = 'Refreshing…';
@@ -481,8 +736,12 @@ async function loadGitStatus(repositoryPath) {
     state.repositories = state.repositories.map((item) => item.path === updated.path ? updated : item);
     renderRepositories();
     renderGitStatus();
+    pruneGitDiffTabs();
+    const active = state.diffTabs.find((tab) => tab.key === state.selectedDiffKey);
+    if (active) await openGitDiff(active.filePath, active.staged);
   } catch (error) {
     state.gitStatus = null;
+    resetGitDiffTabs();
     renderGitStatus();
     showToast(error.message, true);
   }
@@ -490,22 +749,34 @@ async function loadGitStatus(repositoryPath) {
 
 async function openGitDiff(filePath, staged) {
   if (!state.selectedGitPath) return;
-  state.selectedDiffKey = `${staged ? 'staged' : 'working'}:${filePath}`;
-  elements['diff-title'].textContent = filePath;
-  elements['diff-subtitle'].textContent = 'Loading diff…';
-  elements['diff-kind'].textContent = staged ? 'Staged' : 'Working tree';
-  elements['diff-kind'].classList.remove('hidden');
-  elements['diff-content'].textContent = '';
+  const key = gitDiffKey(filePath, staged);
+  let tab = state.diffTabs.find((item) => item.key === key);
+  if (!tab) {
+    tab = { key, filePath, staged, loading: true, diff: null, error: null };
+    state.diffTabs.push(tab);
+  } else {
+    tab.loading = true;
+    tab.error = null;
+  }
+  state.selectedDiffKey = key;
+  renderDiffTabs();
+  renderActiveDiff();
   renderGitStatus();
   try {
     const diff = await window.patchwork.gitDiff(state.selectedGitPath, filePath, staged);
-    elements['diff-subtitle'].textContent = diff.binary
-      ? 'Binary file'
-      : diff.truncated ? 'Preview truncated to 500 KB' : (staged ? 'Changes ready to commit' : 'Unstaged changes');
-    elements['diff-content'].textContent = diff.content;
+    const current = state.diffTabs.find((item) => item.key === key);
+    if (!current) return;
+    current.loading = false;
+    current.diff = diff;
+    current.error = null;
   } catch (error) {
-    elements['diff-subtitle'].textContent = 'Unable to load diff';
-    elements['diff-content'].textContent = error.message;
+    const current = state.diffTabs.find((item) => item.key === key);
+    if (!current) return;
+    current.loading = false;
+    current.error = error.message;
+  } finally {
+    renderDiffTabs();
+    renderActiveDiff();
   }
 }
 
@@ -518,6 +789,9 @@ async function performGitMutation(operation, successMessage) {
     state.repositories = state.repositories.map((item) => item.path === updated.path ? updated : item);
     renderRepositories();
     renderGitStatus();
+    pruneGitDiffTabs();
+    const active = state.diffTabs.find((tab) => tab.key === state.selectedDiffKey);
+    if (active) await openGitDiff(active.filePath, active.staged);
     if (successMessage) showToast(successMessage);
   } catch (error) {
     showToast(error.message, true);
@@ -536,7 +810,7 @@ async function createTask() {
       treeId: elements['task-tree-select'].value || null,
       treeName: elements['tree-name'].value,
     });
-    state.tasks.unshift(task);
+    upsertTask(task);
     await refreshTrees();
     showTask(task);
     addActivity('Fresh embedded chat prepared');
@@ -574,6 +848,9 @@ elements['new-task-button'].addEventListener('click', showComposer);
 elements['chatgpt-session-button'].addEventListener('click', showSession);
 elements['source-control-button'].addEventListener('click', showSourceControl);
 elements['trees-button'].addEventListener('click', showTrees);
+elements['task-history-button'].addEventListener('click', showTaskHistory);
+elements['task-history-search'].addEventListener('input', renderTaskHistory);
+elements['task-history-state'].addEventListener('change', renderTaskHistory);
 elements['trees-new-task'].addEventListener('click', () => {
   elements['task-tree-select'].value = '';
   elements['tree-name'].value = '';
@@ -587,21 +864,6 @@ elements['copy-prompt-button'].addEventListener('click', () => runTaskAction(win
 elements['reveal-package-button'].addEventListener('click', () => runTaskAction(window.patchwork.revealPackage));
 elements['import-result-button'].addEventListener('click', () => runTaskAction(window.patchwork.importResult));
 elements['apply-button'].addEventListener('click', () => runTaskAction(window.patchwork.applyTask, 'Changes applied.'));
-elements['resolve-conflicts-button'].addEventListener('click', async () => {
-  if (!state.activeTask) return;
-  try {
-    const task = await window.patchwork.resubmitConflicts(state.activeTask.taskId);
-    const index = state.tasks.findIndex((item) => item.taskId === task.taskId);
-    if (index >= 0) state.tasks[index] = task;
-    else state.tasks.unshift(task);
-    await refreshTrees();
-    showTask(task);
-    showToast('Conflict context packaged. Submitting it in a fresh ChatGPT chat…');
-    setTimeout(() => runTaskAction(window.patchwork.submitTask), 700);
-  } catch (error) {
-    showToast(error.message, true);
-  }
-});
 elements['rollback-button'].addEventListener('click', () => runTaskAction(window.patchwork.rollbackTask, 'Changes rolled back.'));
 elements['new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
 elements['browser-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));
@@ -625,6 +887,7 @@ elements['source-remove-repository'].addEventListener('click', async () => {
     state.repositories = state.repositories.filter((item) => item.path !== state.selectedGitPath);
     state.selectedGitPath = null;
     state.gitStatus = null;
+    resetGitDiffTabs();
     renderRepositories();
     renderSourceRepositories();
     await loadGitStatus(elements['source-repository-select'].value);
@@ -653,21 +916,16 @@ window.addEventListener('resize', syncBrowserBounds);
 window.addEventListener('scroll', syncBrowserBounds, true);
 new ResizeObserver(syncBrowserBounds).observe(elements['chatgpt-surface']);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
-setInterval(updateTaskElapsedTimes, 1_000);
 
 window.patchwork.onTaskEvent((event) => {
+  if (event.task) upsertTask(event.task);
   if (event.task) {
-    const index = state.tasks.findIndex((task) => task.taskId === event.task.taskId);
-    if (index >= 0) state.tasks[index] = event.task;
-    else state.tasks.unshift(event.task);
+    renderTaskList();
+    if (!elements['history-view'].classList.contains('hidden')) renderTaskHistory();
   }
   if (event.task && (!state.activeTask || state.activeTask.taskId === event.task.taskId)) showTask(event.task);
   if (event.message) addActivity(event.message);
   if (event.type === 'task-failed') showToast(event.message || 'Task failed.', true);
-  if (event.type === 'task-conflicted') {
-    showToast('Merge conflicts need a follow-up resolution task.', true);
-    refreshTrees().catch(() => {});
-  }
   if (event.type === 'task-applied') {
     showToast('ChatGPT changes were validated and committed to the coding tree.');
     refreshTrees().catch(() => {});
@@ -722,3 +980,10 @@ async function initialize() {
 }
 
 initialize();
+
+function upsertTask(task) {
+  const index = state.tasks.findIndex((item) => item.taskId === task.taskId);
+  if (index >= 0) state.tasks[index] = task;
+  else state.tasks.unshift(task);
+  state.tasks.sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+}
