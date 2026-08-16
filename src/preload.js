@@ -26,7 +26,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   deleteTask: (taskId) => ipcRenderer.invoke('task:delete', taskId),
   openTask: (taskId) => ipcRenderer.invoke('task:open', taskId),
   submitTask: (taskId) => ipcRenderer.invoke('task:submit', taskId),
-  resolveTaskConflict: (taskId) => ipcRenderer.invoke('task:resolve-conflict', taskId),
+  resolveTaskConflict: (taskId, options) => ipcRenderer.invoke('task:resolve-conflict', taskId, options),
   copyPrompt: (taskId) => ipcRenderer.invoke('task:copy-prompt', taskId),
   revealPackage: (taskId) => ipcRenderer.invoke('task:reveal-package', taskId),
   importResult: (taskId) => ipcRenderer.invoke('task:import-result', taskId),

@@ -388,6 +388,7 @@ class TaskService {
       treeId: input.tree?.id || null,
       treeName: input.tree?.name || null,
       mergeResolution: Boolean(input.mergeResolution),
+      resolvesTaskId: input.resolvesTaskId ? String(input.resolvesTaskId) : null,
       conversationId: null,
       chatStatus: null,
       chatStatusRaw: null,

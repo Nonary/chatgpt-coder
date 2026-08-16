@@ -640,7 +640,7 @@ class ChatGPTView {
     this.worktreeService = worktreeService;
     this.onMergeResult = onMergeResult;
     this.knownTasks = new Map(restoredTasks
-      .filter((task) => !['applied', 'rolled-back'].includes(task.state))
+      .filter((task) => !['applied', 'resolved', 'rolled-back'].includes(task.state))
       .map((task) => [task.taskId.toLowerCase(), task]));
     this.activeTask = restoredTasks
       .filter((task) => task.state === 'submitted' && isChatGPTConversationUrl(task.conversationUrl))

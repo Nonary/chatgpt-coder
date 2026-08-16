@@ -185,6 +185,7 @@
                 <option value="submitted">Submitted</option>
                 <option value="ready">Ready</option>
                 <option value="conflicted">Conflicted</option>
+                <option value="resolved">Resolved</option>
                 <option value="applied">Applied</option>
                 <option value="rolled-back">Rolled back</option>
                 <option value="failed">Failed</option>
@@ -496,6 +497,43 @@
             </form>
             <div id="prompt-manager-list" class="prompt-manager-list"></div>
           </aside>
+        </div>
+
+        <div id="conflict-resolution-modal" class="modal-backdrop conflict-resolution-backdrop hidden">
+          <section class="conflict-resolution-modal" role="dialog" aria-modal="true" aria-labelledby="conflict-resolution-title">
+            <header class="conflict-resolution-header">
+              <div>
+                <p class="eyebrow">CONFLICT RESOLUTION</p>
+                <h2 id="conflict-resolution-title">Resolve this result with ChatGPT</h2>
+              </div>
+              <button id="conflict-resolution-cancel-button" class="icon-button" type="button" aria-label="Close conflict resolution dialog">×</button>
+            </header>
+            <div class="conflict-resolution-task">
+              <span>Original task</span>
+              <strong id="conflict-resolution-task-label">Current task</strong>
+            </div>
+            <p class="conflict-resolution-copy">Patchwork will create a fresh resolution task in the existing coding tree. Choose a one-time model override and add any extra context ChatGPT should follow.</p>
+            <div class="conflict-resolution-fields">
+              <div>
+                <label class="field-label" for="conflict-resolution-model-select">Model</label>
+                <select id="conflict-resolution-model-select" class="field-control">
+                  <option value="default">ChatGPT default</option>
+                  <option value="sol">GPT-5.6 Sol</option>
+                  <option value="luna">GPT-5.6 Luna</option>
+                </select>
+                <p class="field-help">Starts with the model used by the original task. Changing it only affects this resolution task.</p>
+              </div>
+            </div>
+            <label class="field-label" for="conflict-resolution-instructions">Additional instructions</label>
+            <textarea id="conflict-resolution-instructions" class="conflict-resolution-instructions" rows="8" maxlength="12000" placeholder="Add any context, constraints, or specific files you want ChatGPT to consider while resolving the conflict."></textarea>
+            <footer class="conflict-resolution-footer">
+              <span class="field-help">The original task configuration is left unchanged.</span>
+              <div class="conflict-resolution-actions">
+                <button id="conflict-resolution-cancel-action" class="secondary" type="button">Cancel</button>
+                <button id="conflict-resolution-submit-button" class="primary" type="button">Resolve conflict</button>
+              </div>
+            </footer>
+          </section>
         </div>
 
         <div id="toast" class="toast hidden" role="status"></div>

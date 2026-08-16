@@ -360,6 +360,7 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
     repositories: [{ path: tree.path }],
     tree,
     autoApply: true,
+    resolvesTaskId: task.taskId,
     conflictContext: {
       originalTaskId: task.taskId,
       error: conflicted.result.conflicts[0].error,
@@ -368,6 +369,7 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
     },
   });
   assert.equal(resolutionTask.repositories[0].workingChanges, true);
+  assert.equal(resolutionTask.resolvesTaskId, task.taskId);
   const resolutionZip = new AdmZip(resolutionTask.packagePath);
   assert.ok(resolutionZip.getEntry('CONFLICTS.md'));
   assert.ok(resolutionZip.getEntry(`conflicts/${task.repositories[0].id}.patch`));
@@ -387,6 +389,12 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
   assert.equal(resolved.state, 'applied');
   assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'resolved greeting\n');
   assert.equal((await runGit(tree.path, ['status', '--porcelain'])).stdout, '');
+
+  const resolvedOriginal = await tasks.getTask(task.taskId);
+  assert.equal(resolvedOriginal.state, 'resolved');
+  assert.equal(resolvedOriginal.error, null);
+  assert.equal(resolvedOriginal.resolutionTaskId, resolutionTask.taskId);
+  assert.ok(Number.isFinite(Date.parse(resolvedOriginal.resolvedAt)));
 });
 
 test('an unborn repository is snapshotted without changing the source and accepts its result', async (context) => {
@@ -1078,6 +1086,48 @@ test('task deletion removes history and task files', async (context) => {
   assert.equal(deleted.taskId, 'stuck-task');
   assert.deepEqual(await tasks.listTasks(), []);
   await assert.rejects(fs.access(tasks.taskDirectory('stuck-task')));
+});
+
+test('resolved task status is presented separately from applied work', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  assert.match(renderer, /resolved: 'Resolved'/);
+  assert.match(renderer, /resolved: \['Conflict resolved'/);
+  assert.match(markup, /<option value="resolved">Resolved<\/option>/);
+});
+
+test('conflicted results retain both retry apply and ChatGPT resolution actions', async () => {
+  const service = await fs.readFile(path.join(__dirname, '../src/main/result-service.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  assert.match(service, /\['ready', 'failed', 'conflicted'\]\.includes\(task\.state\)/);
+  assert.match(renderer, /task\.state === 'ready' \|\| task\.state === 'conflicted'/);
+  assert.match(renderer, /task\.state === 'conflicted' \? 'Retry apply' : 'Apply changes'/);
+  assert.match(renderer, /classList\.toggle\('hidden', task\.state !== 'conflicted'\)/);
+});
+
+test('conflict resolution can recover a coding tree from the original task association', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-tree-recovery-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const trees = new WorktreeService(path.join(root, 'data'));
+  const tree = await trees.create(repositoryPath, 'Recover conflict tree');
+  const task = {
+    taskId: 'conflicted-task',
+    repositories: [{ path: tree.path, readOnly: false }],
+  };
+  await trees.attachTask(tree.id, task.taskId);
+
+  const recovered = await trees.findForTask(task);
+  assert.equal(recovered.id, tree.id);
+  assert.equal(recovered.path, tree.path);
+});
+
+test('conflict resolution backend does not require a coding tree', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.doesNotMatch(appSource, /conflicted task is not associated with a coding tree/);
+  assert.match(appSource, /await worktreeService\.findForTask\(task\)/);
+  assert.match(appSource, /if \(tree\) await worktreeService\.attachTask/);
+  assert.match(appSource, /This conflicted task has no writable repository to resolve/);
 });
 
 test('task history persists across service instances and lists newest tasks first', async (context) => {

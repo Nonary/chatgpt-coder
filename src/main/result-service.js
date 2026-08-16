@@ -207,7 +207,7 @@ class ResultService {
 
   async apply(taskId) {
     let task = await this.taskService.getTask(taskId);
-    if (!task.result || !['ready', 'failed'].includes(task.state)) {
+    if (!task.result || !['ready', 'failed', 'conflicted'].includes(task.state)) {
       if (task.state === 'applied') return task;
       throw new Error('This result is not ready to apply.');
     }
@@ -279,9 +279,10 @@ class ResultService {
       throw error;
     }
 
+    const appliedAt = new Date().toISOString();
     task = await this.taskService.updateTask(taskId, {
       state: 'applied',
-      appliedAt: new Date().toISOString(),
+      appliedAt,
       error: null,
       result: { ...task.result, commits: committed.map(({ repository, commit, message }) => ({
         repositoryId: repository.id,
@@ -290,6 +291,29 @@ class ResultService {
       })) },
     });
     await this.onEvent({ type: 'task-applied', task });
+
+    if (task.resolvesTaskId) {
+      try {
+        const originalTask = await this.taskService.getTask(task.resolvesTaskId);
+        if (originalTask.state === 'conflicted') {
+          const resolvedTask = await this.taskService.updateTask(originalTask.taskId, {
+            state: 'resolved',
+            error: null,
+            resolvedAt: appliedAt,
+            resolutionTaskId: task.taskId,
+          });
+          await this.onEvent({
+            type: 'task-resolved',
+            task: resolvedTask,
+            resolutionTask: task,
+            message: 'The original task conflict has been resolved.',
+          });
+        }
+      } catch {
+        // A deleted original task should not invalidate the successful resolution.
+      }
+    }
+
     return task;
   }
 

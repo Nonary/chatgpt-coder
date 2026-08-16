@@ -34,6 +34,12 @@ function taskTitle(task) {
   return firstLine.length > 80 ? `${firstLine.slice(0, 79)}…` : firstLine;
 }
 
+function buildConflictResolutionTaskText(task, conflict, additionalInstructions = '') {
+  const base = `Resolve the failed Patchwork result application described below. Inspect the current coding tree, including any conflict markers, and the original result patch in CONFLICTS.md. Preserve the intended changes from both the original task and the returned result, then complete the work and verify the final diff.\n\nOriginal task:\n${task.taskText}\n\nApply failure:\n${conflict.error || task.error || 'The result could not be applied cleanly.'}`;
+  const extra = String(additionalInstructions || '').replaceAll('\r\n', '\n').trim().slice(0, 12_000);
+  return extra ? `${base}\n\nAdditional instructions from the user:\n${extra}` : base;
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     show: false,
@@ -254,30 +260,29 @@ function registerIpc() {
     const task = await taskService.getTask(taskId);
     return publicTask(await chatGPTView.submit(task));
   });
-  ipcMain.handle('task:resolve-conflict', async (_event, taskId) => {
+  ipcMain.handle('task:resolve-conflict', async (_event, taskId, options = {}) => {
     const task = await taskService.getTask(taskId);
     if (task.state !== 'conflicted' || !task.result?.patches?.length) {
       throw new Error('This task does not have a result conflict to resolve.');
     }
-    if (!task.treeId) throw new Error('This conflicted task is not associated with a coding tree.');
-    const tree = await worktreeService.get(task.treeId);
+    let tree = null;
+    if (task.treeId) tree = await worktreeService.get(task.treeId).catch(() => null);
+    if (!tree) tree = await worktreeService.findForTask(task);
+    const repositories = tree
+      ? [{ path: tree.path }]
+      : task.repositories.filter((repository) => !repository.readOnly).map((repository) => ({ path: repository.path }));
+    if (repositories.length === 0) throw new Error('This conflicted task has no writable repository to resolve.');
     const conflict = task.result.conflicts?.[0] || {};
-    const confirmation = await dialog.showMessageBox(mainWindow, {
-      type: 'question',
-      title: 'Resolve result conflict with ChatGPT?',
-      message: `Ask ChatGPT to resolve the failed result application for “${taskTitle(task)}”?`,
-      detail: 'Patchwork will send the current conflicted coding tree, the original result patch, and the original task attachments in a fresh task package.',
-      buttons: ['Cancel', 'Submit resolution task'],
-      defaultId: 1,
-      cancelId: 0,
-    });
-    if (confirmation.response !== 1) return null;
+    const resolutionOptions = options && typeof options === 'object' ? options : {};
     const resolutionTask = await taskService.createTask({
-      taskText: `Resolve the failed Patchwork result application described below. Inspect the current coding tree, including any conflict markers, and the original result patch in CONFLICTS.md. Preserve the intended changes from both the original task and the returned result, then complete the work and verify the final diff.\n\nOriginal task:\n${task.taskText}\n\nApply failure:\n${conflict.error || task.error || 'The result could not be applied cleanly.'}`,
-      repositories: task.repositories.filter((repository) => !repository.readOnly).map((repository) => ({ path: repository.path })),
+      taskText: buildConflictResolutionTaskText(task, conflict, resolutionOptions.additionalInstructions),
+      repositories,
       attachments: task.attachments || [],
       tree,
       autoApply: true,
+      model: Object.prototype.hasOwnProperty.call(resolutionOptions, 'model') ? resolutionOptions.model : task.model,
+      reasoningMode: task.reasoningMode,
+      resolvesTaskId: task.taskId,
       conflictContext: {
         originalTaskId: task.taskId,
         error: conflict.error || task.error,
@@ -285,7 +290,7 @@ function registerIpc() {
         patches: task.result.patches,
       },
     });
-    await worktreeService.attachTask(tree.id, resolutionTask.taskId);
+    if (tree) await worktreeService.attachTask(tree.id, resolutionTask.taskId);
     emit({ type: 'task-prepared', task: publicTask(resolutionTask) });
     await chatGPTView.prepare(resolutionTask);
     return publicTask(await chatGPTView.submit(resolutionTask));

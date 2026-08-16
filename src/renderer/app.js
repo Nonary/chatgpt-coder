@@ -18,6 +18,7 @@ const state = {
   editingPromptId: null,
   chatgptProjects: [],
   projectSelection: undefined,
+  conflictResolutionTaskId: null,
 };
 
 const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
@@ -44,6 +45,8 @@ const elements = Object.fromEntries(
     'prompt-library-modal', 'prompt-library-close-button', 'prompt-manager-new-button', 'prompt-manager-count', 'prompt-editor',
     'prompt-editor-mode', 'prompt-editor-title', 'prompt-editor-cancel-button', 'prompt-editor-name', 'prompt-editor-description',
     'prompt-editor-content', 'prompt-editor-status', 'prompt-editor-save-button', 'prompt-manager-list',
+    'conflict-resolution-modal', 'conflict-resolution-task-label', 'conflict-resolution-model-select', 'conflict-resolution-instructions',
+    'conflict-resolution-cancel-button', 'conflict-resolution-cancel-action', 'conflict-resolution-submit-button',
     'task-tree-select', 'new-tree-fields', 'tree-name',
     'task-model-select', 'task-reasoning-select',
     'chatgpt-project-select', 'new-project-fields', 'new-project-name',
@@ -680,6 +683,48 @@ function closeSkillDrawer() {
   elements['skills-modal'].classList.add('hidden');
 }
 
+function openConflictResolutionModal(task) {
+  if (!task?.taskId) return;
+  state.conflictResolutionTaskId = task.taskId;
+  elements['conflict-resolution-task-label'].textContent = taskLabel(task);
+  elements['conflict-resolution-model-select'].value = ['default', 'sol', 'luna'].includes(task.model)
+    ? task.model
+    : 'default';
+  elements['conflict-resolution-instructions'].value = '';
+  elements['conflict-resolution-modal'].classList.remove('hidden');
+  requestAnimationFrame(() => elements['conflict-resolution-instructions'].focus());
+}
+
+function closeConflictResolutionModal() {
+  state.conflictResolutionTaskId = null;
+  elements['conflict-resolution-modal'].classList.add('hidden');
+  elements['conflict-resolution-instructions'].value = '';
+  elements['conflict-resolution-submit-button'].disabled = false;
+}
+
+async function submitConflictResolution() {
+  const taskId = state.conflictResolutionTaskId;
+  if (!taskId) return;
+  const button = elements['conflict-resolution-submit-button'];
+  button.disabled = true;
+  try {
+    const task = await window.patchwork.resolveTaskConflict(taskId, {
+      model: elements['conflict-resolution-model-select'].value,
+      additionalInstructions: elements['conflict-resolution-instructions'].value.trim(),
+    });
+    if (!task) return;
+    upsertTask(task);
+    closeConflictResolutionModal();
+    await refreshTrees();
+    showTask(task);
+    showToast('Conflict-resolution task submitted to ChatGPT.');
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderChatGPTProjects() {
   const select = elements['chatgpt-project-select'];
   const previous = select.value;
@@ -882,6 +927,7 @@ function taskStateLabel(task) {
     applied: 'Applied',
     'rolled-back': 'Rolled back',
     conflicted: 'Needs conflict resolution',
+    resolved: 'Resolved',
     failed: 'Needs attention',
   };
   return labels[task.state] || task.state;
@@ -1023,6 +1069,7 @@ const statusText = {
   submitted: ['Task is running', 'ChatGPT is still working in the embedded browser. Patchwork is actively watching for the result.'],
   ready: ['Waiting to apply', 'The plain-text result is validated and waiting for you to apply it.'],
   conflicted: ['Conflict needs resolution', 'The result could not be applied cleanly. Send a resolution task to ChatGPT to preserve both versions.'],
+  resolved: ['Conflict resolved', 'The original task conflict was resolved by a follow-up task.'],
   applied: ['Changes applied', 'The validated patch has been applied to the task target.'],
   'rolled-back': ['Changes reverted', 'The changes from this task were reverted.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
@@ -1067,12 +1114,15 @@ function renderResult(task) {
       <strong>${escapeHtml(patch.name || patch.id)}</strong>
       <pre>${escapeHtml(patch.stat || 'No changes')}</pre>
     </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '');
-  elements['apply-button'].classList.toggle('hidden', task.state !== 'ready');
-  elements['resolve-conflict-button'].classList.toggle('hidden', task.state !== 'conflicted' || !task.treeId);
+  const canApply = task.state === 'ready' || task.state === 'conflicted';
+  elements['apply-button'].classList.toggle('hidden', !canApply);
+  elements['apply-button'].textContent = task.state === 'conflicted' ? 'Retry apply' : 'Apply changes';
+  elements['resolve-conflict-button'].classList.toggle('hidden', task.state !== 'conflicted');
   elements['rollback-button'].classList.toggle('hidden', task.state !== 'applied');
 }
 
 function showTask(task) {
+  closeConflictResolutionModal();
   state.activeTask = task;
   state.activity = [];
   elements['composer-view'].classList.add('hidden');
@@ -1110,6 +1160,7 @@ function showTask(task) {
 }
 
 function showComposer() {
+  closeConflictResolutionModal();
   closeSkillDrawer();
   closePromptManager();
   closePromptLibraryMenu();
@@ -1694,6 +1745,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !elements['skills-modal'].classList.contains('hidden')) closeSkillDrawer();
   if (event.key === 'Escape' && !elements['prompt-library-modal'].classList.contains('hidden')) closePromptManager();
   if (event.key === 'Escape' && !elements['prompt-library-menu'].classList.contains('hidden')) closePromptLibraryMenu();
+  if (event.key === 'Escape' && !elements['conflict-resolution-modal'].classList.contains('hidden')) closeConflictResolutionModal();
 });
 document.addEventListener('click', (event) => {
   if (!event.target.closest('.prompt-library-picker')) closePromptLibraryMenu();
@@ -1707,22 +1759,12 @@ elements['delete-task-button'].addEventListener('click', () => {
   if (state.activeTask) deleteTask(state.activeTask.taskId);
 });
 elements['apply-button'].addEventListener('click', () => runTaskAction(window.patchwork.applyTask, 'Changes applied.'));
-elements['resolve-conflict-button'].addEventListener('click', async () => {
-  if (!state.activeTask) return;
-  const button = elements['resolve-conflict-button'];
-  button.disabled = true;
-  try {
-    const task = await window.patchwork.resolveTaskConflict(state.activeTask.taskId);
-    if (!task) return;
-    upsertTask(task);
-    await refreshTrees();
-    showTask(task);
-    showToast('Conflict-resolution task submitted to ChatGPT.');
-  } catch (error) {
-    showToast(error.message, true);
-  } finally {
-    button.disabled = false;
-  }
+elements['resolve-conflict-button'].addEventListener('click', () => openConflictResolutionModal(state.activeTask));
+elements['conflict-resolution-cancel-button'].addEventListener('click', closeConflictResolutionModal);
+elements['conflict-resolution-cancel-action'].addEventListener('click', closeConflictResolutionModal);
+elements['conflict-resolution-submit-button'].addEventListener('click', submitConflictResolution);
+elements['conflict-resolution-modal'].addEventListener('click', (event) => {
+  if (event.target === elements['conflict-resolution-modal']) closeConflictResolutionModal();
 });
 elements['rollback-button'].addEventListener('click', () => runTaskAction(window.patchwork.rollbackTask, 'Changes rolled back.'));
 elements['new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
@@ -1798,6 +1840,10 @@ window.patchwork.onTaskEvent((event) => {
     return;
   }
   if (event.type === 'task-failed') showToast(event.message || 'Task failed.', true);
+  if (event.type === 'task-resolved') {
+    if (event.resolutionTask?.taskId === state.activeTask?.taskId) showTask(event.task);
+    showToast('The original task conflict has been resolved.');
+  }
   if (event.type === 'task-applied') {
     showToast(event.task?.treeId
       ? 'ChatGPT changes were validated and committed to the coding tree.'

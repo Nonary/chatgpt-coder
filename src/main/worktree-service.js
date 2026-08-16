@@ -131,6 +131,28 @@ class WorktreeService {
     return tree;
   }
 
+  async findForTask(task) {
+    const trees = await this.syncDiscoveredWorktrees();
+    const taskId = String(task?.taskId || '').trim();
+    if (taskId) {
+      const attached = trees.find((tree) => Array.isArray(tree.taskIds) && tree.taskIds.includes(taskId));
+      if (attached) return this.inspect(attached);
+    }
+
+    const repositoryPaths = (Array.isArray(task?.repositories) ? task.repositories : [])
+      .filter((repository) => repository?.path && !repository.readOnly)
+      .map((repository) => repository.path);
+    if (repositoryPaths.length === 0) return null;
+
+    const resolvedPaths = new Set(await Promise.all(repositoryPaths.map((repositoryPath) =>
+      fs.realpath(repositoryPath).catch(() => path.resolve(repositoryPath)))));
+    for (const tree of trees) {
+      const treePath = await fs.realpath(tree.path).catch(() => path.resolve(tree.path));
+      if (resolvedPaths.has(treePath)) return this.inspect(tree);
+    }
+    return null;
+  }
+
   async syncDiscoveredWorktrees() {
     const records = await this.readRecords();
     let repositories;
