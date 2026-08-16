@@ -18,7 +18,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   listTrees: () => ipcRenderer.invoke('trees:list'),
   revealTree: (treeId) => ipcRenderer.invoke('trees:reveal', treeId),
   removeTree: (treeId) => ipcRenderer.invoke('trees:remove', treeId),
-  mergeTree: (treeId) => ipcRenderer.invoke('trees:merge', treeId),
+  mergeTree: (treeId, chatgptProject) => ipcRenderer.invoke('trees:merge', treeId, chatgptProject),
   resolveTreeMerge: (treeId) => ipcRenderer.invoke('trees:resolve-merge', treeId),
   createTask: (input) => ipcRenderer.invoke('task:create', input),
   listTasks: () => ipcRenderer.invoke('task:list'),

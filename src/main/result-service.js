@@ -1,6 +1,5 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const AdmZip = require('adm-zip');
 const {
   applyPatch,
   checkPatch,
@@ -82,12 +81,6 @@ class ResultService {
   constructor(taskService, onEvent = () => {}) {
     this.taskService = taskService;
     this.onEvent = onEvent;
-  }
-
-  async ingestText(taskId, text) {
-    return this.ingestResult(taskId, 'Decoding and validating the plain-text result…', (task) => (
-      this.readPlainTextResult(task, text)
-    ));
   }
 
   async ingestTextFile(taskId, downloadedPath) {

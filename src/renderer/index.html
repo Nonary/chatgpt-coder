@@ -151,7 +151,19 @@
               <h2>Coding trees</h2>
               <p>Each tree has its own branch, tasks, and commits. Continue work concurrently, then squash it into the original branch when ready.</p>
             </div>
-            <button id="trees-new-task" class="primary">＋ New coding tree</button>
+            <div class="trees-header-actions">
+              <div class="trees-project-picker">
+                <div class="trees-project-heading">
+                  <label for="trees-project-select">Project</label>
+                  <button id="trees-refresh-projects-button" class="icon-button" type="button" title="Refresh ChatGPT projects" aria-label="Refresh ChatGPT projects">↻</button>
+                </div>
+                <select id="trees-project-select" class="field-control">
+                  <option value="">No ChatGPT project</option>
+                </select>
+                <small>Default ChatGPT destination for Merge tree.</small>
+              </div>
+              <button id="trees-new-task" class="primary">＋ New coding tree</button>
+            </div>
           </div>
           <div id="trees-list" class="trees-list"></div>
         </section>
@@ -240,10 +252,46 @@
                   <select id="task-reasoning-select" class="field-control">
                     <option value="default">Model default</option>
                     <option value="instant">Instant</option>
+                    <option value="low">Low</option>
                     <option value="medium">Medium</option>
                     <option value="high">High</option>
                     <option value="extra-high">Extra High</option>
                   </select>
+                </div>
+              </div>
+              <div class="prompt-library-picker">
+                <div class="prompt-library-heading">
+                  <div>
+                    <label class="field-label" for="prompt-library-trigger">Prompt library</label>
+                    <small>Reuse saved instructions to extend this task without retyping them.</small>
+                  </div>
+                  <button
+                    id="prompt-library-trigger"
+                    class="secondary prompt-library-trigger"
+                    type="button"
+                    aria-haspopup="true"
+                    aria-expanded="false"
+                  >
+                    <span id="prompt-library-trigger-label" class="prompt-library-trigger-label">Add saved prompts</span>
+                    <span class="prompt-library-chevron" aria-hidden="true">⌄</span>
+                  </button>
+                </div>
+                <div id="prompt-selection-summary" class="prompt-selection-summary hidden" aria-live="polite"></div>
+                <div id="prompt-library-menu" class="prompt-library-menu hidden">
+                  <div class="prompt-library-menu-header">
+                    <div>
+                      <strong>Saved instructions</strong>
+                      <small>Pick one or more to append to this task.</small>
+                    </div>
+                    <button id="prompt-library-manage-button" class="icon-button" type="button" title="Manage prompts" aria-label="Manage prompts">⚙</button>
+                  </div>
+                  <label class="sr-only" for="prompt-library-search">Search saved prompts</label>
+                  <input id="prompt-library-search" class="field-control prompt-library-search" type="search" placeholder="Search prompts" />
+                  <div id="prompt-library-list" class="prompt-library-list"></div>
+                  <div class="prompt-library-menu-footer">
+                    <button id="prompt-library-new-button" class="secondary" type="button">＋ New prompt</button>
+                    <span id="prompt-library-menu-status" class="field-help">No prompts selected.</span>
+                  </div>
                 </div>
               </div>
               <label class="sr-only" for="task-text">Software task</label>
@@ -410,6 +458,43 @@
               <span id="skills-selection-status" class="field-help">No skills selected.</span>
               <button id="skills-done-button" class="primary" type="button">Done</button>
             </footer>
+          </aside>
+        </div>
+
+        <div id="prompt-library-modal" class="modal-backdrop hidden">
+          <aside class="skill-drawer prompt-library-drawer" role="dialog" aria-modal="true" aria-labelledby="prompt-library-title">
+            <header class="skill-drawer-header">
+              <div>
+                <p class="eyebrow">PROMPT LIBRARY</p>
+                <h2 id="prompt-library-title">Manage saved prompts</h2>
+              </div>
+              <button id="prompt-library-close-button" class="icon-button" type="button" aria-label="Close prompt library">×</button>
+            </header>
+            <p class="skill-drawer-copy">Save reusable instructions with a clear name and short description. Prompts stay on this device and are copied into each task only when selected.</p>
+            <div class="prompt-manager-toolbar">
+              <button id="prompt-manager-new-button" class="primary" type="button">＋ New prompt</button>
+              <span id="prompt-manager-count" class="field-help">0 saved prompts</span>
+            </div>
+            <form id="prompt-editor" class="prompt-editor hidden">
+              <div class="prompt-editor-heading">
+                <div>
+                  <p class="eyebrow" id="prompt-editor-mode">NEW PROMPT</p>
+                  <strong id="prompt-editor-title">Create a saved prompt</strong>
+                </div>
+                <button id="prompt-editor-cancel-button" class="icon-button" type="button" aria-label="Cancel prompt editing">×</button>
+              </div>
+              <label class="field-label" for="prompt-editor-name">Name</label>
+              <input id="prompt-editor-name" class="field-control" type="text" maxlength="60" placeholder="For example: UI accessibility review" autocomplete="off" />
+              <label class="field-label" for="prompt-editor-description">Short description</label>
+              <input id="prompt-editor-description" class="field-control" type="text" maxlength="140" placeholder="A quick review of keyboard access and labels" autocomplete="off" />
+              <label class="field-label" for="prompt-editor-content">Additional instructions</label>
+              <textarea id="prompt-editor-content" class="prompt-editor-content" rows="8" maxlength="12000" placeholder="Review the interface for keyboard navigation, focus states, accessible names, and clear error handling."></textarea>
+              <div class="prompt-editor-footer">
+                <span id="prompt-editor-status" class="field-help">This text will be appended to the task only when the prompt is selected.</span>
+                <button id="prompt-editor-save-button" class="primary" type="submit">Save prompt</button>
+              </div>
+            </form>
+            <div id="prompt-manager-list" class="prompt-manager-list"></div>
           </aside>
         </div>
 

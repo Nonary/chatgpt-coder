@@ -25,7 +25,7 @@ Coding trees are optional task targets. A tree runs in a real Git worktree on it
 - attach follow-up tasks to an existing tree while opening a fresh ChatGPT chat each time;
 - inspect the tree in Source Control, reveal its directory, and see its task and commit counts;
 - discard a tree through an explicit confirmation; or
-- ask ChatGPT to summarize all tree commits and produce an improved Conventional Commit message, then squash the tree into the original branch as one commit.
+- choose the ChatGPT project used by **Merge tree**, with the selected destination retained as the tree's default; then ask ChatGPT to summarize all tree commits and produce an improved Conventional Commit message.
 
 Coding-tree task results are never applied to the original checkout. After validation, Patchwork applies the patch to the selected tree, stages it, and commits it using the Conventional Commit message included in ChatGPT's plain-text result. Tasks that target current working changes apply directly to the selected repository without creating a new commit. A tree merge is first tested and committed in a temporary integration worktree. The original branch is fast-forwarded only if it stayed clean and unchanged; Patchwork then removes the task worktree and its branch.
 
@@ -39,11 +39,15 @@ The task composer keeps skills out of the main form. **Choose skills** opens a c
 
 The generated task instructions tell ChatGPT that skills may be present and to read or invoke a selected skill only when it is relevant to the task. Unrelated skills remain available in the package but should not be loaded just because they were selected.
 
+## Prompt library
+
+The task composer includes a local **Prompt library** dropdown directly below model selection. Saved prompts have a name, short description, and reusable instruction text. Multiple prompts can be selected for a task, removed from the selection as chips, and managed from the prompt library drawer. The instruction text is appended to the task only when selected, and the saved library stays local to the Patchwork installation.
+
 ## Current workflow
 
 1. Patchwork opens directly to the embedded ChatGPT session. Sign in there before creating a task; the persistent session is reused afterward.
-2. Choose **New task**, then use the current working changes, create a coding tree from one clean, committed Git repository, or attach the task to an existing tree. The selected task target stays sticky between task selections.
-3. Describe the software task, optionally select local reference files or skills, and choose where ChatGPT should launch it. A task can use a normal new chat, an existing ChatGPT project, or a newly created project. Patchwork copies attachments into the task record and embeds them in the task package under `attachments/`.
+2. Choose **New task**, then use the current working changes, create a coding tree from one clean, committed Git repository, or attach the task to an existing tree. The task target, model, reasoning mode, and ChatGPT project selection stay sticky between task selections and are restored after application restarts.
+3. Describe the software task, optionally select saved prompt instructions, local reference files, or skills, and choose where ChatGPT should launch it. A task can use a normal new chat, an existing ChatGPT project, or a newly created project. Patchwork copies attachments into the task record and embeds them in the task package under `attachments/`.
 4. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, and the selected repository or coding tree Git bundles under `repositories/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
 5. Patchwork opens the selected ChatGPT destination in the same embedded browser, injects the instructions, attaches the ZIP package plus any user-selected reference files, waits for the attachments to finish processing, and clicks ChatGPT's Send button.
 6. ChatGPT follows the embedded protocol and attaches `chatgpt-ide-result-<task-id>.txt`, containing a marked `PATCHWORK_RESULT_V1` JSON envelope with base64-encoded `git diff --binary` patches. The envelope is not printed in the chat.
@@ -52,7 +56,7 @@ The generated task instructions tell ChatGPT that skills may be present and to r
 
 If Git reports conflicts, Patchwork leaves the conflict markers and unmerged files in the coding tree, reports the affected files, and offers **Resolve with ChatGPT**. That action opens a new ChatGPT task containing the current dirty tree, `CONFLICTS.md`, the original result patch, and the original task attachments.
 
-If page automation is temporarily unavailable because ChatGPT's markup changed, the embedded browser remains fully usable. **Copy prompt**, **Show package**, and **Import result** remain available; the importer supports legacy ZIP or raw-patch results for compatibility.
+If page automation is temporarily unavailable because ChatGPT's markup changed, the embedded browser remains fully usable. **Copy prompt**, **Show package**, and **Import result** remain available.
 
 ## Development
 

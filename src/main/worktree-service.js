@@ -5,6 +5,7 @@ const { fingerprintRepository, inspectRepository, runGit, slugify } = require('.
 
 const MERGE_RESULT_START = 'PATCHWORK_MERGE_V1';
 const MERGE_RESULT_END = 'PATCHWORK_MERGE_END';
+const CHATGPT_PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9_-]+$/;
 
 function mergeResultFilename(treeId) {
   return `chatgpt-ide-merge-result-${treeId}.txt`;
@@ -20,6 +21,23 @@ function validateCommitMessage(value) {
     throw new Error('ChatGPT must return a Conventional Commit message, such as "feat(editor): add split diff view".');
   }
   return message;
+}
+
+function normalizeChatGPTProject(project) {
+  if (project == null) return null;
+  const id = String(project.id || '').trim();
+  if (!CHATGPT_PROJECT_ID_PATTERN.test(id)) {
+    throw new Error('ChatGPT returned an invalid project identifier.');
+  }
+  const shortUrl = String(project.shortUrl || id).trim();
+  if (!CHATGPT_PROJECT_ID_PATTERN.test(shortUrl) || (shortUrl !== id && !shortUrl.startsWith(`${id}-`))) {
+    throw new Error('ChatGPT returned an invalid project URL.');
+  }
+  return {
+    id,
+    shortUrl,
+    name: String(project.name || '').trim() || 'ChatGPT project',
+  };
 }
 
 function parseMergeResult(value, treeId) {
@@ -169,6 +187,7 @@ class WorktreeService {
           createdAt: existing?.createdAt || stat?.birthtime?.toISOString() || new Date().toISOString(),
           updatedAt: existing?.updatedAt || new Date().toISOString(),
           taskIds: existing?.taskIds || [],
+          chatgptProject: existing?.chatgptProject || null,
           mergeState: existing?.mergeState || null,
           mergeConversationUrl: existing?.mergeConversationUrl || null,
           managed: false,
@@ -228,6 +247,7 @@ class WorktreeService {
       createdAt,
       updatedAt: createdAt,
       taskIds: [],
+      chatgptProject: null,
       mergeState: null,
       mergeConversationUrl: null,
       managed: true,
@@ -263,13 +283,29 @@ class WorktreeService {
     return Promise.all((await this.syncDiscoveredWorktrees()).map((tree) => this.inspect(tree)));
   }
 
-  async attachTask(treeId, taskId) {
+  async attachTask(treeId, taskId, chatgptProject = undefined) {
     const records = await this.readRecords();
     const index = records.findIndex((item) => item.id === treeId);
     if (index < 0) throw new Error('The selected coding tree no longer exists.');
     records[index] = {
       ...records[index],
       taskIds: [...new Set([...(records[index].taskIds || []), taskId])],
+      updatedAt: new Date().toISOString(),
+    };
+    if (chatgptProject !== undefined) {
+      records[index].chatgptProject = normalizeChatGPTProject(chatgptProject);
+    }
+    await this.writeRecords(records);
+    return this.inspect(records[index]);
+  }
+
+  async setChatGPTProject(treeId, project) {
+    const records = await this.readRecords();
+    const index = records.findIndex((item) => item.id === treeId);
+    if (index < 0) throw new Error('The selected coding tree no longer exists.');
+    records[index] = {
+      ...records[index],
+      chatgptProject: normalizeChatGPTProject(project),
       updatedAt: new Date().toISOString(),
     };
     await this.writeRecords(records);
@@ -290,7 +326,13 @@ class WorktreeService {
     ]);
     const resultFilename = mergeResultFilename(tree.id);
     const prompt = `You are finalizing a Patchwork coding tree. Read the commit history and diff summary below, summarize the combined change, and write one improved Conventional Commit message for the squashed result. The first line must use the Conventional Commits form type(scope): description.\n\nCreate and attach a UTF-8 plain-text file named ${resultFilename}. Its complete contents must be the marked JSON envelope below, with the start and end markers on their own lines. Do not paste the PATCHWORK_MERGE_V1 envelope into the chat. Patchwork will read the text file and apply the squash merge automatically.\n\nPATCHWORK_MERGE_V1\n{"schemaVersion":1,"treeId":"${tree.id}","summary":"concise combined summary","commitMessage":"type(scope): concise description\\n\\nOptional explanatory body"}\nPATCHWORK_MERGE_END\n\nTree: ${tree.name}\nRepository: ${tree.repositoryName}\n\nCommit history:\n${log.trim()}\n\nDiff summary:\n${stat.trim()}`;
-    return { treeId: tree.id, treeName: tree.name, resultFilename, prompt };
+    return {
+      treeId: tree.id,
+      treeName: tree.name,
+      resultFilename,
+      prompt,
+      chatgptProject: tree.chatgptProject || null,
+    };
   }
 
   async markMergeSubmitted(treeId, conversationUrl = null) {

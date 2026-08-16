@@ -34,6 +34,7 @@ const TASK_MODEL_PICKER_OPTIONS = {
 
 const TASK_REASONING_PICKER_OPTIONS = {
   instant: { label: 'Instant', thinkingEffort: null },
+  low: { label: 'Low', thinkingEffort: 'min' },
   medium: { label: 'Medium', thinkingEffort: 'standard' },
   high: { label: 'High', thinkingEffort: 'extended' },
   'extra-high': { label: 'Extra High', thinkingEffort: 'max' },
@@ -311,6 +312,7 @@ function buildTaskConfigurationScript(model, reasoningMode, taskId = null) {
         '<div class="section">Thinking</div>',
         '<button type="button" role="menuitemradio" data-choice="reasoning:default">Auto</button>',
         '<button type="button" role="menuitemradio" data-choice="reasoning:instant">Instant</button>',
+        '<button type="button" role="menuitemradio" data-choice="reasoning:low">Low</button>',
         '<button type="button" role="menuitemradio" data-choice="reasoning:medium">Medium</button>',
         '<button type="button" role="menuitemradio" data-choice="reasoning:high">High</button>',
         '<button type="button" role="menuitemradio" data-choice="reasoning:extra-high">Extra High</button>',
@@ -327,7 +329,7 @@ function buildTaskConfigurationScript(model, reasoningMode, taskId = null) {
       };
       const openMenu = () => {
         const bounds = picker.getBoundingClientRect();
-        const menuHeight = 338;
+        const menuHeight = 374;
         const below = bounds.bottom + 6;
         const above = bounds.top - menuHeight - 6;
         menuHost.style.left = Math.max(8, Math.min(bounds.left, innerWidth - 268)) + 'px';
@@ -809,7 +811,7 @@ class ChatGPTView {
           return;
         }
         try {
-          await this.onResult(task.taskId, savePath, 'text-file');
+          await this.onResult(task.taskId, savePath);
           this.knownTasks.delete(task.taskId.toLowerCase());
           if (this.activeTask?.taskId === task.taskId) this.activeTask = null;
         } catch {
@@ -1616,7 +1618,7 @@ class ChatGPTView {
       treeId: request.treeId,
       message: `Opening a fresh ChatGPT chat to summarize ${request.treeName}…`,
     });
-    await this.newChat();
+    await this.newChat(request.chatgptProject?.id, request.chatgptProject?.shortUrl);
     const composerReady = await this.waitForComposer();
     if (!composerReady) throw new Error('ChatGPT is not ready. Sign in inside the embedded browser and retry.');
     await this.injectPrompt(request.prompt);
@@ -1833,13 +1835,6 @@ class ChatGPTView {
     }
   }
 
-  async finishTaskResult(task, result, transport) {
-    const completed = await this.onResult(task.taskId, result, transport);
-    this.knownTasks.delete(task.taskId.toLowerCase());
-    if (this.activeTask?.taskId === task.taskId) this.activeTask = null;
-    return completed;
-  }
-
   async finishMergeResult(tree, resultText) {
     const completed = await this.onMergeResult(tree.id, resultText);
     this.pendingDownload = null;
@@ -1857,7 +1852,6 @@ class ChatGPTView {
     });
     if (response.canceled || response.filePaths.length === 0) return null;
     const selectedPath = response.filePaths[0];
-    if (selectedPath.toLowerCase().endsWith('.txt')) return this.onResult(task.taskId, selectedPath, 'text-file');
     return this.onResult(task.taskId, selectedPath);
   }
 }

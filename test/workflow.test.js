@@ -50,6 +50,14 @@ async function createRepository(root) {
   return repositoryPath;
 }
 
+async function ingestDownloadedText(results, tasks, task, text) {
+  const incomingDir = path.join(tasks.taskDirectory(task.taskId), 'incoming');
+  await fs.mkdir(incomingDir, { recursive: true });
+  const downloadedPath = path.join(incomingDir, task.resultFilename);
+  await fs.writeFile(downloadedPath, text);
+  return results.ingestTextFile(task.taskId, downloadedPath);
+}
+
 function plainTextResult(task, patch, commitMessage = 'fix(task): apply generated changes') {
   return `PATCHWORK_RESULT_V1\n${JSON.stringify({
     schemaVersion: 2,
@@ -160,6 +168,16 @@ test('task model and reasoning selections are persisted with the task', async (c
   const stored = await tasks.getTask(task.taskId);
   assert.equal(stored.model, 'luna');
   assert.equal(stored.reasoningMode, 'extra-high');
+
+  const lowTask = await tasks.createTask({
+    taskText: 'Use Luna with low reasoning.',
+    repositories: [repository],
+    model: 'luna',
+    reasoningMode: 'low',
+  });
+  assert.equal(lowTask.reasoningMode, 'low');
+  const storedLowTask = await tasks.getTask(lowTask.taskId);
+  assert.equal(storedLowTask.reasoningMode, 'low');
 });
 
 test('selected local skills are discovered, copied into the task package, and described in the prompt', async (context) => {
@@ -300,10 +318,7 @@ test('results apply and commit after the coding tree HEAD advances', async (cont
   await runGit(tree.path, ['add', 'advanced.txt']);
   await runGit(tree.path, ['commit', '-m', 'chore: advance coding tree']);
 
-  const result = await new ResultService(tasks).ingestText(
-    task.taskId,
-    plainTextResult(task, patchBody, 'fix(greeting): apply after advanced head'),
-  );
+  const result = await ingestDownloadedText(new ResultService(tasks), tasks, task, plainTextResult(task, patchBody, 'fix(greeting): apply after advanced head'));
   assert.equal(result.state, 'applied');
   assert.equal(await fs.readFile(path.join(tree.path, 'advanced.txt'), 'utf8'), 'newer tree commit\n');
   assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'hello from ChatGPT\n');
@@ -335,10 +350,7 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
   await fs.writeFile(path.join(tree.path, 'hello.txt'), 'newer coding tree version\n');
   await runGit(tree.path, ['add', 'hello.txt']);
   await runGit(tree.path, ['commit', '-m', 'chore: change the same greeting']);
-  const conflicted = await new ResultService(tasks).ingestText(
-    task.taskId,
-    plainTextResult(task, patchBody, 'fix(greeting): change greeting'),
-  );
+  const conflicted = await ingestDownloadedText(new ResultService(tasks), tasks, task, plainTextResult(task, patchBody, 'fix(greeting): change greeting'));
   assert.equal(conflicted.state, 'conflicted');
   assert.deepEqual(conflicted.result.conflicts[0].files, ['hello.txt']);
   assert.match(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
@@ -371,10 +383,7 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
   const { stdout: resolutionPatch } = await runGit(resolutionClone, [
     'diff', '--binary', resolutionTask.repositories[0].baseCommit, '--', '.',
   ]);
-  const resolved = await new ResultService(tasks).ingestText(
-    resolutionTask.taskId,
-    plainTextResult(resolutionTask, resolutionPatch, 'fix(greeting): resolve concurrent changes'),
-  );
+  const resolved = await ingestDownloadedText(new ResultService(tasks), tasks, resolutionTask, plainTextResult(resolutionTask, resolutionPatch, 'fix(greeting): resolve concurrent changes'));
   assert.equal(resolved.state, 'applied');
   assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'resolved greeting\n');
   assert.equal((await runGit(tree.path, ['status', '--porcelain'])).stdout, '');
@@ -437,7 +446,7 @@ test('an unborn repository is snapshotted without changing the source and accept
   })}\nPATCHWORK_RESULT_END`;
 
   const results = new ResultService(tasks);
-  let current = await results.ingestText(task.taskId, resultText);
+  let current = await ingestDownloadedText(results, tasks, task, resultText);
   assert.equal(current.state, 'ready');
   current = await results.apply(task.taskId);
   assert.equal(current.state, 'applied');
@@ -477,7 +486,7 @@ test('a matching ChatGPT result validates, applies, and rolls back', async (cont
   })}\nPATCHWORK_RESULT_END`;
 
   const results = new ResultService(tasks);
-  let current = await results.ingestText(task.taskId, resultText);
+  let current = await ingestDownloadedText(results, tasks, task, resultText);
   assert.equal(current.state, 'ready');
   assert.match(current.result.patches[0].stat, /hello\.txt/);
   current = await results.apply(task.taskId);
@@ -630,7 +639,7 @@ test('a downloaded text result file validates and applies automatically', async 
     transport: 'plain-text-base64',
     taskId: task.taskId,
     status: 'completed',
-    summary: 'Changed the greeting through text transport.',
+    summary: 'Changed the greeting through the downloaded result file.',
     repositories: [{
       id: repository.id,
       baseCommit: repository.baseCommit,
@@ -662,13 +671,20 @@ test('coding trees commit task results, accept follow-ups, and squash merge', as
   const tree = await trees.create(repositoryPath, 'Modern source control');
   assert.equal(tree.clean, true);
   assert.match(tree.branch, /^patchwork\/modern-source-control-/);
+  const chatgptProject = {
+    id: 'g-p-modern-source-control',
+    shortUrl: 'g-p-modern-source-control',
+    name: 'Modern source control project',
+  };
   const task = await tasks.createTask({
     taskText: 'Change the greeting in the coding tree.',
     repositories: [{ path: tree.path }],
     tree,
     autoApply: true,
+    chatgptProject,
   });
-  await trees.attachTask(tree.id, task.taskId);
+  await trees.attachTask(tree.id, task.taskId, chatgptProject);
+  assert.deepEqual((await trees.get(tree.id)).chatgptProject, chatgptProject);
 
   await fs.writeFile(path.join(tree.path, 'hello.txt'), 'changed in coding tree\n');
   const { stdout: patchBody } = await runGit(tree.path, ['diff', '--binary', task.repositories[0].baseCommit, '--', '.']);
@@ -687,7 +703,7 @@ test('coding trees commit task results, accept follow-ups, and squash merge', as
       patch: Buffer.from(patchBody).toString('base64'),
     }],
   })}\nPATCHWORK_RESULT_END`;
-  const result = await new ResultService(tasks).ingestText(task.taskId, responseText);
+  const result = await ingestDownloadedText(new ResultService(tasks), tasks, task, responseText);
   assert.equal(result.state, 'applied');
   assert.match(result.result.commits[0].commit, /^[0-9a-f]{40}$/);
   assert.equal((await runGit(tree.path, ['log', '-1', '--pretty=%s'])).stdout.trim(), 'feat(greeting): update coding tree message');
@@ -700,6 +716,7 @@ test('coding trees commit task results, accept follow-ups, and squash merge', as
 
   const request = await trees.buildMergeRequest(tree.id);
   assert.equal(request.resultFilename, mergeResultFilename(tree.id));
+  assert.deepEqual(request.chatgptProject, chatgptProject);
   assert.match(request.prompt, /feat\(greeting\): update coding tree message/);
   assert.match(request.prompt, /UTF-8 plain-text file/);
   assert.match(request.prompt, new RegExp(mergeResultFilename(tree.id)));
@@ -1127,7 +1144,7 @@ test('conflict-resolution tasks bundle the original checkout as read-only contex
       patch: '',
     })),
   })}\nPATCHWORK_RESULT_END`;
-  const applied = await new ResultService(tasks).ingestText(task.taskId, responseText);
+  const applied = await ingestDownloadedText(new ResultService(tasks), tasks, task, responseText);
   assert.equal(applied.state, 'applied');
   assert.equal(await fs.readFile(path.join(contextPath, 'after-package.txt'), 'utf8'), 'changed after packaging\n');
 });
@@ -1138,6 +1155,19 @@ test('ChatGPT task submission only accepts real conversation URLs', () => {
   assert.equal(isChatGPTConversationUrl('https://chatgpt.com/'), false);
   assert.equal(isChatGPTConversationUrl('https://chatgpt.com/c/'), false);
   assert.equal(isChatGPTConversationUrl('https://example.com/c/abc123'), false);
+});
+
+test('task composer persists all sticky task selections in local storage', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  assert.match(renderer, /patchwork\.task-model/);
+  assert.match(renderer, /patchwork\.task-reasoning/);
+  assert.match(renderer, /patchwork\.task-tree/);
+  assert.match(renderer, /patchwork\.task-project/);
+  assert.match(renderer, /restoreTaskReasoningSelection\(\)/);
+  assert.match(renderer, /persistTaskReasoningSelection\(event\)/);
+  assert.match(renderer, /restoreTaskProjectSelection\(\)/);
+  assert.match(renderer, /persistTaskProjectSelection\(event\)/);
+  assert.match(renderer, /persistTaskTreeSelectionValue\(button\.dataset\.treeId\)/);
 });
 
 test('task configuration installs an owned Luna picker outside React and suppresses native controls', () => {
@@ -1176,6 +1206,14 @@ test('task configuration installs an owned Luna picker outside React and suppres
   assert.doesNotMatch(script, /GPT-5\.6 Terra/);
 });
 
+test('task configuration supports Luna Low reasoning from the HAR', () => {
+  const script = buildTaskConfigurationScript('luna', 'low', 'task-123');
+  assert.match(script, /GPT-5\.6 Luna/);
+  assert.match(script, /Low/);
+  assert.match(script, /thinkingEffort: \"min\"/);
+  assert.match(script, /reasoning:low/);
+});
+
 test('ChatGPT request configuration uses HAR-confirmed Sol and Luna slugs', () => {
   assert.deepEqual(taskRequestConfiguration('default', 'default'), {
     model: 'default',
@@ -1184,6 +1222,12 @@ test('ChatGPT request configuration uses HAR-confirmed Sol and Luna slugs', () =
     thinkingEffort: null,
   });
   assert.equal(taskRequestConfiguration('sol', 'instant').modelSlug, 'gpt-5-6-instant');
+  assert.deepEqual(taskRequestConfiguration('luna', 'low'), {
+    model: 'luna',
+    reasoningMode: 'low',
+    modelSlug: 'gpt-5-6-t-mini',
+    thinkingEffort: 'min',
+  });
   assert.deepEqual(taskRequestConfiguration('sol', 'high'), {
     model: 'sol',
     reasoningMode: 'high',
@@ -1210,6 +1254,15 @@ test('conversation payload rewriting enforces the selected model and thinking ef
   assert.equal(payload.thinking_effort, 'extended');
   assert.equal(rewritten.model, 'gpt-5-6-t-mini');
   assert.equal(rewritten.thinkingEffort, 'extended');
+
+  const low = rewriteConversationRequestBody(JSON.stringify({
+    action: 'next',
+    model: 'gpt-5-6',
+    messages: [],
+  }), taskRequestConfiguration('luna', 'low'));
+  const lowPayload = JSON.parse(low.text);
+  assert.equal(lowPayload.model, 'gpt-5-6-t-mini');
+  assert.equal(lowPayload.thinking_effort, 'min');
 });
 
 test('task request enforcement observes and rewrites ChatGPT’s actual conversation request', async () => {
@@ -1655,20 +1708,6 @@ test('merge result detection accepts the requested text file after generation st
   assert.equal(mergeTreeId(`${mergeResultFilename(treeId).replace('.txt', '')} (2).txt`), treeId);
 });
 
-test('finishing a task result retires it from ChatGPT monitoring', async () => {
-  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
-  const view = {
-    activeTask: task,
-    knownTasks: new Map([[task.taskId, task]]),
-    onResult: async (taskId, result, transport) => ({ taskId, result, transport }),
-  };
-
-  const completed = await ChatGPTView.prototype.finishTaskResult.call(view, task, 'result text', 'text');
-  assert.equal(completed.taskId, task.taskId);
-  assert.equal(view.activeTask, null);
-  assert.equal(view.knownTasks.has(task.taskId), false);
-});
-
 test('a downloaded plain-text ChatGPT result validates and applies automatically', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -1688,7 +1727,7 @@ test('a downloaded plain-text ChatGPT result validates and applies automatically
     transport: 'plain-text-base64',
     taskId: task.taskId,
     status: 'completed',
-    summary: 'Changed the greeting through text transport.',
+    summary: 'Changed the greeting through the downloaded result file.',
     repositories: [{
       id: repository.id,
       baseCommit: repository.baseCommit,
@@ -1699,7 +1738,7 @@ test('a downloaded plain-text ChatGPT result validates and applies automatically
   assert.equal(parsePlainTextResult(responseText).taskId, task.taskId);
 
   const results = new ResultService(tasks);
-  const current = await results.ingestText(task.taskId, responseText);
+  const current = await ingestDownloadedText(results, tasks, task, responseText);
   assert.equal(current.state, 'applied');
   assert.equal(current.result.transport, 'plain-text-base64');
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'plain text result\n');

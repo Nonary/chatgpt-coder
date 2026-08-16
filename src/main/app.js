@@ -67,11 +67,7 @@ async function attachChatGPTView() {
   chatGPTView = new ChatGPTView(
     mainWindow,
     taskService,
-    (taskId, result, transport) => {
-      if (transport === 'text') return resultService.ingestText(taskId, result);
-      if (transport === 'text-file') return resultService.ingestTextFile(taskId, result);
-      return resultService.ingest(taskId, result);
-    },
+    (taskId, downloadedPath) => resultService.ingestTextFile(taskId, downloadedPath),
     emit,
     tasks,
     worktreeService,
@@ -141,8 +137,11 @@ function registerIpc() {
     if (confirmation.response !== 1) return worktreeService.list();
     return worktreeService.remove(treeId, true);
   });
-  ipcMain.handle('trees:merge', async (_event, treeId) => {
+  ipcMain.handle('trees:merge', async (_event, treeId, chatgptProject) => {
     try {
+      if (chatgptProject !== undefined) {
+        await worktreeService.setChatGPTProject(treeId, chatgptProject);
+      }
       const request = await worktreeService.buildMergeRequest(treeId);
       await chatGPTView.submitMerge(request);
       return worktreeService.list();
@@ -172,6 +171,7 @@ function registerIpc() {
         { path: tree.repositoryPath, readOnly: true },
       ],
       tree,
+      chatgptProject: tree.chatgptProject || null,
       autoApply: true,
       mergeResolution: true,
     });
@@ -211,7 +211,14 @@ function registerIpc() {
       tree,
       autoApply: true,
     });
-    if (tree) await worktreeService.attachTask(tree.id, task.taskId);
+    if (tree) {
+      const hasChatGPTProject = Object.prototype.hasOwnProperty.call(input, 'chatgptProject');
+      await worktreeService.attachTask(
+        tree.id,
+        task.taskId,
+        hasChatGPTProject ? input.chatgptProject : undefined,
+      );
+    }
     emit({ type: 'task-prepared', task: publicTask(task) });
     await chatGPTView.prepare(task);
     return publicTask(task);

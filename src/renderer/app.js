@@ -12,12 +12,22 @@ const state = {
   attachments: [],
   skillCatalog: [],
   selectedSkillIds: [],
+  promptLibrary: [],
+  selectedPromptIds: [],
+  promptLibrarySearch: '',
+  editingPromptId: null,
   chatgptProjects: [],
+  projectSelection: undefined,
 };
 
 const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
+const TASK_REASONING_STORAGE_KEY = 'patchwork.task-reasoning';
 const TASK_TREE_STORAGE_KEY = 'patchwork.task-tree';
+const TASK_PROJECT_STORAGE_KEY = 'patchwork.task-project';
+const PROMPT_LIBRARY_STORAGE_KEY = 'patchwork.prompt-library';
 const TASK_NEW_TREE_VALUE = '__new__';
+const MAX_PROMPTS = 100;
+const MAX_PROMPT_CONTENT_LENGTH = 12_000;
 
 const elements = Object.fromEntries(
   [
@@ -29,10 +39,16 @@ const elements = Object.fromEntries(
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
     'add-attachment-button', 'attachment-list', 'configure-skills-button', 'skill-selection-label', 'skill-selection-summary',
     'skills-modal', 'skills-close-button', 'skills-refresh-button', 'skills-search', 'skills-list', 'skills-selection-status', 'skills-done-button',
+    'prompt-library-trigger', 'prompt-library-trigger-label', 'prompt-selection-summary', 'prompt-library-menu',
+    'prompt-library-manage-button', 'prompt-library-new-button', 'prompt-library-search', 'prompt-library-list', 'prompt-library-menu-status',
+    'prompt-library-modal', 'prompt-library-close-button', 'prompt-manager-new-button', 'prompt-manager-count', 'prompt-editor',
+    'prompt-editor-mode', 'prompt-editor-title', 'prompt-editor-cancel-button', 'prompt-editor-name', 'prompt-editor-description',
+    'prompt-editor-content', 'prompt-editor-status', 'prompt-editor-save-button', 'prompt-manager-list',
     'task-tree-select', 'new-tree-fields', 'tree-name',
     'task-model-select', 'task-reasoning-select',
     'chatgpt-project-select', 'new-project-fields', 'new-project-name',
     'refresh-projects-button', 'project-list-status',
+    'trees-project-select', 'trees-refresh-projects-button',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'delete-task-button', 'result-card', 'result-summary', 'patch-list',
@@ -74,24 +90,346 @@ function showToast(message, error = false) {
   showToast.timer = setTimeout(() => elements.toast.classList.add('hidden'), 5000);
 }
 
-function restoreTaskModelSelection() {
-  const modelSelect = elements['task-model-select'];
+function restoreTaskSelectSelection(select, storageKey) {
   try {
-    const savedModel = localStorage.getItem(TASK_MODEL_STORAGE_KEY);
-    if (savedModel && [...modelSelect.options].some((option) => option.value === savedModel)) {
-      modelSelect.value = savedModel;
+    const savedValue = localStorage.getItem(storageKey);
+    if (savedValue !== null && [...select.options].some((option) => option.value === savedValue)) {
+      select.value = savedValue;
+    } else if (savedValue !== null) {
+      localStorage.removeItem(storageKey);
     }
   } catch {
     // Local storage may be unavailable in restricted renderer contexts.
   }
 }
 
-function persistTaskModelSelection(event) {
+function persistTaskSelectSelection(select, storageKey) {
   try {
-    localStorage.setItem(TASK_MODEL_STORAGE_KEY, event.target.value);
+    localStorage.setItem(storageKey, select.value);
   } catch {
     // Local storage may be unavailable in restricted renderer contexts.
   }
+}
+
+function restoreTaskModelSelection() {
+  restoreTaskSelectSelection(elements['task-model-select'], TASK_MODEL_STORAGE_KEY);
+}
+
+function persistTaskModelSelection(event) {
+  persistTaskSelectSelection(event.target, TASK_MODEL_STORAGE_KEY);
+}
+
+function restoreTaskReasoningSelection() {
+  restoreTaskSelectSelection(elements['task-reasoning-select'], TASK_REASONING_STORAGE_KEY);
+}
+
+function persistTaskReasoningSelection(event) {
+  persistTaskSelectSelection(event.target, TASK_REASONING_STORAGE_KEY);
+}
+
+function createPromptId() {
+  return `prompt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizePromptEntry(value) {
+  const name = String(value?.name || '').trim().slice(0, 60);
+  const description = String(value?.description || '').trim().slice(0, 140);
+  const content = String(value?.content || '').replaceAll('\r\n', '\n').trim().slice(0, MAX_PROMPT_CONTENT_LENGTH);
+  if (!name || !content) return null;
+  return {
+    id: String(value?.id || '').trim() || createPromptId(),
+    name,
+    description,
+    content,
+    createdAt: String(value?.createdAt || new Date().toISOString()),
+    updatedAt: String(value?.updatedAt || value?.createdAt || new Date().toISOString()),
+  };
+}
+
+function loadPromptLibrary() {
+  try {
+    const raw = localStorage.getItem(PROMPT_LIBRARY_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    const seenIds = new Set();
+    state.promptLibrary = (Array.isArray(parsed) ? parsed : [])
+      .map(normalizePromptEntry)
+      .filter((prompt) => {
+        if (!prompt || seenIds.has(prompt.id)) return false;
+        seenIds.add(prompt.id);
+        return true;
+      })
+      .slice(0, MAX_PROMPTS);
+  } catch {
+    state.promptLibrary = [];
+  }
+  state.selectedPromptIds = [];
+  renderPromptLibrarySelection();
+  renderPromptLibraryMenu();
+}
+
+function savePromptLibrary() {
+  try {
+    localStorage.setItem(PROMPT_LIBRARY_STORAGE_KEY, JSON.stringify(state.promptLibrary));
+    return true;
+  } catch {
+    showToast('Prompt library could not be saved on this device.', true);
+    return false;
+  }
+}
+
+function selectedPromptEntries() {
+  const promptsById = new Map(state.promptLibrary.map((prompt) => [prompt.id, prompt]));
+  return state.selectedPromptIds.map((id) => promptsById.get(id)).filter(Boolean);
+}
+
+function renderPromptLibrarySelection() {
+  const selected = selectedPromptEntries();
+  elements['prompt-library-trigger-label'].textContent = selected.length
+    ? `${selected.length} saved prompt${selected.length === 1 ? '' : 's'} selected`
+    : 'Add saved prompts';
+  elements['prompt-library-trigger'].classList.toggle('selected', selected.length > 0);
+  elements['prompt-library-trigger'].setAttribute('aria-expanded', !elements['prompt-library-menu'].classList.contains('hidden'));
+  elements['prompt-library-menu-status'].textContent = selected.length
+    ? `${selected.length} prompt${selected.length === 1 ? '' : 's'} will be added to this task.`
+    : 'No prompts selected.';
+
+  const summary = elements['prompt-selection-summary'];
+  summary.classList.toggle('hidden', selected.length === 0);
+  summary.innerHTML = selected.map((prompt) => `
+    <span class="prompt-selection-chip">
+      <span title="${escapeHtml(prompt.description || prompt.name)}">${escapeHtml(prompt.name)}</span>
+      <button class="prompt-selection-remove" type="button" data-prompt-id="${escapeHtml(prompt.id)}" aria-label="Remove ${escapeHtml(prompt.name)}">×</button>
+    </span>
+  `).join('');
+  summary.querySelectorAll('.prompt-selection-remove').forEach((button) => button.addEventListener('click', () => {
+    state.selectedPromptIds = state.selectedPromptIds.filter((id) => id !== button.dataset.promptId);
+    renderPromptLibrarySelection();
+    renderPromptLibraryMenu();
+  }));
+}
+
+function renderPromptLibraryMenu() {
+  const container = elements['prompt-library-list'];
+  const query = state.promptLibrarySearch.trim().toLowerCase();
+  const prompts = state.promptLibrary.filter((prompt) => {
+    if (!query) return true;
+    return `${prompt.name} ${prompt.description} ${prompt.content}`.toLowerCase().includes(query);
+  });
+
+  if (state.promptLibrary.length === 0) {
+    container.innerHTML = `
+      <div class="prompt-library-empty">
+        <span class="prompt-library-empty-icon" aria-hidden="true">✦</span>
+        <strong>No saved prompts yet</strong>
+        <span>Create a reusable instruction once, then add it to future tasks in one click.</span>
+        <button id="prompt-library-empty-new-button" class="secondary" type="button">＋ Create prompt</button>
+      </div>
+    `;
+    container.querySelector('#prompt-library-empty-new-button')?.addEventListener('click', () => {
+      closePromptLibraryMenu();
+      openPromptManager();
+      startPromptEditor();
+    });
+    renderPromptLibrarySelection();
+    return;
+  }
+
+  if (prompts.length === 0) {
+    container.innerHTML = '<div class="prompt-library-empty compact"><strong>No prompts match that search.</strong><span>Try a different name or description.</span></div>';
+  } else {
+    const selectedIds = new Set(state.selectedPromptIds);
+    container.innerHTML = prompts.map((prompt) => {
+      const selected = selectedIds.has(prompt.id);
+      return `
+        <button class="prompt-library-option${selected ? ' selected' : ''}" type="button" data-prompt-id="${escapeHtml(prompt.id)}" aria-pressed="${selected}">
+          <span class="prompt-option-check" aria-hidden="true">${selected ? '✓' : ''}</span>
+          <span class="prompt-option-copy">
+            <strong>${escapeHtml(prompt.name)}</strong>
+            <small>${escapeHtml(prompt.description || 'No description')}</small>
+          </span>
+          <span class="prompt-option-chevron" aria-hidden="true">＋</span>
+        </button>
+      `;
+    }).join('');
+    container.querySelectorAll('.prompt-library-option').forEach((button) => button.addEventListener('click', () => {
+      const promptId = button.dataset.promptId;
+      state.selectedPromptIds = state.selectedPromptIds.includes(promptId)
+        ? state.selectedPromptIds.filter((id) => id !== promptId)
+        : [...state.selectedPromptIds, promptId];
+      renderPromptLibrarySelection();
+      renderPromptLibraryMenu();
+    }));
+  }
+
+  renderPromptLibrarySelection();
+}
+
+function closePromptLibraryMenu() {
+  elements['prompt-library-menu'].classList.add('hidden');
+  elements['prompt-library-trigger'].setAttribute('aria-expanded', 'false');
+}
+
+function togglePromptLibraryMenu() {
+  const menu = elements['prompt-library-menu'];
+  const opening = menu.classList.contains('hidden');
+  if (opening) {
+    renderPromptLibraryMenu();
+    menu.classList.remove('hidden');
+    elements['prompt-library-trigger'].setAttribute('aria-expanded', 'true');
+    return;
+  }
+  closePromptLibraryMenu();
+}
+
+function renderPromptManager() {
+  const list = elements['prompt-manager-list'];
+  const count = state.promptLibrary.length;
+  elements['prompt-manager-count'].textContent = `${count} saved prompt${count === 1 ? '' : 's'}`;
+  if (count === 0) {
+    list.innerHTML = `
+      <div class="prompt-manager-empty">
+        <strong>Your prompt library is ready for its first reusable instruction.</strong>
+        <span>Give it a name, add a short description, and write the exact instructions you want Patchwork to append to future tasks.</span>
+        <button class="primary prompt-manager-empty-new" type="button">＋ New prompt</button>
+      </div>
+    `;
+    list.querySelector('.prompt-manager-empty-new')?.addEventListener('click', () => startPromptEditor());
+    return;
+  }
+
+  list.innerHTML = state.promptLibrary.map((prompt) => `
+    <article class="prompt-manager-item">
+      <div class="prompt-manager-item-heading">
+        <div>
+          <strong>${escapeHtml(prompt.name)}</strong>
+          <small>${escapeHtml(prompt.description || 'No description')}</small>
+        </div>
+        ${state.selectedPromptIds.includes(prompt.id) ? '<span class="prompt-manager-selected">Selected</span>' : ''}
+      </div>
+      <p>${escapeHtml(prompt.content.replace(/\s+/g, ' ').trim())}</p>
+      <div class="prompt-manager-actions">
+        <button class="secondary prompt-edit-button" type="button" data-prompt-id="${escapeHtml(prompt.id)}">Edit</button>
+        <button class="danger prompt-delete-button" type="button" data-prompt-id="${escapeHtml(prompt.id)}">Delete</button>
+      </div>
+    </article>
+  `).join('');
+  list.querySelectorAll('.prompt-edit-button').forEach((button) => button.addEventListener('click', () => startPromptEditor(button.dataset.promptId)));
+  list.querySelectorAll('.prompt-delete-button').forEach((button) => button.addEventListener('click', () => deletePrompt(button.dataset.promptId)));
+}
+
+function openPromptManager() {
+  closePromptLibraryMenu();
+  elements['prompt-library-modal'].classList.remove('hidden');
+  renderPromptManager();
+}
+
+function closePromptManager() {
+  elements['prompt-library-modal'].classList.add('hidden');
+  cancelPromptEditor();
+}
+
+function startPromptEditor(promptId = null) {
+  const prompt = promptId ? state.promptLibrary.find((item) => item.id === promptId) : null;
+  state.editingPromptId = prompt?.id || null;
+  elements['prompt-editor-mode'].textContent = prompt ? 'EDIT PROMPT' : 'NEW PROMPT';
+  elements['prompt-editor-title'].textContent = prompt ? 'Edit saved prompt' : 'Create a saved prompt';
+  elements['prompt-editor-name'].value = prompt?.name || '';
+  elements['prompt-editor-description'].value = prompt?.description || '';
+  elements['prompt-editor-content'].value = prompt?.content || '';
+  elements['prompt-editor-status'].textContent = 'This text will be appended to the task only when the prompt is selected.';
+  elements['prompt-editor-status'].classList.remove('error');
+  elements['prompt-editor'].classList.remove('hidden');
+  requestAnimationFrame(() => elements['prompt-editor-name'].focus());
+}
+
+function cancelPromptEditor() {
+  state.editingPromptId = null;
+  elements['prompt-editor'].classList.add('hidden');
+  elements['prompt-editor-name'].value = '';
+  elements['prompt-editor-description'].value = '';
+  elements['prompt-editor-content'].value = '';
+  elements['prompt-editor-status'].classList.remove('error');
+}
+
+function savePromptFromEditor(event) {
+  event.preventDefault();
+  const name = elements['prompt-editor-name'].value.trim();
+  const description = elements['prompt-editor-description'].value.trim();
+  const content = elements['prompt-editor-content'].value.replaceAll('\r\n', '\n').trim();
+  if (!name) {
+    elements['prompt-editor-status'].textContent = 'Add a name so the prompt is easy to recognize in the dropdown.';
+    elements['prompt-editor-status'].classList.add('error');
+    elements['prompt-editor-name'].focus();
+    return;
+  }
+  if (!content) {
+    elements['prompt-editor-status'].textContent = 'Add the instructions that should be appended when this prompt is selected.';
+    elements['prompt-editor-status'].classList.add('error');
+    elements['prompt-editor-content'].focus();
+    return;
+  }
+  const duplicate = state.promptLibrary.find((prompt) => (
+    prompt.id !== state.editingPromptId && prompt.name.toLowerCase() === name.toLowerCase()
+  ));
+  if (duplicate) {
+    elements['prompt-editor-status'].textContent = 'A saved prompt with this name already exists.';
+    elements['prompt-editor-status'].classList.add('error');
+    elements['prompt-editor-name'].focus();
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const previous = state.promptLibrary;
+  const nextPrompt = normalizePromptEntry({
+    id: state.editingPromptId || createPromptId(),
+    name,
+    description,
+    content,
+    createdAt: state.promptLibrary.find((prompt) => prompt.id === state.editingPromptId)?.createdAt || now,
+    updatedAt: now,
+  });
+  state.promptLibrary = state.editingPromptId
+    ? state.promptLibrary.map((prompt) => prompt.id === state.editingPromptId ? nextPrompt : prompt)
+    : [nextPrompt, ...state.promptLibrary];
+  if (state.promptLibrary.length > MAX_PROMPTS) state.promptLibrary = state.promptLibrary.slice(0, MAX_PROMPTS);
+  if (!savePromptLibrary()) {
+    state.promptLibrary = previous;
+    return;
+  }
+
+  state.editingPromptId = null;
+  elements['prompt-editor'].classList.add('hidden');
+  elements['prompt-editor-status'].classList.remove('error');
+  renderPromptManager();
+  renderPromptLibraryMenu();
+  showToast(`${name} ${previous.some((prompt) => prompt.id === nextPrompt.id) ? 'updated' : 'saved'}.`);
+}
+
+function deletePrompt(promptId) {
+  const prompt = state.promptLibrary.find((item) => item.id === promptId);
+  if (!prompt) return;
+  if (!window.confirm(`Delete the saved prompt “${prompt.name}”?`)) return;
+  const previous = state.promptLibrary;
+  const previousSelectedIds = state.selectedPromptIds;
+  state.promptLibrary = state.promptLibrary.filter((item) => item.id !== promptId);
+  state.selectedPromptIds = state.selectedPromptIds.filter((id) => id !== promptId);
+  if (!savePromptLibrary()) {
+    state.promptLibrary = previous;
+    state.selectedPromptIds = previousSelectedIds;
+    return;
+  }
+  if (state.editingPromptId === promptId) cancelPromptEditor();
+  renderPromptManager();
+  renderPromptLibrarySelection();
+  renderPromptLibraryMenu();
+  showToast(`${prompt.name} deleted.`);
+}
+
+function buildTaskTextWithPrompts(baseTaskText) {
+  const selected = selectedPromptEntries();
+  if (selected.length === 0) return baseTaskText;
+  const additions = selected.map((prompt) => `### ${prompt.name}\n${prompt.content.trim()}`).filter(Boolean).join('\n\n');
+  return `${baseTaskText}\n\nAdditional instructions from the prompt library:\n\n${additions}`;
 }
 
 function persistTaskTreeSelectionValue(value) {
@@ -119,6 +457,29 @@ function restoreTaskTreeSelection() {
 
 function persistTaskTreeSelection(event) {
   persistTaskTreeSelectionValue(event.target.value);
+}
+
+function restoreTaskProjectSelection() {
+  if (state.projectSelection !== undefined) return;
+  try {
+    state.projectSelection = localStorage.getItem(TASK_PROJECT_STORAGE_KEY) || '';
+  } catch {
+    state.projectSelection = '';
+  }
+}
+
+function persistTaskProjectSelectionValue(value) {
+  const next = value === '__new__' ? '' : String(value || '');
+  state.projectSelection = next;
+  try {
+    localStorage.setItem(TASK_PROJECT_STORAGE_KEY, next);
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
+}
+
+function persistTaskProjectSelection(event) {
+  persistTaskProjectSelectionValue(event.target.value);
 }
 
 function formatTime(value = new Date()) {
@@ -325,30 +686,47 @@ function renderChatGPTProjects() {
   select.innerHTML = '<option value="">New chat (no project)</option>'
     + state.chatgptProjects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join('')
     + '<option value="__new__">Create a new ChatGPT project…</option>';
-  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  const desired = previous === '__new__' ? previous : (state.projectSelection ?? previous ?? '');
+  if ([...select.options].some((option) => option.value === desired)) select.value = desired;
   const creating = select.value === '__new__';
   elements['new-project-fields'].classList.toggle('hidden', !creating);
   elements['new-project-name'].disabled = !creating;
 }
 
+function renderTreesProjectSelection() {
+  const select = elements['trees-project-select'];
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = '<option value="">No ChatGPT project</option>'
+    + state.chatgptProjects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join('');
+  const desired = state.projectSelection ?? previous ?? '';
+  if ([...select.options].some((option) => option.value === desired)) select.value = desired;
+  else select.value = '';
+}
+
 async function refreshChatGPTProjects(showErrors = false) {
   elements['refresh-projects-button'].disabled = true;
+  elements['trees-refresh-projects-button'].disabled = true;
   elements['project-list-status'].classList.remove('error');
   elements['project-list-status'].textContent = 'Loading ChatGPT projects…';
   try {
     state.chatgptProjects = await window.patchwork.listChatGPTProjects();
+    restoreTaskProjectSelection();
     renderChatGPTProjects();
+    renderTreesProjectSelection();
     elements['project-list-status'].textContent = state.chatgptProjects.length
       ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available.`
       : 'No ChatGPT projects found. You can create one below.';
   } catch (error) {
     state.chatgptProjects = [];
     renderChatGPTProjects();
+    renderTreesProjectSelection();
     elements['project-list-status'].classList.add('error');
     elements['project-list-status'].textContent = error.message;
     if (showErrors) showToast(error.message, true);
   } finally {
     elements['refresh-projects-button'].disabled = false;
+    elements['trees-refresh-projects-button'].disabled = false;
   }
 }
 
@@ -393,6 +771,7 @@ function renderTrees() {
       <div class="tree-stat"><strong>${escapeHtml(tree.commitCount || 0)}</strong><small>Tree commits</small></div>
       <div class="tree-stat"><strong>${escapeHtml((tree.taskIds || []).length)}</strong><small>Tasks</small></div>
     </div>
+    <div class="tree-project"><span>Project</span><strong>${escapeHtml(tree.chatgptProject?.name || 'No ChatGPT project')}</strong></div>
     <div class="tree-last">${tree.lastSubject ? `${escapeHtml(tree.lastCommit)} · ${escapeHtml(tree.lastSubject)}` : 'No task commits yet.'}</div>
     ${tree.mergeError ? `<div class="tree-last tree-error">${escapeHtml(tree.mergeError)}</div>` : ''}
     <div class="tree-actions">
@@ -407,6 +786,7 @@ function renderTrees() {
   container.querySelectorAll('.tree-continue').forEach((button) => button.addEventListener('click', () => {
     showComposer();
     elements['task-tree-select'].value = button.dataset.treeId;
+    persistTaskTreeSelectionValue(button.dataset.treeId);
     renderTaskTreeOptions();
     elements['task-text'].focus();
   }));
@@ -421,7 +801,11 @@ function renderTrees() {
   }));
   container.querySelectorAll('.tree-merge').forEach((button) => button.addEventListener('click', async () => {
     try {
-      await window.patchwork.mergeTree(button.dataset.treeId);
+      const projectId = elements['trees-project-select'].value;
+      const chatgptProject = projectId
+        ? state.chatgptProjects.find((project) => project.id === projectId) || null
+        : null;
+      await window.patchwork.mergeTree(button.dataset.treeId, chatgptProject);
       showSession();
       showToast('Fresh ChatGPT chat opened to prepare the squash commit.');
       await refreshTrees();
@@ -663,6 +1047,7 @@ function taskConfigurationLabel(task) {
   const reasoning = {
     default: 'default reasoning',
     instant: 'Instant',
+    low: 'Low',
     medium: 'Medium',
     high: 'High',
     'extra-high': 'Extra High',
@@ -726,7 +1111,13 @@ function showTask(task) {
 
 function showComposer() {
   closeSkillDrawer();
+  closePromptManager();
+  closePromptLibraryMenu();
   resetTaskSkills();
+  state.selectedPromptIds = [];
+  state.promptLibrarySearch = '';
+  elements['prompt-library-search'].value = '';
+  renderPromptLibrarySelection();
   state.activeTask = null;
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
@@ -741,6 +1132,8 @@ function showComposer() {
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   restoreTaskModelSelection();
+  restoreTaskReasoningSelection();
+  restoreTaskProjectSelection();
   restoreTaskTreeSelection();
   renderChatGPTProjects();
   refreshChatGPTProjects().catch(() => {});
@@ -794,7 +1187,10 @@ function showTrees() {
   elements['trees-button'].classList.add('active');
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
+  restoreTaskProjectSelection();
+  renderTreesProjectSelection();
   refreshTrees().catch((error) => showToast(error.message, true));
+  refreshChatGPTProjects().catch(() => {});
 }
 
 function showTaskHistory() {
@@ -1157,6 +1553,9 @@ async function createTask() {
   button.disabled = true;
   button.firstChild.textContent = 'Preparing bundle… ';
   try {
+    const baseTaskText = elements['task-text'].value.trim();
+    if (!baseTaskText) throw new Error('Describe the software task before creating a task package.');
+    const taskText = buildTaskTextWithPrompts(baseTaskText);
     let chatgptProject = null;
     const projectSelection = elements['chatgpt-project-select'].value;
     if (projectSelection === '__new__') {
@@ -1165,18 +1564,21 @@ async function createTask() {
       button.firstChild.textContent = 'Creating ChatGPT project… ';
       chatgptProject = await window.patchwork.createChatGPTProject(projectName);
       state.chatgptProjects = [chatgptProject, ...state.chatgptProjects.filter((item) => item.id !== chatgptProject.id)];
+      persistTaskProjectSelectionValue(chatgptProject.id);
       renderChatGPTProjects();
       elements['chatgpt-project-select'].value = chatgptProject.id;
+      persistTaskProjectSelectionValue(chatgptProject.id);
       elements['new-project-fields'].classList.add('hidden');
       elements['new-project-name'].disabled = true;
     } else if (projectSelection) {
       chatgptProject = state.chatgptProjects.find((project) => project.id === projectSelection) || null;
       if (!chatgptProject) throw new Error('Refresh ChatGPT projects and choose the destination again.');
+      persistTaskProjectSelectionValue(chatgptProject.id);
     }
     button.firstChild.textContent = 'Preparing bundle… ';
     const task = await window.patchwork.createTask({
       repositories: state.repositories,
-      taskText: elements['task-text'].value,
+      taskText,
       model: elements['task-model-select'].value,
       reasoningMode: elements['task-reasoning-select'].value,
       skillIds: [...state.selectedSkillIds],
@@ -1247,8 +1649,37 @@ elements['task-tree-select'].addEventListener('change', (event) => {
   renderTaskTreeOptions();
 });
 elements['task-model-select'].addEventListener('change', persistTaskModelSelection);
-elements['chatgpt-project-select'].addEventListener('change', renderChatGPTProjects);
+elements['task-reasoning-select'].addEventListener('change', persistTaskReasoningSelection);
+elements['prompt-library-trigger'].addEventListener('click', togglePromptLibraryMenu);
+elements['prompt-library-manage-button'].addEventListener('click', () => openPromptManager());
+elements['prompt-library-new-button'].addEventListener('click', () => {
+  closePromptLibraryMenu();
+  openPromptManager();
+  startPromptEditor();
+});
+elements['prompt-library-search'].addEventListener('input', (event) => {
+  state.promptLibrarySearch = event.target.value;
+  renderPromptLibraryMenu();
+});
+elements['prompt-library-modal'].addEventListener('click', (event) => {
+  if (event.target === elements['prompt-library-modal']) closePromptManager();
+});
+elements['prompt-library-close-button'].addEventListener('click', closePromptManager);
+elements['prompt-manager-new-button'].addEventListener('click', () => startPromptEditor());
+elements['prompt-editor-cancel-button'].addEventListener('click', cancelPromptEditor);
+elements['prompt-editor'].addEventListener('submit', savePromptFromEditor);
+elements['chatgpt-project-select'].addEventListener('change', (event) => {
+  persistTaskProjectSelection(event);
+  renderChatGPTProjects();
+  renderTreesProjectSelection();
+});
 elements['refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
+elements['trees-project-select'].addEventListener('change', (event) => {
+  persistTaskProjectSelection(event);
+  renderTreesProjectSelection();
+  renderChatGPTProjects();
+});
+elements['trees-refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
 elements['add-attachment-button'].addEventListener('click', chooseAttachments);
 elements['configure-skills-button'].addEventListener('click', openSkillDrawer);
@@ -1261,6 +1692,11 @@ elements['skills-modal'].addEventListener('click', (event) => {
 });
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !elements['skills-modal'].classList.contains('hidden')) closeSkillDrawer();
+  if (event.key === 'Escape' && !elements['prompt-library-modal'].classList.contains('hidden')) closePromptManager();
+  if (event.key === 'Escape' && !elements['prompt-library-menu'].classList.contains('hidden')) closePromptLibraryMenu();
+});
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('.prompt-library-picker')) closePromptLibraryMenu();
 });
 elements['create-task-button'].addEventListener('click', createTask);
 elements['submit-task-button'].addEventListener('click', () => runTaskAction(window.patchwork.submitTask, 'Task submitted.'));
@@ -1408,6 +1844,9 @@ async function initialize() {
     state.workspaceRepositories = repositories;
     state.repositories = repositories.filter((repository) => !repository.unavailable).slice(0, 1);
     restoreTaskModelSelection();
+    restoreTaskReasoningSelection();
+    restoreTaskProjectSelection();
+    loadPromptLibrary();
     renderTaskList();
     renderRepositories();
     renderTrees();

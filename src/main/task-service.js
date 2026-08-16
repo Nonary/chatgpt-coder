@@ -12,7 +12,7 @@ const { SkillService } = require('./skill-service');
 
 const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
-const REASONING_MODES = new Set(['default', 'instant', 'medium', 'high', 'extra-high']);
+const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high']);
 
 function normalizeTaskModel(value) {
   const model = String(value || 'default').trim().toLowerCase();
@@ -121,7 +121,7 @@ function buildHandoffPrompt(taskId, taskText, attachments = [], skills = []) {
   const skillNote = skills.length
     ? `\n\nThe task ZIP also includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under \`skills/\`. Use or invoke a selected skill only when it is relevant to the task, and do not load unrelated skills.`
     : '\n\nThe task ZIP may include selected local skills under \`skills/\`. Use or invoke them only when they are relevant to the task.';
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}${skillNote}\n\nTask summary:\n${taskText}`;
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}${skillNote}\n\nTask summary:\n${taskText}\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
 }
 
 function uniqueAttachmentName(filename, usedNames) {
@@ -353,7 +353,7 @@ class TaskService {
       skills: packageSkills,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
-    const agentInstructions = `${buildAgentInstructions(taskId, packageSkills)}\n${buildCurrentAgentAddendum(taskId)}`;
+    const agentInstructions = buildAgentInstructions(taskId, packageSkills);
 
     await Promise.all([
       fs.writeFile(path.join(taskDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
@@ -406,7 +406,6 @@ class TaskService {
       state: 'prepared',
       result: null,
     };
-    record.handoffPrompt = `${record.handoffPrompt}\n\n${buildCurrentHandoffAddendum(taskId)}`;
     await this.saveTask(record);
     return record;
   }
@@ -457,15 +456,3 @@ module.exports = {
   buildAgentInstructions,
   buildHandoffPrompt,
 };
-
-function buildCurrentAgentAddendum(taskId) {
-  return `## Current ChatGPT - Coder requirements
-
-Repositories marked \`readOnly: true\` are context snapshots. Inspect them to understand the task, but never edit them. Make changes only in writable repositories and return an empty patch for each read-only repository.
-
-The required result is one attached UTF-8 text file named \`chatgpt-ide-result-${taskId}.txt\`. Never print the result envelope or patch contents in the conversation. Do not paste PATCHWORK_RESULT_V1 or its JSON payload into chat. These requirements supersede any earlier compatibility wording.`;
-}
-
-function buildCurrentHandoffAddendum(taskId) {
-  return `Do not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Create and attach the required UTF-8 result file named \`chatgpt-ide-result-${taskId}.txt\`. Do not paste PATCHWORK_RESULT_V1, the JSON envelope, or patch contents into the conversation. Selected local skills may be included in the task package; use or invoke them only when relevant and do not load unrelated skills.`;
-}
