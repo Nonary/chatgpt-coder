@@ -333,7 +333,7 @@ class ResultService {
         const repository = task.repositories.find((entry) => entry.id === item.repositoryId);
         const current = await inspectRepository(repository.path);
         if (!current.isClean || current.baseCommit !== item.commit) {
-          throw new Error('The coding tree changed after this task was committed; revert it from Source Control instead.');
+          throw new Error('The task target changed after this task was applied; revert it from Source Control instead.');
         }
         await runGit(repository.path, ['revert', '--no-edit', item.commit]);
         const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);

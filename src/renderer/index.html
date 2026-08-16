@@ -188,13 +188,14 @@
               <div class="card-heading">
                 <div>
                   <span class="step-number">1</span>
-                  <h2>Choose a coding tree</h2>
+                  <h2>Choose a task target</h2>
                 </div>
               </div>
-              <p class="card-copy">Start an isolated worktree for this task, or attach a follow-up to an existing tree. Every task opens a fresh ChatGPT chat.</p>
-              <label class="field-label" for="task-tree-select">Coding tree</label>
+              <p class="card-copy">Use the current working changes, create an isolated coding tree, or attach a follow-up to an existing tree. Every task opens a fresh ChatGPT chat.</p>
+              <label class="field-label" for="task-tree-select">Task target</label>
               <select id="task-tree-select" class="field-control">
-                <option value="">Create a new coding tree</option>
+                <option value="">Use current working changes</option>
+                <option value="__new__">Create a new coding tree</option>
               </select>
               <div id="new-tree-fields" class="new-tree-fields">
                 <label class="field-label" for="tree-name">New tree name</label>
@@ -210,7 +211,7 @@
                 </div>
                 <button id="add-repository-button" class="secondary">Add repository</button>
               </div>
-              <p class="card-copy">New coding trees start from one clean, committed repository. Existing trees already know which repository they belong to.</p>
+              <p class="card-copy">Current-working-change tasks package the selected repository as it is now, including uncommitted changes. New coding trees require one clean repository.</p>
               <div id="repository-list" class="repository-list empty-state">
                 <div class="empty-icon">⌘</div>
                 <strong>No repository selected</strong>
@@ -251,6 +252,14 @@
                 rows="9"
                 placeholder="For example: Add keyboard navigation to the command palette, update the tests, and document the shortcuts."
               ></textarea>
+              <div class="task-option-picker">
+                <div>
+                  <strong>Task skills</strong>
+                  <small>Optional skills discovered from common Claude Code, Codex, Copilot, and Agent Skills locations.</small>
+                </div>
+                <button id="configure-skills-button" class="secondary" type="button"><span id="skill-selection-label">Choose skills</span></button>
+              </div>
+              <div id="skill-selection-summary" class="skill-selection-summary hidden" aria-live="polite"></div>
               <div class="attachment-picker">
                 <div>
                   <strong>Task attachments</strong>
@@ -265,8 +274,8 @@
                 <input id="auto-apply" type="checkbox" checked disabled />
                 <span class="toggle"><span></span></span>
                 <span>
-                  <strong>Validate, apply, and commit to the coding tree</strong>
-                  <small>ChatGPT supplies a Conventional Commit message. The original branch is untouched until you merge the tree.</small>
+                  <strong>Validate and apply changes</strong>
+                  <small>Coding-tree tasks also commit with ChatGPT’s Conventional Commit message. Current-working-change tasks apply directly to the selected repository.</small>
                 </span>
               </label>
             </article>
@@ -300,10 +309,10 @@
           <aside class="guide-card">
             <p class="eyebrow">HOW IT WORKS</p>
             <ol>
-              <li><span>1</span><div><strong>Isolate</strong><small>A Git worktree and Patchwork branch keep this stream independent.</small></div></li>
-              <li><span>2</span><div><strong>Target</strong><small>Choose a regular chat or a ChatGPT project for the task.</small></div></li>
+              <li><span>1</span><div><strong>Target</strong><small>Use current working changes, create a Git worktree, or continue an existing coding tree.</small></div></li>
+              <li><span>2</span><div><strong>Launch</strong><small>Choose a regular chat or a ChatGPT project for the task.</small></div></li>
               <li><span>3</span><div><strong>Hand off</strong><small>The repository bundle and attachments are submitted through the visible browser.</small></div></li>
-              <li><span>4</span><div><strong>Commit + merge</strong><small>Validated changes are committed in the tree and can later be squashed into the original branch.</small></div></li>
+              <li><span>4</span><div><strong>Apply</strong><small>Validated changes are applied to the selected target. Coding-tree changes can later be squashed into the original branch.</small></div></li>
             </ol>
             <div class="boundary-note">
               <strong>Visible browser boundary</strong>
@@ -380,6 +389,29 @@
             </div>
           </div>
         </section>
+
+        <div id="skills-modal" class="modal-backdrop hidden">
+          <aside class="skill-drawer" role="dialog" aria-modal="true" aria-labelledby="skill-drawer-title">
+            <header class="skill-drawer-header">
+              <div>
+                <p class="eyebrow">TASK CONFIGURATION</p>
+                <h2 id="skill-drawer-title">Choose skills</h2>
+              </div>
+              <button id="skills-close-button" class="icon-button" type="button" aria-label="Close skill drawer">×</button>
+            </header>
+            <p class="skill-drawer-copy">Select only the local skills that should be available to this task. Patchwork copies selected skill folders into the task package.</p>
+            <div class="skill-drawer-toolbar">
+              <label class="sr-only" for="skills-search">Search skills</label>
+              <input id="skills-search" class="field-control" type="search" placeholder="Search skills" />
+              <button id="skills-refresh-button" class="secondary" type="button">Refresh</button>
+            </div>
+            <div id="skills-list" class="skill-list"></div>
+            <footer class="skill-drawer-footer">
+              <span id="skills-selection-status" class="field-help">No skills selected.</span>
+              <button id="skills-done-button" class="primary" type="button">Done</button>
+            </footer>
+          </aside>
+        </div>
 
         <div id="toast" class="toast hidden" role="status"></div>
       </main>

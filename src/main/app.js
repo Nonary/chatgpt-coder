@@ -3,6 +3,7 @@ const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
 const { ResultService } = require('./result-service');
+const { SkillService } = require('./skill-service');
 const { TaskService } = require('./task-service');
 const { WorktreeService } = require('./worktree-service');
 
@@ -16,6 +17,7 @@ let mainWindow;
 let taskService;
 let gitService;
 let resultService;
+let skillService;
 let worktreeService;
 let chatGPTView;
 
@@ -90,6 +92,10 @@ function registerIpc() {
 
   ipcMain.handle('projects:list', async () => chatGPTView.listProjects());
   ipcMain.handle('projects:create', async (_event, name) => chatGPTView.createProject(name));
+  ipcMain.handle('skills:list', async (_event, repositoryPaths) => {
+    const skills = await skillService.discover(Array.isArray(repositoryPaths) ? repositoryPaths : []);
+    return skills.map(({ sourcePath, skillFile, ...skill }) => skill);
+  });
 
   ipcMain.handle('attachments:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
@@ -177,28 +183,35 @@ function registerIpc() {
 
   ipcMain.handle('task:create', async (_event, input) => {
     if (!String(input.taskText || '').trim()) {
-      throw new Error('Describe the software task before creating a coding tree.');
+      throw new Error('Describe the software task before creating a task package.');
     }
-    let tree;
+    let tree = null;
+    let skillRepositoryPaths = Array.isArray(input.repositories)
+      ? input.repositories.map((item) => item.path)
+      : [];
     if (input.treeId) {
       tree = await worktreeService.get(input.treeId);
       const inspected = await worktreeService.inspect(tree);
       if (!inspected.available) throw new Error(inspected.error);
       if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
-    } else {
+      skillRepositoryPaths = [tree.path];
+    } else if (input.createTree) {
       if (!Array.isArray(input.repositories) || input.repositories.length !== 1) {
         throw new Error('Choose exactly one repository when creating a coding tree.');
       }
+      await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
       const suggestedName = String(input.treeName || input.taskText || '').split('\n')[0].trim();
       tree = await worktreeService.create(input.repositories[0].path, suggestedName);
     }
+    if (!input.createTree) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
     const task = await taskService.createTask({
       ...input,
-      repositories: [{ path: tree.path }],
+      skillRepositoryPaths,
+      repositories: tree ? [{ path: tree.path }] : input.repositories,
       tree,
       autoApply: true,
     });
-    await worktreeService.attachTask(tree.id, task.taskId);
+    if (tree) await worktreeService.attachTask(tree.id, task.taskId);
     emit({ type: 'task-prepared', task: publicTask(task) });
     await chatGPTView.prepare(task);
     return publicTask(task);
@@ -299,12 +312,14 @@ function registerIpc() {
 }
 
 app.whenReady().then(async () => {
-  taskService = new TaskService(path.join(app.getPath('userData'), 'patchwork'));
+  const dataRoot = path.join(app.getPath('userData'), 'patchwork');
+  skillService = new SkillService();
+  taskService = new TaskService(dataRoot, skillService);
   await taskService.initialize();
-  gitService = new GitService(path.join(app.getPath('userData'), 'patchwork'));
+  gitService = new GitService(dataRoot);
   await gitService.initialize();
   worktreeService = new WorktreeService(
-    path.join(app.getPath('userData'), 'patchwork'),
+    dataRoot,
     emit,
     () => gitService.listRepositories(),
   );

@@ -9,12 +9,16 @@ const AdmZip = require('adm-zip');
 const {
   CHATGPT_URL,
   ChatGPTView,
+  buildConversationStatusScript,
   buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
+  conversationIdFromRouteUrl,
+  conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,
   taskRequestConfiguration,
@@ -24,6 +28,7 @@ const {
 const { fingerprintRepository, runGit } = require('../src/main/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/main/git-service');
 const { ResultService, parsePlainTextResult } = require('../src/main/result-service');
+const { SkillService } = require('../src/main/skill-service');
 const { TaskService } = require('../src/main/task-service');
 const {
   WorktreeService,
@@ -155,6 +160,76 @@ test('task model and reasoning selections are persisted with the task', async (c
   const stored = await tasks.getTask(task.taskId);
   assert.equal(stored.model, 'luna');
   assert.equal(stored.reasoningMode, 'extra-high');
+});
+
+test('selected local skills are discovered, copied into the task package, and described in the prompt', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-skills-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const homeDirectory = path.join(root, 'home');
+  const userSkillPath = path.join(homeDirectory, '.codex', 'skills', 'review-changes');
+  const projectSkillPath = path.join(repositoryPath, '.github', 'skills', 'ui-review');
+  await fs.mkdir(userSkillPath, { recursive: true });
+  await fs.mkdir(projectSkillPath, { recursive: true });
+  await fs.writeFile(path.join(userSkillPath, 'SKILL.md'), [
+    '---',
+    'name: review-changes',
+    'description: Review changed code for correctness and maintainability.',
+    '---',
+    '',
+    '# Review changes',
+    '',
+    'Use this skill when the task asks for a focused code review.',
+    '',
+  ].join('\n'));
+  await fs.writeFile(path.join(projectSkillPath, 'SKILL.md'), [
+    '---',
+    'name: ui-review',
+    'description: Review user interface changes for consistency and accessibility.',
+    '---',
+    '',
+    '# UI review',
+    '',
+    'Inspect the affected interface and related state before making changes.',
+    '',
+  ].join('\n'));
+  await fs.writeFile(path.join(projectSkillPath, 'checklist.md'), 'Check keyboard focus and labels.\n');
+
+  const skillService = new SkillService({ homeDirectory });
+  const tasks = new TaskService(path.join(root, 'data'), skillService);
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const discovered = await skillService.discover([repositoryPath]);
+
+  assert.ok(discovered.some((skill) => skill.name === 'review-changes' && skill.provider === 'Codex' && skill.scope === 'user'));
+  assert.ok(discovered.some((skill) => skill.name === 'ui-review' && skill.provider === 'GitHub Copilot' && skill.scope === 'project'));
+  const selectedIds = discovered
+    .filter((skill) => skill.name === 'review-changes' || skill.name === 'ui-review')
+    .map((skill) => skill.id);
+
+  const task = await tasks.createTask({
+    taskText: 'Improve the UI and review the resulting changes.',
+    repositories: [repository],
+    skillIds: selectedIds,
+    skillRepositoryPaths: [repositoryPath],
+  });
+
+  assert.equal(task.skills.length, 2);
+  assert.ok(task.skills.every((skill) => skill.path.startsWith(path.join(path.dirname(task.packagePath), 'skills'))));
+  assert.match(task.handoffPrompt, /selected local skills/i);
+  assert.match(task.handoffPrompt, /only when it is relevant/i);
+
+  const archive = new AdmZip(task.packagePath);
+  const entries = new Map(archive.getEntries().map((entry) => [entry.entryName, entry]));
+  const manifest = JSON.parse(entries.get('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.skills.length, 2);
+  assert.equal(manifest.skills.every((skill) => !skill.path), true);
+  assert.match(entries.get('AGENTS.md').getData().toString('utf8'), /Do not load or invoke unrelated skills/i);
+
+  const uiSkill = task.skills.find((skill) => skill.name === 'ui-review');
+  assert.ok(entries.has(`${uiSkill.directory}/SKILL.md`));
+  assert.ok(entries.has(`${uiSkill.directory}/checklist.md`));
+  assert.equal(entries.get(`${uiSkill.directory}/checklist.md`).getData().toString('utf8'), 'Check keyboard focus and labels.\n');
 });
 
 test('dirty repositories keep their full history and capture unstaged files as a task tip', async (context) => {
@@ -456,6 +531,33 @@ test('opening a task loads its saved ChatGPT conversation', async () => {
     view.openTaskConversation({ ...task, conversationUrl: 'https://example.com/not-chatgpt' }),
     /invalid saved ChatGPT conversation URL/,
   );
+});
+
+test('opening an already-live task preserves the streaming conversation page', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const loaded = [];
+  const task = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    conversationId,
+    conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+  };
+  const view = Object.create(ChatGPTView.prototype);
+  view.view = {
+    webContents: {
+      getURL: () => `https://chatgpt.com/g/g-p-example/c/${conversationId}?model=gpt-5-6`,
+      loadURL: async (url) => loaded.push(url),
+    },
+  };
+  view.activeTask = task;
+  view.activeMerge = null;
+  view.knownTasks = new Map([[task.taskId, task]]);
+  view.onEvent = async () => {};
+  view.installResultWatcher = () => {};
+
+  const result = await view.openTaskConversation(task);
+  assert.equal(result.opened, true);
+  assert.deepEqual(loaded, []);
 });
 
 test('ChatGPT thinking dialogs are not treated as request-limit notices', () => {
@@ -1160,6 +1262,74 @@ test('task request enforcement observes and rewrites ChatGPT’s actual conversa
   assert.equal(attached, false);
 });
 
+test('ChatGPT stream status helpers follow the status endpoint captured in the HAR', () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  assert.equal(
+    conversationIdFromStreamStatusUrl(`https://chatgpt.com/backend-api/conversation/${conversationId}/stream_status`),
+    conversationId,
+  );
+  assert.equal(
+    conversationIdFromRouteUrl(`https://chatgpt.com/c/${conversationId}`),
+    conversationId,
+  );
+  assert.equal(
+    conversationIdFromRouteUrl(`https://chatgpt.com/g/g-p-example/c/${conversationId}`),
+    conversationId,
+  );
+  assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/WEB:1443a631-8e0c-4683-bd40-8071fd8ab3c6'), null);
+  assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/not-a-uuid'), null);
+  assert.equal(conversationIdFromStreamStatusUrl('https://example.com/backend-api/conversation/nope/stream_status'), null);
+  assert.equal(normalizeConversationStreamStatus('IS_STREAMING'), 'streaming');
+  assert.equal(normalizeConversationStreamStatus('COMPLETE'), 'completed');
+  assert.equal(normalizeConversationStreamStatus('NOT_STREAMING'), 'completed');
+  assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
+  assert.match(buildConversationStatusScript(conversationId), /backend-api\/conversation.*stream_status/);
+  assert.match(buildConversationStatusScript(conversationId), /cache: 'no-store'/);
+});
+
+test('completed ChatGPT stream status stops the task timer and persists the chat completion state', async () => {
+  const task = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    conversationId: '6a80f4cf-1650-83ea-8609-adb411b3e4bc',
+    submittedAt: '2026-08-15T23:23:00.000Z',
+    chatStatus: 'streaming',
+    chatStatusRaw: 'IS_STREAMING',
+    chatFinishedAt: null,
+  };
+  const events = [];
+  let current = task;
+  const view = {
+    activeTask: task,
+    knownTasks: new Map([[task.taskId, task]]),
+    conversationStatusBusy: false,
+    taskService: {
+      updateTask: async (_taskId, update) => {
+        current = { ...current, ...update };
+        return current;
+      },
+    },
+    onEvent: async (event) => events.push(event),
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => `https://chatgpt.com/c/${task.conversationId}`,
+        executeJavaScript: async () => ({ ok: true, status: 'COMPLETE' }),
+      },
+    },
+  };
+
+  const result = await ChatGPTView.prototype.checkConversationStatus.call(view);
+  assert.equal(result.status, 'COMPLETE');
+  assert.equal(current.chatStatus, 'completed');
+  assert.equal(current.chatStatusRaw, 'COMPLETE');
+  assert.ok(Number.isFinite(Date.parse(current.chatFinishedAt)));
+  assert.ok(Date.parse(current.chatFinishedAt) >= Date.parse(task.submittedAt));
+  assert.equal(view.activeTask.chatStatus, 'completed');
+  assert.equal(events.at(-1).type, 'task-chat-status');
+  assert.equal(events.at(-1).chatStatus, 'completed');
+});
+
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-submit-recovery-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -1179,6 +1349,10 @@ test('unconfirmed submitted tasks are restored to prepared state', async (contex
   assert.equal(recovered.state, 'prepared');
   assert.equal(recovered.submittedAt, null);
   assert.equal(recovered.conversationUrl, null);
+  assert.equal(recovered.conversationId, null);
+  assert.equal(recovered.chatStatus, null);
+  assert.equal(recovered.chatStatusRaw, null);
+  assert.equal(recovered.chatFinishedAt, null);
   assert.equal((await tasks.getTask(task.taskId)).state, 'prepared');
 });
 

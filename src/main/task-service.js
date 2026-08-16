@@ -8,6 +8,7 @@ const {
   createWorkingSnapshotBundle,
   inspectRepository,
 } = require('./git');
+const { SkillService } = require('./skill-service');
 
 const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
@@ -25,8 +26,19 @@ function normalizeReasoningMode(value) {
   return mode;
 }
 
-function buildAgentInstructions(taskId) {
+function buildAgentInstructions(taskId, skills = []) {
   const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
+  const skillInstructions = skills.length
+    ? `## Optional task skills
+
+This task includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under the \`skills/\` directory. The selected skills are listed in \`manifest.json\`. Read a skill's \`SKILL.md\` and follow it only when that skill is clearly relevant to the task. Do not load or invoke unrelated skills, and do not edit the bundled skill files.
+
+`
+    : `## Optional task skills
+
+Task packages may include selected local skills under the \`skills/\` directory. When skills are present, use or invoke them only when they are clearly relevant to the task. Do not load unrelated skills just because they are available, and do not edit bundled skill files.
+
+`;
   return `# Patchwork task protocol
 
 You are working on a software task supplied by the user through Patchwork IDE.
@@ -35,7 +47,7 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Do not
 ## Set up the repositories
 
 1. Extract the uploaded ZIP into a writable directory.
-2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely. If \`manifest.json.attachments\` is non-empty, also read each listed file under \`attachments/\`; those files are user-provided task context.
+2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely. If \`manifest.json.attachments\` is non-empty, also read each listed file under \`attachments/\`; those files are user-provided task context. If \`manifest.json.skills\` is non-empty, the selected skills are bundled under \`skills/\`; use them only when relevant to the task.
 3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`.
 4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
@@ -43,7 +55,7 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Do not
 
 ## Inspect supplied working changes
 
-For every manifest repository with \`workingChanges: true\`, the supplied \`baseCommit\` captures staged, unstaged, untracked, or unmerged files that already existed in the coding tree. These changes are task input, not work you should discard.
+For every manifest repository with \`workingChanges: true\`, the supplied \`baseCommit\` captures staged, unstaged, untracked, or unmerged files that already existed in the selected repository. These changes are task input, not work you should discard.
 
 - Read its \`workingStatus\`, then run \`git status --short\` and inspect the files and conflict markers carefully.
 - When \`sourceHead\` is present, inspect the captured working changes with \`git diff --binary <sourceHead> <baseCommit> -- .\`.
@@ -52,7 +64,7 @@ For every manifest repository with \`workingChanges: true\`, the supplied \`base
 
 You may create commits as checkpoints. Do not rewrite the supplied base history and do not add generated dependencies, build output, credentials, or unrelated files.
 
-## Sandbox constraints
+${skillInstructions}## Sandbox constraints
 
 The ChatGPT sandbox cannot successfully install dependencies or run this project's verification toolchain. Do not attempt any of the following:
 
@@ -84,7 +96,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
   "taskId": "${taskId}",
   "status": "completed",
   "summary": "A concise summary of the implementation and verification performed.",
-  "commitMessage": "A Conventional Commit message, for example feat(editor): add split diff view",
+  "commitMessage": "A Conventional Commit message for coding-tree tasks, for example feat(editor): add split diff view; null is allowed when no coding tree is used",
   "repositories": [
     {
       "id": "the repository id from manifest.json",
@@ -98,15 +110,18 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
 
 \`PATCHWORK_RESULT_END\`
 
-The commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat, but do not print or paste the result envelope into the chat itself.
+When a coding tree is used, the commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. For tasks without a coding tree, the commit message may be null. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat, but do not print or paste the result envelope into the chat itself.
 `;
 }
 
-function buildHandoffPrompt(taskId, taskText, attachments = []) {
+function buildHandoffPrompt(taskId, taskText, attachments = [], skills = []) {
   const attachmentNote = attachments.length
     ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
     : '';
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}\n\nTask summary:\n${taskText}`;
+  const skillNote = skills.length
+    ? `\n\nThe task ZIP also includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under \`skills/\`. Use or invoke a selected skill only when it is relevant to the task, and do not load unrelated skills.`
+    : '\n\nThe task ZIP may include selected local skills under \`skills/\`. Use or invoke them only when they are relevant to the task.';
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}${skillNote}\n\nTask summary:\n${taskText}`;
 }
 
 function uniqueAttachmentName(filename, usedNames) {
@@ -151,14 +166,15 @@ ${patches || '- No non-empty original patch was available.'}
 ${String(context.error || 'The patch did not apply cleanly.').replaceAll('```', "'''")}
 \`\`\`
 
-The bundled repository base captures the coding tree exactly as it exists now, including unstaged files and conflict markers. Inspect \`git status\`, \`git diff\`, every conflict marker, and the original result patch before editing. Resolve the conflict as part of the requested task; do not merely describe a resolution.
+The bundled repository base captures the selected repository exactly as it exists now, including unstaged files and conflict markers. Inspect \`git status\`, \`git diff\`, every conflict marker, and the original result patch before editing. Resolve the conflict as part of the requested task; do not merely describe a resolution.
 `;
 }
 
 class TaskService {
-  constructor(dataRoot) {
+  constructor(dataRoot, skillService = new SkillService()) {
     this.dataRoot = dataRoot;
     this.tasksRoot = path.join(dataRoot, 'tasks');
+    this.skillService = skillService;
   }
 
   async initialize() {
@@ -185,6 +201,10 @@ class TaskService {
     const reasoningMode = normalizeReasoningMode(input.reasoningMode);
 
     const repositories = await this.inspectRepositories(input.repositories.map((item) => item.path));
+    const skillRepositoryPaths = Array.isArray(input.skillRepositoryPaths) && input.skillRepositoryPaths.length
+      ? input.skillRepositoryPaths
+      : input.repositories.map((item) => item.path);
+    const selectedSkills = await this.skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
     const requestedRepositories = new Map(await Promise.all(input.repositories.map(async (item) => [
       await fs.realpath(item.path),
       item,
@@ -210,6 +230,27 @@ class TaskService {
         const attachmentPath = path.join(attachmentsDir, name);
         await fs.copyFile(resolvedPath, attachmentPath);
         attachments.push({ name, path: attachmentPath, size: stat.size });
+      }
+    }
+
+    const taskSkills = [];
+    if (selectedSkills.length > 0) {
+      const skillsRoot = path.join(taskDir, 'skills');
+      await fs.mkdir(skillsRoot, { recursive: true });
+      for (const skill of selectedSkills) {
+        const storagePath = path.join(skillsRoot, skill.id);
+        await fs.cp(skill.sourcePath, storagePath, { recursive: true, force: true });
+        taskSkills.push({
+          id: skill.id,
+          name: skill.name,
+          description: skill.description,
+          provider: skill.provider,
+          scope: skill.scope,
+          location: skill.location,
+          directory: `skills/${skill.id}`,
+          skillFile: `skills/${skill.id}/SKILL.md`,
+          path: storagePath,
+        });
       }
     }
 
@@ -302,15 +343,17 @@ class TaskService {
       size,
       file: `attachments/${name}`,
     }));
+    const packageSkills = taskSkills.map(({ path: _path, ...skill }) => skill);
     const manifest = {
       schemaVersion: SCHEMA_VERSION,
       taskId,
       createdAt,
       repositories: publicRepositories,
       attachments: packageAttachments,
+      skills: packageSkills,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
-    const agentInstructions = `${buildAgentInstructions(taskId)}\n${buildCurrentAgentAddendum(taskId)}`;
+    const agentInstructions = `${buildAgentInstructions(taskId, packageSkills)}\n${buildCurrentAgentAddendum(taskId)}`;
 
     await Promise.all([
       fs.writeFile(path.join(taskDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
@@ -328,6 +371,7 @@ class TaskService {
       addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'repositories');
     }
     for (const attachment of attachments) zip.addLocalFile(attachment.path, 'attachments');
+    for (const skill of taskSkills) zip.addLocalFolder(skill.path, skill.directory);
     for (const patch of conflictPatchFiles) zip.addLocalFile(path.join(taskDir, patch.file), 'conflicts');
     await fs.writeFile(packagePath, await zip.toBufferPromise());
     const packageStat = await fs.stat(packagePath);
@@ -337,12 +381,17 @@ class TaskService {
       taskText,
       model,
       reasoningMode,
+      skills: taskSkills,
       autoApply: input.autoApply !== false,
       transport: 'zip-git-bundle',
       resultTransport: 'downloaded-text-file',
       treeId: input.tree?.id || null,
       treeName: input.tree?.name || null,
       mergeResolution: Boolean(input.mergeResolution),
+      conversationId: null,
+      chatStatus: null,
+      chatStatusRaw: null,
+      chatFinishedAt: null,
       resultFilename: `chatgpt-ide-result-${taskId}.txt`,
       sourceRepositoryPath: input.tree?.repositoryPath || null,
       chatgptProject: input.chatgptProject?.id ? {
@@ -352,7 +401,7 @@ class TaskService {
       } : null,
       packagePath,
       attachments,
-      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments),
+      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments, packageSkills),
       repositories: taskRepositories,
       state: 'prepared',
       result: null,
@@ -418,5 +467,5 @@ The required result is one attached UTF-8 text file named \`chatgpt-ide-result-$
 }
 
 function buildCurrentHandoffAddendum(taskId) {
-  return `Do not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Create and attach the required UTF-8 result file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1, the JSON envelope, or patch contents into the conversation.`;
+  return `Do not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Create and attach the required UTF-8 result file named \`chatgpt-ide-result-${taskId}.txt\`. Do not paste PATCHWORK_RESULT_V1, the JSON envelope, or patch contents into the conversation. Selected local skills may be included in the task package; use or invoke them only when relevant and do not load unrelated skills.`;
 }

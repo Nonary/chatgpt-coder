@@ -10,10 +10,14 @@ const state = {
   selectedDiffKey: null,
   diffTabs: [],
   attachments: [],
+  skillCatalog: [],
+  selectedSkillIds: [],
   chatgptProjects: [],
 };
 
 const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
+const TASK_TREE_STORAGE_KEY = 'patchwork.task-tree';
+const TASK_NEW_TREE_VALUE = '__new__';
 
 const elements = Object.fromEntries(
   [
@@ -23,7 +27,8 @@ const elements = Object.fromEntries(
     'history-view', 'task-history-button', 'task-history-count', 'task-history-list',
     'task-history-search', 'task-history-state',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
-    'add-attachment-button', 'attachment-list',
+    'add-attachment-button', 'attachment-list', 'configure-skills-button', 'skill-selection-label', 'skill-selection-summary',
+    'skills-modal', 'skills-close-button', 'skills-refresh-button', 'skills-search', 'skills-list', 'skills-selection-status', 'skills-done-button',
     'task-tree-select', 'new-tree-fields', 'tree-name',
     'task-model-select', 'task-reasoning-select',
     'chatgpt-project-select', 'new-project-fields', 'new-project-name',
@@ -89,6 +94,33 @@ function persistTaskModelSelection(event) {
   }
 }
 
+function persistTaskTreeSelectionValue(value) {
+  try {
+    localStorage.setItem(TASK_TREE_STORAGE_KEY, value);
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
+}
+
+function restoreTaskTreeSelection() {
+  const select = elements['task-tree-select'];
+  try {
+    const savedTree = localStorage.getItem(TASK_TREE_STORAGE_KEY);
+    if (savedTree !== null && [...select.options].some((option) => option.value === savedTree)) {
+      select.value = savedTree;
+    } else if (savedTree && savedTree !== TASK_NEW_TREE_VALUE) {
+      localStorage.removeItem(TASK_TREE_STORAGE_KEY);
+    }
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
+  renderTaskTreeOptions();
+}
+
+function persistTaskTreeSelection(event) {
+  persistTaskTreeSelectionValue(event.target.value);
+}
+
 function formatTime(value = new Date()) {
   return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(value));
 }
@@ -139,6 +171,7 @@ function renderRepositories() {
   container.querySelectorAll('.remove-repo').forEach((button) => {
     button.addEventListener('click', () => {
       state.repositories = state.repositories.filter((item) => item.id !== button.dataset.repositoryId);
+      resetTaskSkills();
       renderRepositories();
     });
   });
@@ -164,6 +197,126 @@ function renderAttachments() {
       renderAttachments();
     });
   });
+}
+
+function resetTaskSkills() {
+  state.skillCatalog = [];
+  state.selectedSkillIds = [];
+  elements['skills-search'].value = '';
+  renderSkillSelection();
+}
+
+function taskSkillRepositoryPaths() {
+  const selectedTarget = elements['task-tree-select'].value;
+  if (selectedTarget && selectedTarget !== TASK_NEW_TREE_VALUE) {
+    const tree = state.trees.find((item) => item.id === selectedTarget);
+    if (tree?.path) return [tree.path];
+  }
+  return state.repositories.map((repository) => repository.path).filter(Boolean);
+}
+
+function selectedSkills() {
+  const selected = new Set(state.selectedSkillIds);
+  return state.skillCatalog.filter((skill) => selected.has(skill.id));
+}
+
+function renderSkillSelection() {
+  const skills = selectedSkills();
+  elements['skill-selection-label'].textContent = skills.length
+    ? `${skills.length} skill${skills.length === 1 ? '' : 's'} selected`
+    : 'Choose skills';
+  if (skills.length === 0) {
+    elements['skill-selection-summary'].classList.add('hidden');
+    elements['skill-selection-summary'].innerHTML = '';
+  } else {
+    const visibleSkills = skills.slice(0, 3);
+    const moreCount = skills.length - visibleSkills.length;
+    elements['skill-selection-summary'].classList.remove('hidden');
+    elements['skill-selection-summary'].innerHTML = visibleSkills
+      .map((skill) => `<span class="skill-selection-chip">${escapeHtml(skill.name)}</span>`)
+      .join('') + (moreCount > 0 ? `<span class="skill-selection-chip more">+${moreCount} more</span>` : '');
+  }
+  elements['skills-selection-status'].textContent = skills.length
+    ? `${skills.length} selected · ${state.skillCatalog.length} found`
+    : state.skillCatalog.length
+      ? `${state.skillCatalog.length} skill${state.skillCatalog.length === 1 ? '' : 's'} found`
+      : 'No skills selected.';
+}
+
+function renderSkillDrawerList() {
+  const search = elements['skills-search'].value.trim().toLowerCase();
+  const visibleSkills = state.skillCatalog.filter((skill) => [
+    skill.name,
+    skill.description,
+    skill.provider,
+    skill.scope,
+    skill.location,
+  ].filter(Boolean).join(' ').toLowerCase().includes(search));
+  if (visibleSkills.length === 0) {
+    elements['skills-list'].innerHTML = state.skillCatalog.length
+      ? '<div class="skill-list-empty"><strong>No matching skills</strong><span>Try a different search term.</span></div>'
+      : '<div class="skill-list-empty"><strong>No local skills found</strong><span>Patchwork checks common user and project skill folders, including .claude/skills, .codex/skills, .copilot/skills, .github/skills, and .agents/skills.</span></div>';
+    renderSkillSelection();
+    return;
+  }
+  let lastScope = null;
+  const markup = [];
+  for (const skill of visibleSkills) {
+    if (skill.scope !== lastScope) {
+      const label = skill.scope === 'project' ? 'Project skills' : 'User skills';
+      markup.push(`<div class="skill-group-label">${escapeHtml(label)}</div>`);
+      lastScope = skill.scope;
+    }
+    const checked = state.selectedSkillIds.includes(skill.id);
+    markup.push(`<label class="skill-option">
+      <input type="checkbox" data-skill-id="${escapeHtml(skill.id)}" ${checked ? 'checked' : ''} />
+      <span class="skill-check" aria-hidden="true"></span>
+      <span class="skill-option-copy">
+        <span class="skill-option-heading"><strong>${escapeHtml(skill.name)}</strong><small>${escapeHtml(skill.provider)}</small></span>
+        ${skill.description ? `<span class="skill-option-description">${escapeHtml(skill.description)}</span>` : ''}
+        <span class="skill-option-location">${escapeHtml(skill.location)}</span>
+      </span>
+    </label>`);
+  }
+  elements['skills-list'].innerHTML = markup.join('');
+  elements['skills-list'].querySelectorAll('[data-skill-id]').forEach((input) => input.addEventListener('change', () => {
+    const id = input.dataset.skillId;
+    if (input.checked) {
+      if (!state.selectedSkillIds.includes(id)) state.selectedSkillIds.push(id);
+    } else {
+      state.selectedSkillIds = state.selectedSkillIds.filter((item) => item !== id);
+    }
+    renderSkillSelection();
+  }));
+  renderSkillSelection();
+}
+
+async function refreshSkillCatalog(showErrors = true) {
+  elements['skills-refresh-button'].disabled = true;
+  const previous = [...state.selectedSkillIds];
+  elements['skills-list'].innerHTML = '<div class="skill-list-empty"><strong>Scanning local skill folders…</strong><span>Checking the configured user and project locations.</span></div>';
+  try {
+    state.skillCatalog = await window.patchwork.listSkills(taskSkillRepositoryPaths());
+    const available = new Set(state.skillCatalog.map((skill) => skill.id));
+    state.selectedSkillIds = previous.filter((id) => available.has(id));
+    renderSkillDrawerList();
+  } catch (error) {
+    elements['skills-list'].innerHTML = `<div class="skill-list-empty"><strong>Could not load skills</strong><span>${escapeHtml(error.message)}</span></div>`;
+    if (showErrors) showToast(error.message, true);
+  } finally {
+    elements['skills-refresh-button'].disabled = false;
+  }
+}
+
+async function openSkillDrawer() {
+  elements['skills-modal'].classList.remove('hidden');
+  renderSkillSelection();
+  await refreshSkillCatalog(true);
+  requestAnimationFrame(() => elements['skills-search'].focus());
+}
+
+function closeSkillDrawer() {
+  elements['skills-modal'].classList.add('hidden');
 }
 
 function renderChatGPTProjects() {
@@ -202,14 +355,20 @@ async function refreshChatGPTProjects(showErrors = false) {
 function renderTaskTreeOptions() {
   const select = elements['task-tree-select'];
   const previous = select.value;
-  select.innerHTML = '<option value="">Create a new coding tree</option>' + state.trees
+  select.innerHTML = '<option value="">Use current working changes</option><option value="__new__">Create a new coding tree</option>' + state.trees
     .filter((tree) => tree.available && tree.mergeState !== 'submitted')
     .map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}${tree.managed === false ? ' · Git worktree' : ''}</option>`)
     .join('');
-  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
-  const existing = Boolean(select.value);
-  elements['new-tree-fields'].classList.toggle('hidden', existing);
-  elements['tree-name'].disabled = existing;
+  if ([...select.options].some((option) => option.value === previous)) {
+    select.value = previous;
+  } else {
+    select.value = '';
+  }
+  const creating = select.value === TASK_NEW_TREE_VALUE;
+  const existing = Boolean(select.value) && !creating;
+  elements['new-tree-fields'].classList.toggle('hidden', !creating);
+  elements['tree-name'].disabled = !creating;
+  if (existing) persistTaskTreeSelectionValue(select.value);
   renderRepositories();
 }
 
@@ -324,11 +483,14 @@ function formatElapsed(startedAt, now = Date.now()) {
 
 function updateTaskElapsedTimes() {
   document.querySelectorAll('.task-elapsed[data-started-at]').forEach((element) => {
-    element.textContent = formatElapsed(element.dataset.startedAt);
+    const endedAt = element.dataset.endedAt ? new Date(element.dataset.endedAt).getTime() : Date.now();
+    element.textContent = formatElapsed(element.dataset.startedAt, endedAt);
   });
 }
 
 function taskStateLabel(task) {
+  if (task.state === 'submitted' && task.chatStatus === 'completed') return 'ChatGPT finished';
+  if (task.state === 'submitted' && task.chatStatus === 'failed') return 'ChatGPT stopped';
   const labels = {
     prepared: 'Prepared',
     submitted: 'Running',
@@ -343,7 +505,8 @@ function taskStateLabel(task) {
 
 function taskElapsedMarkup(task) {
   if (task.state !== 'submitted' || !task.submittedAt) return '';
-  return `<time class="task-elapsed" data-started-at="${escapeHtml(task.submittedAt)}">${escapeHtml(formatElapsed(task.submittedAt))}</time>`;
+  const endedAt = task.chatFinishedAt || '';
+  return `<time class="task-elapsed" data-started-at="${escapeHtml(task.submittedAt)}"${endedAt ? ` data-ended-at="${escapeHtml(endedAt)}"` : ''}>${escapeHtml(formatElapsed(task.submittedAt, endedAt ? new Date(endedAt).getTime() : Date.now()))}</time>`;
 }
 
 function renderTaskList() {
@@ -380,7 +543,9 @@ function taskHistorySearchText(task) {
     task.treeName,
     task.model,
     task.reasoningMode,
+    ...(task.skills || []).flatMap((skill) => [skill.name, skill.provider, skill.location, skill.description]),
     task.state,
+    task.chatStatus,
     task.error,
     task.result?.summary,
     task.result?.commitMessage,
@@ -474,10 +639,20 @@ const statusText = {
   submitted: ['Task is running', 'ChatGPT is still working in the embedded browser. Patchwork is actively watching for the result.'],
   ready: ['Waiting to apply', 'The plain-text result is validated and waiting for you to apply it.'],
   conflicted: ['Conflict needs resolution', 'The result could not be applied cleanly. Send a resolution task to ChatGPT to preserve both versions.'],
-  applied: ['Changes committed', 'The validated patch is committed in this task’s coding tree.'],
-  'rolled-back': ['Changes reverted', 'A revert commit was created in this task’s coding tree.'],
+  applied: ['Changes applied', 'The validated patch has been applied to the task target.'],
+  'rolled-back': ['Changes reverted', 'The changes from this task were reverted.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
 };
+
+function taskStatusText(task) {
+  if (task.state === 'submitted' && task.chatStatus === 'completed') {
+    return ['ChatGPT finished', 'ChatGPT finished generating this task. Patchwork is checking for the result file.'];
+  }
+  if (task.state === 'submitted' && task.chatStatus === 'failed') {
+    return ['ChatGPT stopped', 'ChatGPT reported a generation failure for this task.'];
+  }
+  return statusText[task.state] || statusText.prepared;
+}
 
 function taskConfigurationLabel(task) {
   const models = {
@@ -492,7 +667,9 @@ function taskConfigurationLabel(task) {
     high: 'High',
     'extra-high': 'Extra High',
   };
-  return `${models[task.model || 'default'] || task.model} · ${reasoning[task.reasoningMode || 'default'] || task.reasoningMode}`;
+  const skillCount = Array.isArray(task.skills) ? task.skills.length : 0;
+  const skills = skillCount ? ` · ${skillCount} skill${skillCount === 1 ? '' : 's'}` : '';
+  return `${models[task.model || 'default'] || task.model} · ${reasoning[task.reasoningMode || 'default'] || task.reasoningMode}${skills}`;
 }
 
 function renderResult(task) {
@@ -524,7 +701,7 @@ function showTask(task) {
   elements['trees-button'].classList.remove('active');
   elements['task-history-button'].classList.remove('active');
   elements['page-title'].textContent = taskLabel(task);
-  const [title, copy] = statusText[task.state] || statusText.prepared;
+  const [title, copy] = taskStatusText(task);
   elements['task-status-title'].textContent = title;
   elements['task-status-copy'].textContent = task.error || copy;
   elements['status-badge'].textContent = taskStateLabel(task);
@@ -534,6 +711,9 @@ function showTask(task) {
   addActivity(`Model: ${taskConfigurationLabel(task)}`, task.createdAt);
   if (task.attachments?.length) {
     addActivity(`${task.attachments.length} task attachment${task.attachments.length === 1 ? '' : 's'} prepared`, task.createdAt);
+  }
+  if (task.skills?.length) {
+    addActivity(`${task.skills.length} selected skill${task.skills.length === 1 ? '' : 's'} included`, task.createdAt);
   }
   if (task.chatgptProject?.name) {
     addActivity(`ChatGPT project: ${task.chatgptProject.name}`, task.createdAt);
@@ -545,6 +725,8 @@ function showTask(task) {
 }
 
 function showComposer() {
+  closeSkillDrawer();
+  resetTaskSkills();
   state.activeTask = null;
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
@@ -559,7 +741,7 @@ function showComposer() {
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   restoreTaskModelSelection();
-  renderTaskTreeOptions();
+  restoreTaskTreeSelection();
   renderChatGPTProjects();
   refreshChatGPTProjects().catch(() => {});
   renderTaskList();
@@ -652,7 +834,10 @@ function syncBrowserBounds() {
 async function chooseRepositories() {
   try {
     const repositories = await window.patchwork.chooseRepositories();
-    if (repositories[0]) state.repositories = [repositories[0]];
+    if (repositories[0]) {
+      state.repositories = [repositories[0]];
+      resetTaskSkills();
+    }
     const workspace = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
     repositories.forEach((repository) => workspace.set(repository.path, repository));
     state.workspaceRepositories = [...workspace.values()];
@@ -994,14 +1179,21 @@ async function createTask() {
       taskText: elements['task-text'].value,
       model: elements['task-model-select'].value,
       reasoningMode: elements['task-reasoning-select'].value,
+      skillIds: [...state.selectedSkillIds],
       autoApply: true,
-      treeId: elements['task-tree-select'].value || null,
+      treeId: elements['task-tree-select'].value && elements['task-tree-select'].value !== TASK_NEW_TREE_VALUE
+        ? elements['task-tree-select'].value
+        : null,
+      createTree: elements['task-tree-select'].value === TASK_NEW_TREE_VALUE,
       treeName: elements['tree-name'].value,
       attachments: state.attachments,
       chatgptProject,
     });
     state.attachments = [];
+    resetTaskSkills();
     renderAttachments();
+    persistTaskTreeSelectionValue(task.treeId || '');
+    elements['task-tree-select'].value = task.treeId || '';
     upsertTask(task);
     await refreshTrees();
     showTask(task);
@@ -1044,16 +1236,32 @@ elements['task-history-button'].addEventListener('click', showTaskHistory);
 elements['task-history-search'].addEventListener('input', renderTaskHistory);
 elements['task-history-state'].addEventListener('change', renderTaskHistory);
 elements['trees-new-task'].addEventListener('click', () => {
-  elements['task-tree-select'].value = '';
+  elements['task-tree-select'].value = TASK_NEW_TREE_VALUE;
+  persistTaskTreeSelectionValue(TASK_NEW_TREE_VALUE);
   elements['tree-name'].value = '';
   showComposer();
 });
-elements['task-tree-select'].addEventListener('change', renderTaskTreeOptions);
+elements['task-tree-select'].addEventListener('change', (event) => {
+  persistTaskTreeSelection(event);
+  resetTaskSkills();
+  renderTaskTreeOptions();
+});
 elements['task-model-select'].addEventListener('change', persistTaskModelSelection);
 elements['chatgpt-project-select'].addEventListener('change', renderChatGPTProjects);
 elements['refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
 elements['add-attachment-button'].addEventListener('click', chooseAttachments);
+elements['configure-skills-button'].addEventListener('click', openSkillDrawer);
+elements['skills-close-button'].addEventListener('click', closeSkillDrawer);
+elements['skills-done-button'].addEventListener('click', closeSkillDrawer);
+elements['skills-refresh-button'].addEventListener('click', () => refreshSkillCatalog(true));
+elements['skills-search'].addEventListener('input', renderSkillDrawerList);
+elements['skills-modal'].addEventListener('click', (event) => {
+  if (event.target === elements['skills-modal']) closeSkillDrawer();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !elements['skills-modal'].classList.contains('hidden')) closeSkillDrawer();
+});
 elements['create-task-button'].addEventListener('click', createTask);
 elements['submit-task-button'].addEventListener('click', () => runTaskAction(window.patchwork.submitTask, 'Task submitted.'));
 elements['copy-prompt-button'].addEventListener('click', () => runTaskAction(window.patchwork.copyPrompt, 'Instructions copied.'));
@@ -1155,7 +1363,9 @@ window.patchwork.onTaskEvent((event) => {
   }
   if (event.type === 'task-failed') showToast(event.message || 'Task failed.', true);
   if (event.type === 'task-applied') {
-    showToast('ChatGPT changes were validated and committed to the coding tree.');
+    showToast(event.task?.treeId
+      ? 'ChatGPT changes were validated and committed to the coding tree.'
+      : 'ChatGPT changes were validated and applied to the current repository.');
     refreshTrees().catch(() => {});
   }
   if (event.type === 'task-applied' && state.selectedGitPath) loadGitStatus(state.selectedGitPath);
@@ -1201,7 +1411,9 @@ async function initialize() {
     renderTaskList();
     renderRepositories();
     renderTrees();
+    restoreTaskTreeSelection();
     renderSourceRepositories();
+    renderSkillSelection();
     showSession();
   } catch (error) {
     showToast(error.message, true);

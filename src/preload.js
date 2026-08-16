@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   chooseAttachments: () => ipcRenderer.invoke('attachments:choose'),
   listChatGPTProjects: () => ipcRenderer.invoke('projects:list'),
   createChatGPTProject: (name) => ipcRenderer.invoke('projects:create', name),
+  listSkills: (repositoryPaths) => ipcRenderer.invoke('skills:list', repositoryPaths),
   listWorkspaceRepositories: () => ipcRenderer.invoke('workspace:list'),
   removeWorkspaceRepository: (repositoryPath) => ipcRenderer.invoke('workspace:remove', repositoryPath),
   gitStatus: (repositoryPath) => ipcRenderer.invoke('git:status', repositoryPath),
