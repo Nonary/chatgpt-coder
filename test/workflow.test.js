@@ -635,6 +635,53 @@ test('coding tree merge leaves conflicting source changes untouched', async (con
   assert.equal((await runGit(repositoryPath, ['stash', 'list'])).stdout, '');
 });
 
+test('coding tree merge combines tree-only insertions with nearby source edits', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-insertion-merge-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  await fs.writeFile(path.join(repositoryPath, 'workflow.test.js'), [
+    "test('limit notice', () => {});",
+    '',
+    "test('downloaded result validates', () => {});",
+    '',
+  ].join('\n'));
+  await runGit(repositoryPath, ['add', 'workflow.test.js']);
+  await runGit(repositoryPath, ['commit', '-m', 'test: add workflow coverage']);
+
+  const trees = new WorktreeService(path.join(root, 'data'));
+  const tree = await trees.create(repositoryPath, 'Compatible neighboring edits');
+  await fs.writeFile(path.join(tree.path, 'workflow.test.js'), [
+    "test('limit notice', () => {});",
+    '',
+    "test('thinking dialog', () => {});",
+    '',
+    "test('downloaded result validates', () => {});",
+    '',
+  ].join('\n'));
+  await runGit(tree.path, ['add', 'workflow.test.js']);
+  await runGit(tree.path, ['commit', '-m', 'test: cover thinking dialog']);
+
+  await fs.writeFile(path.join(repositoryPath, 'workflow.test.js'), [
+    "test('limit notice', () => {});",
+    '',
+    "test('downloaded result file validates', () => {});",
+    '',
+  ].join('\n'));
+  await runGit(repositoryPath, ['add', 'workflow.test.js']);
+  await runGit(repositoryPath, ['commit', '-m', 'fix: clarify downloaded result coverage']);
+
+  const merged = await trees.mergeFromText(tree.id, `PATCHWORK_MERGE_V1\n${JSON.stringify({
+    schemaVersion: 1,
+    treeId: tree.id,
+    summary: 'Combine compatible workflow tests.',
+    commitMessage: 'test: combine workflow coverage',
+  })}\nPATCHWORK_MERGE_END`);
+  assert.match(merged.commit, /^[0-9a-f]{40}$/);
+  const combined = await fs.readFile(path.join(repositoryPath, 'workflow.test.js'), 'utf8');
+  assert.match(combined, /thinking dialog/);
+  assert.match(combined, /downloaded result file validates/);
+});
+
 test('a resolved tree can immediately prepare the resumed final merge', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-resumed-merge-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

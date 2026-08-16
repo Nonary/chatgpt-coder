@@ -370,7 +370,12 @@ class WorktreeService {
       }
 
       await runGit(source.path, ['worktree', 'add', '--detach', integrationPath, source.baseCommit]);
-      await runGit(integrationPath, ['merge', '--squash', '--no-commit', tree.branch]);
+      try {
+        await runGit(integrationPath, ['merge', '--squash', '--no-commit', tree.branch]);
+      } catch (mergeError) {
+        const resolved = await this.resolveInsertionOnlyConflicts(integrationPath, tree, integrationId);
+        if (!resolved) throw mergeError;
+      }
       await runGit(integrationPath, ['commit', '-m', commitMessage]);
       const { stdout } = await runGit(integrationPath, ['rev-parse', 'HEAD']);
       commit = stdout.trim();
@@ -418,6 +423,47 @@ class WorktreeService {
     const result = { treeId, treeName: tree.name, commit, commitMessage, summary, repositoryPath: source.path };
     await this.onEvent({ type: 'tree-merged', result, message: `Merged ${tree.name} as ${commit.slice(0, 9)}.` });
     return result;
+  }
+
+  async resolveInsertionOnlyConflicts(integrationPath, tree, integrationId) {
+    const { stdout: conflictedOutput } = await runGit(integrationPath, [
+      'diff', '--name-only', '--diff-filter=U', '-z', '--', '.',
+    ]).catch(() => ({ stdout: '' }));
+    const conflictedFiles = conflictedOutput.split('\0').filter(Boolean);
+    if (conflictedFiles.length === 0) return false;
+
+    const patchFiles = [];
+    try {
+      for (const file of conflictedFiles) {
+        const { stdout: numstat } = await runGit(integrationPath, [
+          'diff', '--numstat', tree.baseCommit, tree.branch, '--', file,
+        ]);
+        const lines = numstat.trim().split('\n').filter(Boolean);
+        if (lines.length !== 1) return false;
+        const [added, deleted] = lines[0].split('\t');
+        if (!/^\d+$/.test(added) || deleted !== '0') return false;
+
+        await runGit(integrationPath, ['checkout', '--ours', '--', file]);
+        const patchName = `${integrationId}-${crypto.createHash('sha256').update(file).digest('hex').slice(0, 12)}.patch`;
+        const patchPath = path.join(this.mergesRoot, patchName);
+        patchFiles.push(patchPath);
+        await runGit(integrationPath, [
+          'diff', '--binary', '--unified=0', `--output=${patchPath}`,
+          tree.baseCommit, tree.branch, '--', file,
+        ]);
+        await runGit(integrationPath, ['apply', '--check', '--binary', '--unidiff-zero', patchPath]);
+        await runGit(integrationPath, ['apply', '--binary', '--unidiff-zero', patchPath]);
+        await runGit(integrationPath, ['add', '--', file]);
+      }
+      const { stdout: remaining } = await runGit(integrationPath, [
+        'diff', '--name-only', '--diff-filter=U', '-z', '--', '.',
+      ]);
+      return remaining.length === 0;
+    } catch {
+      return false;
+    } finally {
+      await Promise.all(patchFiles.map((patchFile) => fs.rm(patchFile, { force: true })));
+    }
   }
 
   async remove(treeId, force = false) {
