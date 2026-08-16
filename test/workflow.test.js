@@ -8,6 +8,7 @@ const AdmZip = require('adm-zip');
 const {
   CHATGPT_URL,
   ChatGPTView,
+  buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
@@ -97,7 +98,7 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
 });
 
-test('task attachments are copied into task storage and named in the handoff prompt', async (context) => {
+test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-attachments-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
@@ -117,8 +118,40 @@ test('task attachments are copied into task storage and named in the handoff pro
   assert.equal(task.attachments[0].name, 'requirements.txt');
   assert.notEqual(task.attachments[0].path, attachmentPath);
   assert.equal(await fs.readFile(task.attachments[0].path, 'utf8'), 'reference context\n');
+  const zip = new AdmZip(task.packagePath);
+  const attachmentEntry = zip.getEntry('attachments/requirements.txt');
+  assert.ok(attachmentEntry);
+  assert.equal(attachmentEntry.getData().toString('utf8'), 'reference context\n');
+  const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
+  assert.deepEqual(manifest.attachments, [{
+    name: 'requirements.txt',
+    size: Buffer.byteLength('reference context\n'),
+    file: 'attachments/requirements.txt',
+  }]);
   assert.match(task.handoffPrompt, /requirements\.txt/);
-  assert.match(task.handoffPrompt, /user-provided files/i);
+  assert.match(task.handoffPrompt, /task ZIP contains/i);
+});
+
+test('task model and reasoning selections are persisted with the task', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-model-selection-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Use Luna with deeper reasoning.',
+    repositories: [repository],
+    model: 'luna',
+    reasoningMode: 'extra-high',
+  });
+
+  assert.equal(task.model, 'luna');
+  assert.equal(task.reasoningMode, 'extra-high');
+  const stored = await tasks.getTask(task.taskId);
+  assert.equal(stored.model, 'luna');
+  assert.equal(stored.reasoningMode, 'extra-high');
 });
 
 test('dirty repositories keep their full history and capture unstaged files as a task tip', async (context) => {
@@ -981,6 +1014,13 @@ test('ChatGPT task submission only accepts real conversation URLs', () => {
   assert.equal(isChatGPTConversationUrl('https://example.com/c/abc123'), false);
 });
 
+test('task configuration maps Luna to Thinking Mini and supports Extra High reasoning', () => {
+  const script = buildTaskConfigurationScript('luna', 'extra-high');
+  assert.match(script, /Thinking Mini/);
+  assert.match(script, /GPT-5\.6 Luna/);
+  assert.match(script, /Extra High/);
+});
+
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-submit-recovery-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -1062,6 +1102,46 @@ test('task submit persists the confirmed ChatGPT conversation with submitted sta
   assert.equal(update.conversationUrl, conversationUrl);
   assert.match(update.submittedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(submitted.conversationUrl, conversationUrl);
+});
+
+test('task submit selects the requested model and reasoning before injecting the prompt', async () => {
+  const task = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    handoffPrompt: 'Task',
+    packagePath: '/task.txt',
+    model: 'luna',
+    reasoningMode: 'high',
+  };
+  const steps = [];
+  const view = {
+    activeMerge: null,
+    activeTask: null,
+    knownTasks: new Map(),
+    view: {
+      webContents: {
+        executeJavaScript: async () => {
+          steps.push('configure');
+          return { ok: true };
+        },
+      },
+    },
+    taskService: {
+      updateTask: async (_taskId, next) => ({ ...task, ...next }),
+    },
+    onEvent: async () => {},
+    waitForComposer: async () => true,
+    injectPrompt: async () => steps.push('prompt'),
+    uploadPackage: async () => steps.push('package'),
+    clickSend: async () => {
+      steps.push('send');
+      return true;
+    },
+    waitForConversationUrl: async () => 'https://chatgpt.com/c/confirmed-conversation',
+    installResultWatcher: () => {},
+  };
+
+  await ChatGPTView.prototype.submit.call(view, task);
+  assert.deepEqual(steps.slice(0, 4), ['configure', 'prompt', 'package', 'send']);
 });
 
 test('task upload selects the composer file input and dispatches its change event', async () => {

@@ -10,6 +10,7 @@ const state = {
   selectedDiffKey: null,
   diffTabs: [],
   attachments: [],
+  chatgptProjects: [],
 };
 
 const elements = Object.fromEntries(
@@ -22,10 +23,13 @@ const elements = Object.fromEntries(
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
     'add-attachment-button', 'attachment-list',
     'task-tree-select', 'new-tree-fields', 'tree-name',
+    'task-model-select', 'task-reasoning-select',
+    'chatgpt-project-select', 'new-project-fields', 'new-project-name',
+    'refresh-projects-button', 'project-list-status',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'result-card', 'result-summary', 'patch-list',
-    'apply-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
+    'apply-button', 'resolve-conflict-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
     'chatgpt-surface', 'browser-back-button', 'browser-forward-button',
     'browser-reload-button', 'new-chat-button', 'browser-title', 'browser-status',
     'browser-status-dot',
@@ -138,6 +142,39 @@ function renderAttachments() {
       renderAttachments();
     });
   });
+}
+
+function renderChatGPTProjects() {
+  const select = elements['chatgpt-project-select'];
+  const previous = select.value;
+  select.innerHTML = '<option value="">New chat (no project)</option>'
+    + state.chatgptProjects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join('')
+    + '<option value="__new__">Create a new ChatGPT project…</option>';
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  const creating = select.value === '__new__';
+  elements['new-project-fields'].classList.toggle('hidden', !creating);
+  elements['new-project-name'].disabled = !creating;
+}
+
+async function refreshChatGPTProjects(showErrors = false) {
+  elements['refresh-projects-button'].disabled = true;
+  elements['project-list-status'].classList.remove('error');
+  elements['project-list-status'].textContent = 'Loading ChatGPT projects…';
+  try {
+    state.chatgptProjects = await window.patchwork.listChatGPTProjects();
+    renderChatGPTProjects();
+    elements['project-list-status'].textContent = state.chatgptProjects.length
+      ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available.`
+      : 'No ChatGPT projects found. You can create one below.';
+  } catch (error) {
+    state.chatgptProjects = [];
+    renderChatGPTProjects();
+    elements['project-list-status'].classList.add('error');
+    elements['project-list-status'].textContent = error.message;
+    if (showErrors) showToast(error.message, true);
+  } finally {
+    elements['refresh-projects-button'].disabled = false;
+  }
 }
 
 function renderTaskTreeOptions() {
@@ -276,6 +313,7 @@ function taskStateLabel(task) {
     ready: 'Waiting to apply',
     applied: 'Applied',
     'rolled-back': 'Rolled back',
+    conflicted: 'Needs conflict resolution',
     failed: 'Needs attention',
   };
   return labels[task.state] || task.state;
@@ -318,6 +356,8 @@ function taskHistorySearchText(task) {
   return [
     task.taskText,
     task.treeName,
+    task.model,
+    task.reasoningMode,
     task.state,
     task.error,
     task.result?.summary,
@@ -346,13 +386,14 @@ function renderTaskHistory() {
   elements['task-history-list'].innerHTML = tasks.map((task) => {
     const repositoryNames = (task.repositories || []).map((repository) => repository.name).filter(Boolean);
     const context = task.treeName || repositoryNames.join(', ') || 'Local task';
+    const configuration = taskConfigurationLabel(task);
     const detail = task.result?.summary || task.error || 'No result summary recorded.';
     const commitMessage = task.result?.commitMessage?.split('\n')[0] || '';
     return `<article class="task-history-card">
       <div class="task-history-heading">
         <div>
           <strong>${escapeHtml(taskLabel(task))}</strong>
-          <small>${escapeHtml(formatDateTime(task.createdAt))} · ${escapeHtml(context)}</small>
+          <small>${escapeHtml(formatDateTime(task.createdAt))} · ${escapeHtml(context)} · ${escapeHtml(configuration)}</small>
         </div>
         <span class="history-state ${escapeHtml(task.state)}">${escapeHtml(taskStateLabel(task))}${taskElapsedMarkup(task)}</span>
       </div>
@@ -388,10 +429,28 @@ const statusText = {
   prepared: ['Package prepared', 'Attach the package in ChatGPT and send the copied instructions.'],
   submitted: ['Task is running', 'ChatGPT is still working in the embedded browser. Patchwork is actively watching for the result.'],
   ready: ['Waiting to apply', 'The plain-text result is validated and waiting for you to apply it.'],
+  conflicted: ['Conflict needs resolution', 'The result could not be applied cleanly. Send a resolution task to ChatGPT to preserve both versions.'],
   applied: ['Changes committed', 'The validated patch is committed in this task’s coding tree.'],
   'rolled-back': ['Changes reverted', 'A revert commit was created in this task’s coding tree.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
 };
+
+function taskConfigurationLabel(task) {
+  const models = {
+    default: 'ChatGPT default',
+    sol: 'GPT-5.6 Sol',
+    terra: 'GPT-5.6 Terra',
+    luna: 'GPT-5.6 Luna',
+  };
+  const reasoning = {
+    default: 'default reasoning',
+    instant: 'Instant',
+    medium: 'Medium',
+    high: 'High',
+    'extra-high': 'Extra High',
+  };
+  return `${models[task.model || 'default'] || task.model} · ${reasoning[task.reasoningMode || 'default'] || task.reasoningMode}`;
+}
 
 function renderResult(task) {
   const hasResult = Boolean(task.result);
@@ -404,6 +463,7 @@ function renderResult(task) {
       <pre>${escapeHtml(patch.stat || 'No changes')}</pre>
     </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '');
   elements['apply-button'].classList.toggle('hidden', task.state !== 'ready');
+  elements['resolve-conflict-button'].classList.toggle('hidden', task.state !== 'conflicted' || !task.treeId);
   elements['rollback-button'].classList.toggle('hidden', task.state !== 'applied');
 }
 
@@ -428,8 +488,12 @@ function showTask(task) {
   elements['status-badge'].className = `status-badge ${task.state}`;
   addActivity(`Task ${task.state}`, task.updatedAt || task.createdAt);
   addActivity(`${task.repositories.length} repository snapshot${task.repositories.length === 1 ? '' : 's'} prepared`, task.createdAt);
+  addActivity(`Model: ${taskConfigurationLabel(task)}`, task.createdAt);
   if (task.attachments?.length) {
     addActivity(`${task.attachments.length} task attachment${task.attachments.length === 1 ? '' : 's'} prepared`, task.createdAt);
+  }
+  if (task.chatgptProject?.name) {
+    addActivity(`ChatGPT project: ${task.chatgptProject.name}`, task.createdAt);
   }
   renderResult(task);
   renderTaskList();
@@ -452,6 +516,8 @@ function showComposer() {
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   renderTaskTreeOptions();
+  renderChatGPTProjects();
+  refreshChatGPTProjects().catch(() => {});
   renderTaskList();
 }
 
@@ -862,13 +928,33 @@ async function createTask() {
   button.disabled = true;
   button.firstChild.textContent = 'Preparing bundle… ';
   try {
+    let chatgptProject = null;
+    const projectSelection = elements['chatgpt-project-select'].value;
+    if (projectSelection === '__new__') {
+      const projectName = elements['new-project-name'].value.trim();
+      if (!projectName) throw new Error('Enter a name for the new ChatGPT project.');
+      button.firstChild.textContent = 'Creating ChatGPT project… ';
+      chatgptProject = await window.patchwork.createChatGPTProject(projectName);
+      state.chatgptProjects = [chatgptProject, ...state.chatgptProjects.filter((item) => item.id !== chatgptProject.id)];
+      renderChatGPTProjects();
+      elements['chatgpt-project-select'].value = chatgptProject.id;
+      elements['new-project-fields'].classList.add('hidden');
+      elements['new-project-name'].disabled = true;
+    } else if (projectSelection) {
+      chatgptProject = state.chatgptProjects.find((project) => project.id === projectSelection) || null;
+      if (!chatgptProject) throw new Error('Refresh ChatGPT projects and choose the destination again.');
+    }
+    button.firstChild.textContent = 'Preparing bundle… ';
     const task = await window.patchwork.createTask({
       repositories: state.repositories,
       taskText: elements['task-text'].value,
+      model: elements['task-model-select'].value,
+      reasoningMode: elements['task-reasoning-select'].value,
       autoApply: true,
       treeId: elements['task-tree-select'].value || null,
       treeName: elements['tree-name'].value,
       attachments: state.attachments,
+      chatgptProject,
     });
     state.attachments = [];
     renderAttachments();
@@ -919,6 +1005,8 @@ elements['trees-new-task'].addEventListener('click', () => {
   showComposer();
 });
 elements['task-tree-select'].addEventListener('change', renderTaskTreeOptions);
+elements['chatgpt-project-select'].addEventListener('change', renderChatGPTProjects);
+elements['refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
 elements['add-attachment-button'].addEventListener('click', chooseAttachments);
 elements['create-task-button'].addEventListener('click', createTask);
@@ -927,6 +1015,23 @@ elements['copy-prompt-button'].addEventListener('click', () => runTaskAction(win
 elements['reveal-package-button'].addEventListener('click', () => runTaskAction(window.patchwork.revealPackage));
 elements['import-result-button'].addEventListener('click', () => runTaskAction(window.patchwork.importResult));
 elements['apply-button'].addEventListener('click', () => runTaskAction(window.patchwork.applyTask, 'Changes applied.'));
+elements['resolve-conflict-button'].addEventListener('click', async () => {
+  if (!state.activeTask) return;
+  const button = elements['resolve-conflict-button'];
+  button.disabled = true;
+  try {
+    const task = await window.patchwork.resolveTaskConflict(state.activeTask.taskId);
+    if (!task) return;
+    upsertTask(task);
+    await refreshTrees();
+    showTask(task);
+    showToast('Conflict-resolution task submitted to ChatGPT.');
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
 elements['rollback-button'].addEventListener('click', () => runTaskAction(window.patchwork.rollbackTask, 'Changes rolled back.'));
 elements['new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
 elements['browser-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));

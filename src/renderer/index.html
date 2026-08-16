@@ -172,6 +172,7 @@
                 <option value="prepared">Prepared</option>
                 <option value="submitted">Submitted</option>
                 <option value="ready">Ready</option>
+                <option value="conflicted">Conflicted</option>
                 <option value="applied">Applied</option>
                 <option value="rolled-back">Rolled back</option>
                 <option value="failed">Failed</option>
@@ -224,6 +225,27 @@
                   <h2>Describe the change</h2>
                 </div>
               </div>
+              <div class="task-model-fields">
+                <div>
+                  <label class="field-label" for="task-model-select">Model</label>
+                  <select id="task-model-select" class="field-control">
+                    <option value="default">ChatGPT default</option>
+                    <option value="sol">GPT-5.6 Sol</option>
+                    <option value="terra">GPT-5.6 Terra</option>
+                    <option value="luna">GPT-5.6 Luna (Thinking Mini)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="field-label" for="task-reasoning-select">Reasoning</label>
+                  <select id="task-reasoning-select" class="field-control">
+                    <option value="default">Model default</option>
+                    <option value="instant">Instant</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="extra-high">Extra High</option>
+                  </select>
+                </div>
+              </div>
               <label class="sr-only" for="task-text">Software task</label>
               <textarea
                 id="task-text"
@@ -233,7 +255,7 @@
               <div class="attachment-picker">
                 <div>
                   <strong>Task attachments</strong>
-                  <small>Optional files are uploaded to ChatGPT with the Patchwork task package before the message is sent.</small>
+                  <small>Optional files are included inside the task ZIP and uploaded alongside it before the message is sent.</small>
                 </div>
                 <button id="add-attachment-button" class="secondary" type="button">Upload attachment</button>
               </div>
@@ -250,6 +272,27 @@
               </label>
             </article>
 
+            <article class="card">
+              <div class="card-heading">
+                <div>
+                  <span class="step-number">4</span>
+                  <h2>Choose a ChatGPT project</h2>
+                </div>
+                <button id="refresh-projects-button" class="secondary" type="button">Refresh</button>
+              </div>
+              <p class="card-copy">Launch the task as a normal new chat, inside one of your existing ChatGPT projects, or create a project for this task.</p>
+              <label class="field-label" for="chatgpt-project-select">ChatGPT destination</label>
+              <select id="chatgpt-project-select" class="field-control">
+                <option value="">New chat (no project)</option>
+                <option value="__new__">Create a new ChatGPT project…</option>
+              </select>
+              <div id="new-project-fields" class="new-tree-fields hidden">
+                <label class="field-label" for="new-project-name">New project name</label>
+                <input id="new-project-name" class="field-control" type="text" maxlength="100" placeholder="For example: Patchwork tasks" />
+              </div>
+              <p id="project-list-status" class="field-help">Open the ChatGPT session and sign in to load your projects.</p>
+            </article>
+
             <button id="create-task-button" class="primary launch-button">
               Prepare and submit with ChatGPT <span>↗</span>
             </button>
@@ -259,13 +302,13 @@
             <p class="eyebrow">HOW IT WORKS</p>
             <ol>
               <li><span>1</span><div><strong>Isolate</strong><small>A Git worktree and Patchwork branch keep this stream independent.</small></div></li>
-              <li><span>2</span><div><strong>Hand off</strong><small>The repository bundle crosses the browser boundary as plain text.</small></div></li>
-              <li><span>3</span><div><strong>Commit</strong><small>Validated response text is applied and committed in the tree.</small></div></li>
-              <li><span>4</span><div><strong>Merge</strong><small>ChatGPT summarizes the tree before Patchwork squashes it into the original branch.</small></div></li>
+              <li><span>2</span><div><strong>Target</strong><small>Choose a regular chat or a ChatGPT project for the task.</small></div></li>
+              <li><span>3</span><div><strong>Hand off</strong><small>The repository bundle and attachments are submitted through the visible browser.</small></div></li>
+              <li><span>4</span><div><strong>Commit + merge</strong><small>Validated changes are committed in the tree and can later be squashed into the original branch.</small></div></li>
             </ol>
             <div class="boundary-note">
               <strong>Visible browser boundary</strong>
-              <p>Patchwork never calls ChatGPT’s private APIs or reads authentication cookies.</p>
+              <p>Patchwork does not use the OpenAI developer API or read authentication cookies. Project discovery and creation use ChatGPT’s same-origin web endpoints inside the signed-in browser session.</p>
             </div>
           </aside>
         </section>
@@ -303,6 +346,7 @@
                 <div id="patch-list" class="patch-list"></div>
                 <div class="result-actions">
                   <button id="apply-button" class="primary">Apply changes</button>
+                  <button id="resolve-conflict-button" class="primary hidden">Resolve with ChatGPT</button>
                   <button id="rollback-button" class="danger hidden">Roll back</button>
                 </div>
               </article>

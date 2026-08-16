@@ -4,6 +4,7 @@ const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('el
 const { mergeResultFilename } = require('./worktree-service');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
+const CHATGPT_PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9_-]+$/;
 const PARTITION = 'persist:patchwork-chatgpt';
 const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 const RESULT_RETRY_MILLISECONDS = 6_000;
@@ -11,6 +12,35 @@ const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
+
+const TASK_MODEL_PICKER_OPTIONS = {
+  sol: {
+    label: 'GPT-5.6 Sol',
+    labels: ['GPT-5.6 Sol', 'GPT 5.6 Sol', 'Sol', 'Thinking'],
+    testIds: ['model-switcher-gpt-5-6-thinking', 'model-switcher-gpt-5-6-sol'],
+  },
+  terra: {
+    label: 'GPT-5.6 Terra',
+    labels: ['GPT-5.6 Terra', 'GPT 5.6 Terra', 'Terra'],
+    testIds: ['model-switcher-gpt-5-6-terra'],
+  },
+  luna: {
+    label: 'GPT-5.6 Luna',
+    labels: ['GPT-5.6 Luna', 'GPT 5.6 Luna', 'Luna', 'Thinking Mini', 'Thinking mini'],
+    testIds: [
+      'model-switcher-gpt-5-6-luna',
+      'model-switcher-gpt-5-thinking-mini',
+      'model-switcher-gpt-5-t-mini',
+    ],
+  },
+};
+
+const TASK_REASONING_PICKER_OPTIONS = {
+  instant: { label: 'Instant', labels: ['Instant'] },
+  medium: { label: 'Medium', labels: ['Medium', 'Thinking Standard', 'Standard'] },
+  high: { label: 'High', labels: ['High', 'Thinking Extended', 'Extended'] },
+  'extra-high': { label: 'Extra High', labels: ['Extra High', 'Extra high', 'Thinking Heavy', 'Heavy'] },
+};
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -26,12 +56,23 @@ function mergeTreeId(filename) {
   return MERGE_RESULT_NAME_PATTERN.exec(path.basename(String(filename || '')))?.[1]?.toLowerCase() || null;
 }
 
+function chatGPTProjectUrl(projectId, shortUrl = null) {
+  const id = String(projectId || '').trim();
+  if (!CHATGPT_PROJECT_ID_PATTERN.test(id)) throw new Error('ChatGPT returned an invalid project identifier.');
+  const routeId = String(shortUrl || id).trim();
+  if (!CHATGPT_PROJECT_ID_PATTERN.test(routeId) || (routeId !== id && !routeId.startsWith(`${id}-`))) {
+    throw new Error('ChatGPT returned an invalid project URL.');
+  }
+  return `https://chatgpt.com/g/${routeId}/project`;
+}
+
 function isChatGPTConversationUrl(value) {
   try {
     const url = new URL(String(value || ''));
     return url.protocol === 'https:'
       && url.hostname === 'chatgpt.com'
-      && /^\/c\/[^/]+\/?$/.test(url.pathname);
+      && (/^\/c\/[^/]+\/?$/.test(url.pathname)
+        || /^\/g\/g-p-[A-Za-z0-9_-]+\/c\/[^/]+\/?$/.test(url.pathname));
   } catch {
     return false;
   }
@@ -89,6 +130,100 @@ function buildLimitNoticeDismissalScript() {
       return { dismissed: true, notice: notice.slice(0, 240), action };
     }
     return { dismissed: false };
+  })()`;
+}
+
+function buildTaskConfigurationScript(model, reasoningMode) {
+  const modelTarget = TASK_MODEL_PICKER_OPTIONS[model] || null;
+  const reasoningTarget = TASK_REASONING_PICKER_OPTIONS[reasoningMode] || null;
+  return `(async () => {
+    const modelTarget = ${JSON.stringify(modelTarget)};
+    const reasoningTarget = ${JSON.stringify(reasoningTarget)};
+    const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+    const visible = (element) => {
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0;
+    };
+    const textFor = (element) => [
+      element.textContent,
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.getAttribute('data-testid'),
+    ].filter(Boolean).join(' ');
+    const candidates = () => [...document.querySelectorAll([
+      '[role="menuitem"]',
+      '[role="option"]',
+      '[role="radio"]',
+      '[data-radix-collection-item]',
+      'button',
+    ].join(', '))].filter((element) => (
+      visible(element) && element.getAttribute('data-testid') !== 'model-switcher-dropdown-button'
+    ));
+    const findChoice = (target) => {
+      if (!target) return null;
+      const items = candidates();
+      const testIds = new Set((target.testIds || []).map(normalize));
+      const direct = items.find((element) => testIds.has(normalize(element.getAttribute('data-testid'))));
+      if (direct) return direct;
+      const labels = (target.labels || []).map(normalize).filter(Boolean);
+      const scored = items.map((element) => {
+        const text = normalize(textFor(element));
+        let score = 0;
+        for (const label of labels) {
+          if (text === label) score = Math.max(score, 4);
+          else if (text.startsWith(label + ' ')) score = Math.max(score, 3);
+          else if (label.length >= 8 && text.includes(label)) score = Math.max(score, 2);
+        }
+        return { element, score };
+      }).filter((item) => item.score > 0).sort((left, right) => right.score - left.score);
+      return scored[0]?.element || null;
+    };
+    const pickerButton = () => document.querySelector('button[data-testid="model-switcher-dropdown-button"]')
+      || [...document.querySelectorAll('button')].filter(visible).find((button) => /(?:model|reasoning|instant|medium|high|thinking|sol|terra|luna)/i.test(textFor(button)));
+    const openPicker = async () => {
+      const openMenu = [...document.querySelectorAll('[role="menu"], [role="listbox"]')].find(visible);
+      if (openMenu) return true;
+      const button = pickerButton();
+      if (!button) return false;
+      button.click();
+      await sleep(160);
+      return true;
+    };
+    const choose = async (target, submenuLabels = []) => {
+      if (!target) return { ok: true, selected: null };
+      if (!await openPicker()) return { ok: false, reason: 'picker-not-found' };
+      let choice = findChoice(target);
+      if (!choice) {
+        for (const submenuLabel of submenuLabels) {
+          const submenu = findChoice({ labels: [submenuLabel] });
+          if (!submenu) continue;
+          submenu.click();
+          await sleep(140);
+          choice = findChoice(target);
+          if (choice) break;
+        }
+      }
+      if (!choice) {
+        return {
+          ok: false,
+          reason: 'option-not-found',
+          available: candidates().map((element) => textFor(element).replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 24),
+        };
+      }
+      const selected = textFor(choice).replace(/\\s+/g, ' ').trim();
+      choice.click();
+      await sleep(180);
+      return { ok: true, selected };
+    };
+
+    const selectedModel = await choose(modelTarget, ['Models', 'More models', 'Legacy models']);
+    if (!selectedModel.ok) return { ok: false, kind: 'model', target: modelTarget?.label, ...selectedModel };
+    const selectedReasoning = await choose(reasoningTarget, ['Reasoning', 'Thinking effort', 'Effort', 'Configure']);
+    if (!selectedReasoning.ok) return { ok: false, kind: 'reasoning', target: reasoningTarget?.label, ...selectedReasoning };
+    return { ok: true, model: selectedModel.selected, reasoning: selectedReasoning.selected };
   })()`;
 }
 
@@ -446,12 +581,14 @@ class ChatGPTView {
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
     clipboard.writeText(task.handoffPrompt);
-    await this.newChat();
+    await this.newChat(task.chatgptProject?.id, task.chatgptProject?.shortUrl);
     this.installResultWatcher();
     await this.onEvent({
       type: 'browser-prepared',
       taskId: task.taskId,
-      message: 'A fresh embedded ChatGPT chat is ready for automated submission.',
+      message: task.chatgptProject?.name
+        ? `A fresh chat in ChatGPT project “${task.chatgptProject.name}” is ready for automated submission.`
+        : 'A fresh embedded ChatGPT chat is ready for automated submission.',
     });
   }
 
@@ -474,13 +611,100 @@ class ChatGPTView {
     return { opened: true, task };
   }
 
-  async newChat() {
-    if (this.view.webContents.getURL() !== CHATGPT_URL) {
-      await this.view.webContents.loadURL(CHATGPT_URL);
+  async newChat(projectId = null, projectShortUrl = null) {
+    const targetUrl = projectId ? chatGPTProjectUrl(projectId, projectShortUrl) : CHATGPT_URL;
+    if (this.view.webContents.getURL() !== targetUrl) {
+      await this.view.webContents.loadURL(targetUrl);
     } else {
       await this.view.webContents.reload();
     }
     return true;
+  }
+
+  async listProjects() {
+    const result = await this.view.webContents.executeJavaScript(`(async () => {
+      const projects = [];
+      let cursor = null;
+      let page = 0;
+      do {
+        const url = new URL('/backend-api/gizmos/snorlax/sidebar', location.origin);
+        url.searchParams.set('conversations_per_gizmo', '0');
+        url.searchParams.set('owned_only', 'true');
+        url.searchParams.set('limit', '20');
+        if (cursor) url.searchParams.set('cursor', cursor);
+        const response = await fetch(url.toString(), { credentials: 'include' });
+        if (!response.ok) {
+          return { ok: false, status: response.status, message: (await response.text()).slice(0, 240) };
+        }
+        const data = await response.json();
+        for (const item of data.items || []) {
+          const gizmo = item?.gizmo?.gizmo || item?.gizmo;
+          const id = gizmo?.id;
+          const shortUrl = gizmo?.short_url;
+          const name = gizmo?.display?.name;
+          if (typeof id === 'string' && id.startsWith('g-p-') && typeof name === 'string' && name.trim()) {
+            projects.push({ id, shortUrl: typeof shortUrl === 'string' ? shortUrl : null, name: name.trim() });
+          }
+        }
+        cursor = data.cursor || null;
+        page += 1;
+      } while (cursor && page < 20);
+      return { ok: true, projects };
+    })()`, true).catch((error) => ({ ok: false, status: 0, message: error.message }));
+    if (!result?.ok) {
+      if ([401, 403].includes(result?.status)) throw new Error('Sign in to ChatGPT before loading projects.');
+      throw new Error(`Could not load ChatGPT projects${result?.status ? ` (${result.status})` : ''}.`);
+    }
+    const unique = new Map();
+    for (const project of result.projects || []) {
+      if (CHATGPT_PROJECT_ID_PATTERN.test(project.id)) unique.set(project.id, project);
+    }
+    return [...unique.values()].sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  async createProject(name) {
+    const projectName = String(name || '').trim();
+    if (!projectName) throw new Error('Enter a name for the new ChatGPT project.');
+    const result = await this.view.webContents.executeJavaScript(`(async () => {
+      const response = await fetch('/backend-api/projects', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: ${JSON.stringify(projectName)}, instructions: '' }),
+      });
+      const text = await response.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch {}
+      if (!response.ok) return { ok: false, status: response.status, message: text.slice(0, 240) };
+      const candidate = data?.resource?.gizmo || data?.gizmo?.gizmo || data?.gizmo || data?.project?.gizmo || data?.project || data;
+      return {
+        ok: true,
+        project: {
+          id: candidate?.id || candidate?.gizmo_id || data?.id || data?.gizmo_id || data?.project_id || null,
+          shortUrl: candidate?.short_url || null,
+          name: candidate?.display?.name || candidate?.name || data?.name || ${JSON.stringify(projectName)},
+        },
+      };
+    })()`, true).catch((error) => ({ ok: false, status: 0, message: error.message }));
+    if (!result?.ok) {
+      if ([401, 403].includes(result?.status)) throw new Error('Sign in to ChatGPT before creating a project.');
+      throw new Error(`Could not create the ChatGPT project${result?.status ? ` (${result.status})` : ''}.`);
+    }
+    let project = result.project;
+    if (!CHATGPT_PROJECT_ID_PATTERN.test(String(project?.id || ''))) {
+      const projects = await this.listProjects();
+      project = projects.find((item) => item.name === projectName) || null;
+    }
+    if (!project || !CHATGPT_PROJECT_ID_PATTERN.test(project.id)) {
+      throw new Error('ChatGPT created the project, but Patchwork could not determine its project identifier.');
+    }
+    const shortUrl = CHATGPT_PROJECT_ID_PATTERN.test(String(project.shortUrl || '')) ? project.shortUrl : null;
+    return {
+      id: project.id,
+      shortUrl,
+      name: String(project.name || projectName).trim(),
+      url: chatGPTProjectUrl(project.id, shortUrl),
+    };
   }
 
   async reload() {
@@ -515,6 +739,28 @@ class ChatGPTView {
       await delay(350);
     }
     return false;
+  }
+
+  async configureTaskModel(task) {
+    const model = String(task?.model || 'default').toLowerCase();
+    const reasoningMode = String(task?.reasoningMode || 'default').toLowerCase();
+    if (model === 'default' && reasoningMode === 'default') return true;
+    const modelOption = TASK_MODEL_PICKER_OPTIONS[model];
+    const reasoningOption = TASK_REASONING_PICKER_OPTIONS[reasoningMode];
+    if (model !== 'default' && !modelOption) throw new Error(`Unsupported task model: ${task.model}`);
+    if (reasoningMode !== 'default' && !reasoningOption) {
+      throw new Error(`Unsupported task reasoning mode: ${task.reasoningMode}`);
+    }
+    const result = await this.view.webContents.executeJavaScript(
+      buildTaskConfigurationScript(model, reasoningMode),
+      true,
+    ).catch(() => ({ ok: false, reason: 'picker-script-failed' }));
+    if (!result?.ok) {
+      const requested = result?.target || modelOption?.label || reasoningOption?.label || 'requested task configuration';
+      const available = result?.available?.length ? ` Available options: ${result.available.join(', ')}.` : '';
+      throw new Error(`Could not select ${requested} in ChatGPT before submission.${available}`);
+    }
+    return true;
   }
 
   async injectPrompt(prompt) {
@@ -750,6 +996,7 @@ class ChatGPTView {
       });
       throw new Error('ChatGPT is not ready. Sign in inside the embedded browser and retry.');
     }
+    await ChatGPTView.prototype.configureTaskModel.call(this, task);
     await this.injectPrompt(task.handoffPrompt);
     await this.uploadPackage(task.packagePath);
     await ChatGPTView.prototype.uploadAttachments.call(this, task.attachments);
@@ -943,6 +1190,8 @@ class ChatGPTView {
 module.exports = {
   CHATGPT_URL,
   ChatGPTView,
+  buildTaskConfigurationScript,
+  chatGPTProjectUrl,
   buildLimitNoticeDismissalScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,

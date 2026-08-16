@@ -10,6 +10,20 @@ const {
 } = require('./git');
 
 const SCHEMA_VERSION = 1;
+const TASK_MODELS = new Set(['default', 'sol', 'terra', 'luna']);
+const REASONING_MODES = new Set(['default', 'instant', 'medium', 'high', 'extra-high']);
+
+function normalizeTaskModel(value) {
+  const model = String(value || 'default').trim().toLowerCase();
+  if (!TASK_MODELS.has(model)) throw new Error(`Unsupported ChatGPT model: ${value}`);
+  return model;
+}
+
+function normalizeReasoningMode(value) {
+  const mode = String(value || 'default').trim().toLowerCase();
+  if (!REASONING_MODES.has(mode)) throw new Error(`Unsupported ChatGPT reasoning mode: ${value}`);
+  return mode;
+}
 
 function buildAgentInstructions(taskId) {
   const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
@@ -21,7 +35,7 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Do not
 ## Set up the repositories
 
 1. Extract the uploaded ZIP into a writable directory.
-2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely.
+2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely. If \`manifest.json.attachments\` is non-empty, also read each listed file under \`attachments/\`; those files are user-provided task context.
 3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`.
 4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
@@ -90,7 +104,7 @@ The commit message first line must follow Conventional Commits: \`type(optional-
 
 function buildHandoffPrompt(taskId, taskText, attachments = []) {
   const attachmentNote = attachments.length
-    ? `\n\nI also attached these user-provided files for task context: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
+    ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
     : '';
   return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}\n\nTask summary:\n${taskText}`;
 }
@@ -167,6 +181,8 @@ class TaskService {
     if (!Array.isArray(input.repositories) || input.repositories.length === 0) {
       throw new Error('Add at least one Git repository.');
     }
+    const model = normalizeTaskModel(input.model);
+    const reasoningMode = normalizeReasoningMode(input.reasoningMode);
 
     const repositories = await this.inspectRepositories(input.repositories.map((item) => item.path));
     const requestedRepositories = new Map(await Promise.all(input.repositories.map(async (item) => [
@@ -281,11 +297,17 @@ class TaskService {
     }
 
     const createdAt = new Date().toISOString();
+    const packageAttachments = attachments.map(({ name, size }) => ({
+      name,
+      size,
+      file: `attachments/${name}`,
+    }));
     const manifest = {
       schemaVersion: SCHEMA_VERSION,
       taskId,
       createdAt,
       repositories: publicRepositories,
+      attachments: packageAttachments,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
     const agentInstructions = `${buildAgentInstructions(taskId)}\n${buildCurrentAgentAddendum(taskId)}`;
@@ -305,6 +327,7 @@ class TaskService {
     for (const repository of publicRepositories) {
       addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'repositories');
     }
+    for (const attachment of attachments) zip.addLocalFile(attachment.path, 'attachments');
     for (const patch of conflictPatchFiles) zip.addLocalFile(path.join(taskDir, patch.file), 'conflicts');
     await fs.writeFile(packagePath, await zip.toBufferPromise());
     const packageStat = await fs.stat(packagePath);
@@ -312,6 +335,8 @@ class TaskService {
     const record = {
       ...manifest,
       taskText,
+      model,
+      reasoningMode,
       autoApply: input.autoApply !== false,
       transport: 'zip-git-bundle',
       resultTransport: 'downloaded-text-file',
@@ -320,6 +345,11 @@ class TaskService {
       mergeResolution: Boolean(input.mergeResolution),
       resultFilename: `chatgpt-ide-result-${taskId}.txt`,
       sourceRepositoryPath: input.tree?.repositoryPath || null,
+      chatgptProject: input.chatgptProject?.id ? {
+        id: String(input.chatgptProject.id),
+        shortUrl: input.chatgptProject.shortUrl ? String(input.chatgptProject.shortUrl) : null,
+        name: String(input.chatgptProject.name || '').trim() || 'ChatGPT project',
+      } : null,
       packagePath,
       attachments,
       handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments),

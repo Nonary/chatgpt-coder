@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('patchwork', {
   chooseRepositories: () => ipcRenderer.invoke('repositories:choose'),
   chooseAttachments: () => ipcRenderer.invoke('attachments:choose'),
+  listChatGPTProjects: () => ipcRenderer.invoke('projects:list'),
+  createChatGPTProject: (name) => ipcRenderer.invoke('projects:create', name),
   listWorkspaceRepositories: () => ipcRenderer.invoke('workspace:list'),
   removeWorkspaceRepository: (repositoryPath) => ipcRenderer.invoke('workspace:remove', repositoryPath),
   gitStatus: (repositoryPath) => ipcRenderer.invoke('git:status', repositoryPath),
@@ -22,6 +24,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   getTask: (taskId) => ipcRenderer.invoke('task:get', taskId),
   openTask: (taskId) => ipcRenderer.invoke('task:open', taskId),
   submitTask: (taskId) => ipcRenderer.invoke('task:submit', taskId),
+  resolveTaskConflict: (taskId) => ipcRenderer.invoke('task:resolve-conflict', taskId),
   copyPrompt: (taskId) => ipcRenderer.invoke('task:copy-prompt', taskId),
   revealPackage: (taskId) => ipcRenderer.invoke('task:reveal-package', taskId),
   importResult: (taskId) => ipcRenderer.invoke('task:import-result', taskId),
