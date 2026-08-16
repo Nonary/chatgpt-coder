@@ -231,8 +231,7 @@
                   <select id="task-model-select" class="field-control">
                     <option value="default">ChatGPT default</option>
                     <option value="sol">GPT-5.6 Sol</option>
-                    <option value="terra">GPT-5.6 Terra</option>
-                    <option value="luna">GPT-5.6 Luna (Thinking Mini)</option>
+                    <option value="luna">GPT-5.6 Luna</option>
                   </select>
                 </div>
                 <div>
@@ -335,8 +334,8 @@
                   <button id="import-result-button" class="secondary">Import result</button>
                 </div>
                 <div class="boundary-note browser-boundary">
-                  <strong>Browser-level automation</strong>
-                  <p>Only DOM injection and Chromium file-input controls are used. Network requests and login credentials are not intercepted.</p>
+                  <strong>Verified browser automation</strong>
+                  <p>Patchwork replaces ChatGPT’s model control and verifies the selected model on the outgoing task request. Login credentials remain inside ChatGPT and are never read or stored.</p>
                 </div>
               </article>
 

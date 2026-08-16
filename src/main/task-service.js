@@ -10,7 +10,7 @@ const {
 } = require('./git');
 
 const SCHEMA_VERSION = 1;
-const TASK_MODELS = new Set(['default', 'sol', 'terra', 'luna']);
+const TASK_MODELS = new Set(['default', 'sol', 'luna']);
 const REASONING_MODES = new Set(['default', 'instant', 'medium', 'high', 'extra-high']);
 
 function normalizeTaskModel(value) {

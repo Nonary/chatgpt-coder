@@ -439,7 +439,6 @@ function taskConfigurationLabel(task) {
   const models = {
     default: 'ChatGPT default',
     sol: 'GPT-5.6 Sol',
-    terra: 'GPT-5.6 Terra',
     luna: 'GPT-5.6 Luna',
   };
   const reasoning = {

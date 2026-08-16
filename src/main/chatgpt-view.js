@@ -10,37 +10,69 @@ const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.
 const RESULT_RETRY_MILLISECONDS = 6_000;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
+const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 
 const TASK_MODEL_PICKER_OPTIONS = {
   sol: {
     label: 'GPT-5.6 Sol',
-    labels: ['GPT-5.6 Sol', 'GPT 5.6 Sol', 'Sol', 'Thinking'],
-    testIds: ['model-switcher-gpt-5-6-thinking', 'model-switcher-gpt-5-6-sol'],
-  },
-  terra: {
-    label: 'GPT-5.6 Terra',
-    labels: ['GPT-5.6 Terra', 'GPT 5.6 Terra', 'Terra'],
-    testIds: ['model-switcher-gpt-5-6-terra'],
+    defaultSlug: 'gpt-5-6',
+    instantSlug: 'gpt-5-6-instant',
+    thinkingSlug: 'gpt-5-6-thinking',
   },
   luna: {
     label: 'GPT-5.6 Luna',
-    labels: ['GPT-5.6 Luna', 'GPT 5.6 Luna', 'Luna', 'Thinking Mini', 'Thinking mini'],
-    testIds: [
-      'model-switcher-gpt-5-6-luna',
-      'model-switcher-gpt-5-thinking-mini',
-      'model-switcher-gpt-5-t-mini',
-    ],
+    defaultSlug: 'gpt-5-6-t-mini',
+    instantSlug: 'gpt-5-6-mini',
+    thinkingSlug: 'gpt-5-6-t-mini',
   },
 };
 
 const TASK_REASONING_PICKER_OPTIONS = {
-  instant: { label: 'Instant', labels: ['Instant'] },
-  medium: { label: 'Medium', labels: ['Medium', 'Thinking Standard', 'Standard'] },
-  high: { label: 'High', labels: ['High', 'Thinking Extended', 'Extended'] },
-  'extra-high': { label: 'Extra High', labels: ['Extra High', 'Extra high', 'Thinking Heavy', 'Heavy'] },
+  instant: { label: 'Instant', thinkingEffort: null },
+  medium: { label: 'Medium', thinkingEffort: 'standard' },
+  high: { label: 'High', thinkingEffort: 'extended' },
+  'extra-high': { label: 'Extra High', thinkingEffort: 'max' },
 };
+
+function taskRequestConfiguration(model, reasoningMode) {
+  const requestedModel = String(model || 'default').toLowerCase();
+  const requestedReasoning = String(reasoningMode || 'default').toLowerCase();
+  const modelKey = requestedModel === 'default' ? 'sol' : requestedModel;
+  const modelOption = TASK_MODEL_PICKER_OPTIONS[modelKey];
+  const reasoningOption = TASK_REASONING_PICKER_OPTIONS[requestedReasoning] || null;
+  if (!modelOption) throw new Error(`Unsupported ChatGPT model: ${model}`);
+  if (requestedReasoning !== 'default' && !reasoningOption) {
+    throw new Error(`Unsupported ChatGPT reasoning mode: ${reasoningMode}`);
+  }
+  const modelSlug = requestedReasoning === 'instant'
+    ? modelOption.instantSlug
+    : requestedReasoning === 'default'
+      ? modelOption.defaultSlug
+      : modelOption.thinkingSlug;
+  return {
+    model: requestedModel,
+    reasoningMode: requestedReasoning,
+    modelSlug,
+    thinkingEffort: reasoningOption?.thinkingEffort || null,
+  };
+}
+
+function rewriteConversationRequestBody(postData, configuration) {
+  const payload = JSON.parse(String(postData || ''));
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error('ChatGPT sent an invalid conversation request.');
+  }
+  payload.model = configuration.modelSlug;
+  if (configuration.thinkingEffort) payload.thinking_effort = configuration.thinkingEffort;
+  else delete payload.thinking_effort;
+  return {
+    text: JSON.stringify(payload),
+    model: payload.model,
+    thinkingEffort: payload.thinking_effort || null,
+  };
+}
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -133,97 +165,281 @@ function buildLimitNoticeDismissalScript() {
   })()`;
 }
 
-function buildTaskConfigurationScript(model, reasoningMode) {
-  const modelTarget = TASK_MODEL_PICKER_OPTIONS[model] || null;
-  const reasoningTarget = TASK_REASONING_PICKER_OPTIONS[reasoningMode] || null;
-  return `(async () => {
-    const modelTarget = ${JSON.stringify(modelTarget)};
-    const reasoningTarget = ${JSON.stringify(reasoningTarget)};
-    const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
-    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const visible = (element) => {
-      if (!element) return false;
-      const style = getComputedStyle(element);
-      const bounds = element.getBoundingClientRect();
-      return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0;
+function buildTaskConfigurationScript(model, reasoningMode, taskId = null) {
+  const requestConfiguration = taskRequestConfiguration(model, reasoningMode);
+  return `(() => {
+    const taskId = ${JSON.stringify(taskId)};
+    const initialModel = ${JSON.stringify(model || 'default')};
+    const initialReasoningMode = ${JSON.stringify(reasoningMode || 'default')};
+    const modelOptions = ${JSON.stringify(TASK_MODEL_PICKER_OPTIONS)};
+    const reasoningOptions = ${JSON.stringify(TASK_REASONING_PICKER_OPTIONS)};
+    const pickerId = 'patchwork-task-model-selector';
+    const menuId = 'patchwork-task-model-menu';
+    const slotId = 'patchwork-task-model-selector-slot';
+    const nativePickerSelector = [
+      '[aria-label^="Model selector" i]',
+      '[aria-label*="current model" i]',
+      '[style*="--vt-thread-model-switcher"]',
+      '[data-testid="model-switcher-dropdown"]',
+      '[data-testid="model-switcher-dropdown-button"]',
+      '[data-testid="model-switcher-dropdown"] > button',
+      'button.composer-intelligence-button',
+      'button[class*="composer-intelligence-button"]',
+    ].join(', ');
+    const nativePickerLabel = /^(?:ChatGPT(?:\\s+5(?:\\.\\d+)*)?|GPT-5(?:\\.\\d+)*(?:\\s+(?:Sol|Luna|Instant|Thinking|Auto|Pro))?|5\\.6\\s+(?:Sol|Luna)|Instant|Thinking(?:\\s+mini)?|Auto|Pro)$/i;
+    const previousSelection = globalThis.__patchworkOwnedModelSelection;
+    const selected = previousSelection?.taskId === taskId
+      ? previousSelection
+      : { taskId, model: initialModel, reasoningMode: initialReasoningMode };
+    globalThis.__patchworkOwnedModelSelection = selected;
+
+    const stalePicker = document.getElementById(pickerId);
+    if (stalePicker && stalePicker.getAttribute('data-task-id') !== String(taskId || '')) stalePicker.remove();
+    const staleMenu = document.getElementById(menuId);
+    if (staleMenu && staleMenu.getAttribute('data-task-id') !== String(taskId || '')) staleMenu.remove();
+
+    const compactModelLabel = (value) => value === 'luna' ? 'Luna' : 'Sol';
+    const reasoningLabel = (value) => reasoningOptions[value]?.label || 'Auto';
+    const displayModel = () => selected.model === 'default' ? 'sol' : selected.model;
+    const displayLabel = () => compactModelLabel(displayModel())
+      + ' · ' + (selected.reasoningMode === 'default' ? 'Auto' : reasoningLabel(selected.reasoningMode));
+    const selectedSlug = () => {
+      const option = modelOptions[displayModel()];
+      if (selected.reasoningMode === 'instant') return option.instantSlug;
+      if (selected.reasoningMode === 'default') return option.defaultSlug;
+      return option.thinkingSlug;
     };
-    const textFor = (element) => [
-      element.textContent,
-      element.getAttribute('aria-label'),
-      element.getAttribute('title'),
-      element.getAttribute('data-testid'),
-    ].filter(Boolean).join(' ');
-    const candidates = () => [...document.querySelectorAll([
-      '[role="menuitem"]',
-      '[role="option"]',
-      '[role="radio"]',
-      '[data-radix-collection-item]',
-      'button',
-    ].join(', '))].filter((element) => (
-      visible(element) && element.getAttribute('data-testid') !== 'model-switcher-dropdown-button'
-    ));
-    const findChoice = (target) => {
-      if (!target) return null;
-      const items = candidates();
-      const testIds = new Set((target.testIds || []).map(normalize));
-      const direct = items.find((element) => testIds.has(normalize(element.getAttribute('data-testid'))));
-      if (direct) return direct;
-      const labels = (target.labels || []).map(normalize).filter(Boolean);
-      const scored = items.map((element) => {
-        const text = normalize(textFor(element));
-        let score = 0;
-        for (const label of labels) {
-          if (text === label) score = Math.max(score, 4);
-          else if (text.startsWith(label + ' ')) score = Math.max(score, 3);
-          else if (label.length >= 8 && text.includes(label)) score = Math.max(score, 2);
-        }
-        return { element, score };
-      }).filter((item) => item.score > 0).sort((left, right) => right.score - left.score);
-      return scored[0]?.element || null;
-    };
-    const pickerButton = () => document.querySelector('button[data-testid="model-switcher-dropdown-button"]')
-      || [...document.querySelectorAll('button')].filter(visible).find((button) => /(?:model|reasoning|instant|medium|high|thinking|sol|terra|luna)/i.test(textFor(button)));
-    const openPicker = async () => {
-      const openMenu = [...document.querySelectorAll('[role="menu"], [role="listbox"]')].find(visible);
-      if (openMenu) return true;
-      const button = pickerButton();
-      if (!button) return false;
-      button.click();
-      await sleep(160);
-      return true;
-    };
-    const choose = async (target, submenuLabels = []) => {
-      if (!target) return { ok: true, selected: null };
-      if (!await openPicker()) return { ok: false, reason: 'picker-not-found' };
-      let choice = findChoice(target);
-      if (!choice) {
-        for (const submenuLabel of submenuLabels) {
-          const submenu = findChoice({ labels: [submenuLabel] });
-          if (!submenu) continue;
-          submenu.click();
-          await sleep(140);
-          choice = findChoice(target);
-          if (choice) break;
-        }
-      }
-      if (!choice) {
-        return {
-          ok: false,
-          reason: 'option-not-found',
-          available: candidates().map((element) => textFor(element).replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 24),
-        };
-      }
-      const selected = textFor(choice).replace(/\\s+/g, ' ').trim();
-      choice.click();
-      await sleep(180);
-      return { ok: true, selected };
+    const persistSelection = () => fetch(
+      '/backend-api/settings/user_last_used_model_config?model_slug=' + encodeURIComponent(selectedSlug()),
+      { method: 'PATCH', credentials: 'include' },
+    ).catch(() => null);
+
+    const suppressionStyle = document.getElementById('patchwork-native-model-selector-suppression')
+      || document.createElement('style');
+    suppressionStyle.id = 'patchwork-native-model-selector-suppression';
+    suppressionStyle.textContent = nativePickerSelector
+      + ' { visibility: hidden !important; pointer-events: none !important; }';
+    if (!suppressionStyle.parentElement) document.head.append(suppressionStyle);
+
+    const createMenu = (picker, renderPicker) => {
+      document.getElementById(menuId)?.remove();
+      const menuHost = document.createElement('patchwork-model-menu');
+      menuHost.id = menuId;
+      menuHost.setAttribute('data-task-id', String(taskId || ''));
+      menuHost.hidden = true;
+      menuHost.style.cssText = 'position:fixed;z-index:2147483647;left:0;top:0;color:#f4f4f4;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+      const menu = menuHost.attachShadow({ mode: 'closed' });
+      menu.innerHTML = [
+        '<style>',
+        ':host([hidden]){display:none!important}',
+        '.menu{box-sizing:border-box;width:260px;padding:6px;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:#212121;box-shadow:0 14px 36px rgba(0,0,0,.4);font-size:14px;line-height:20px}',
+        '.section{padding:7px 10px 5px;color:#aaa;font-size:12px;font-weight:600}',
+        '.divider{height:1px;margin:5px 4px;background:rgba(255,255,255,.12)}',
+        'button{display:flex;box-sizing:border-box;width:100%;align-items:center;justify-content:space-between;padding:9px 10px;border:0;border-radius:9px;color:#f4f4f4;background:transparent;font:inherit;text-align:left;cursor:pointer}',
+        'button:hover,button[aria-checked="true"]{background:#2f2f2f}',
+        'button[aria-checked="true"]::after{content:"✓";margin-left:16px;font-size:14px}',
+        '</style>',
+        '<div class="menu" role="menu">',
+        '<div class="section">Model</div>',
+        '<button type="button" role="menuitemradio" data-choice="model:sol">GPT-5.6 Sol</button>',
+        '<button type="button" role="menuitemradio" data-choice="model:luna">GPT-5.6 Luna</button>',
+        '<div class="divider"></div>',
+        '<div class="section">Thinking</div>',
+        '<button type="button" role="menuitemradio" data-choice="reasoning:default">Auto</button>',
+        '<button type="button" role="menuitemradio" data-choice="reasoning:instant">Instant</button>',
+        '<button type="button" role="menuitemradio" data-choice="reasoning:medium">Medium</button>',
+        '<button type="button" role="menuitemradio" data-choice="reasoning:high">High</button>',
+        '<button type="button" role="menuitemradio" data-choice="reasoning:extra-high">Extra High</button>',
+        '</div>',
+      ].join('');
+      const renderMenu = () => menu.querySelectorAll('[data-choice]').forEach((option) => {
+        const [kind, value] = option.getAttribute('data-choice').split(':');
+        const checked = kind === 'model' ? displayModel() === value : selected.reasoningMode === value;
+        option.setAttribute('aria-checked', String(checked));
+      });
+      const closeMenu = () => {
+        menuHost.hidden = true;
+        picker.__patchworkSetExpanded?.(false);
+      };
+      const openMenu = () => {
+        const bounds = picker.getBoundingClientRect();
+        const menuHeight = 338;
+        const below = bounds.bottom + 6;
+        const above = bounds.top - menuHeight - 6;
+        menuHost.style.left = Math.max(8, Math.min(bounds.left, innerWidth - 268)) + 'px';
+        menuHost.style.top = (below + menuHeight <= innerHeight - 8 ? below : Math.max(8, above)) + 'px';
+        renderMenu();
+        menuHost.hidden = false;
+        picker.__patchworkSetExpanded?.(true);
+      };
+      menu.querySelectorAll('[data-choice]').forEach((option) => option.addEventListener('click', () => {
+        const [kind, value] = option.getAttribute('data-choice').split(':');
+        if (kind === 'model') selected.model = value;
+        else selected.reasoningMode = value;
+        renderPicker();
+        renderMenu();
+        closeMenu();
+        persistSelection();
+      }));
+      picker.__patchworkToggleMenu = () => menuHost.hidden ? openMenu() : closeMenu();
+      picker.__patchworkCloseMenu = closeMenu;
+      document.body.append(menuHost);
+      return menuHost;
     };
 
-    const selectedModel = await choose(modelTarget, ['Models', 'More models', 'Legacy models']);
-    if (!selectedModel.ok) return { ok: false, kind: 'model', target: modelTarget?.label, ...selectedModel };
-    const selectedReasoning = await choose(reasoningTarget, ['Reasoning', 'Thinking effort', 'Effort', 'Configure']);
-    if (!selectedReasoning.ok) return { ok: false, kind: 'reasoning', target: reasoningTarget?.label, ...selectedReasoning };
-    return { ok: true, model: selectedModel.selected, reasoning: selectedReasoning.selected };
+    const positionPicker = (picker, nativePicker = null) => {
+      const bounds = nativePicker?.getBoundingClientRect();
+      if (bounds && bounds.width > 0 && bounds.height > 0) {
+        globalThis.__patchworkOwnedModelPickerBounds = {
+          left: bounds.left,
+          top: bounds.top,
+          height: bounds.height,
+        };
+      }
+      const saved = globalThis.__patchworkOwnedModelPickerBounds;
+      picker.style.left = Math.max(8, saved?.left ?? 48) + 'px';
+      picker.style.top = Math.max(4, saved?.top ?? 8) + 'px';
+      if (saved?.height > 0) picker.style.minHeight = saved.height + 'px';
+    };
+
+    const resizeLayoutSlot = (picker) => {
+      const slot = document.getElementById(slotId);
+      if (!slot) return;
+      const pickerBounds = picker.getBoundingClientRect();
+      const width = Math.ceil(Math.max(Number(slot.dataset.nativeWidth || 0), pickerBounds.width));
+      const height = Math.ceil(Math.max(Number(slot.dataset.nativeHeight || 0), pickerBounds.height));
+      slot.style.cssText = 'display:inline-block;flex:0 0 ' + width + 'px;width:' + width
+        + 'px;min-width:' + width + 'px;height:' + height
+        + 'px;visibility:hidden;pointer-events:none;vertical-align:middle;';
+    };
+
+    const createPicker = (nativePicker = null) => {
+      const picker = document.createElement('patchwork-model-selector');
+      picker.id = pickerId;
+      picker.setAttribute('data-task-id', String(taskId || ''));
+      picker.style.cssText = 'display:inline-flex;position:fixed;z-index:2147483646;align-items:center;min-width:0;vertical-align:middle;';
+      positionPicker(picker, nativePicker);
+      const shadow = picker.attachShadow({ mode: 'closed' });
+      shadow.innerHTML = [
+        '<style>',
+        ':host{display:inline-flex;align-items:center;color:var(--text-primary,#f4f4f4);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+        'button{display:inline-flex;min-height:32px;align-items:center;gap:4px;padding:0 8px;border:0;border-radius:8px;color:inherit;background:transparent;font:400 14px/20px inherit;white-space:nowrap;cursor:pointer}',
+        'button:hover,button[aria-expanded="true"]{background:var(--surface-hover,var(--main-surface-secondary,rgba(255,255,255,.08)))}',
+        '.chevron{width:16px;height:16px;transition:transform .15s}',
+        'button[aria-expanded="true"] .chevron{transform:rotate(180deg)}',
+        '</style>',
+        '<button type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Patchwork model selector"><span class="label"></span><svg class="chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>',
+      ].join('');
+      const button = shadow.querySelector('button');
+      const renderPicker = () => {
+        picker.setAttribute('data-model', selected.model);
+        picker.setAttribute('data-reasoning-mode', selected.reasoningMode);
+        shadow.querySelector('.label').textContent = displayLabel();
+        requestAnimationFrame(() => resizeLayoutSlot(picker));
+      };
+      picker.__patchworkSetExpanded = (expanded) => button.setAttribute('aria-expanded', String(expanded));
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        picker.__patchworkToggleMenu?.();
+      });
+      renderPicker();
+      createMenu(picker, renderPicker);
+      return picker;
+    };
+
+    const replaceNativePickers = () => {
+      let picker = document.getElementById(pickerId);
+      const labelMatchedPickers = [...document.querySelectorAll('button, [role="button"]')]
+        .filter((candidate) => {
+          const bounds = candidate.getBoundingClientRect();
+          const labels = [candidate.textContent, ...candidate.querySelectorAll(':scope > span')]
+            .map((value) => String(value?.textContent ?? value ?? '').replace(/\\s+/g, ' ').trim());
+          return bounds.width > 0 && bounds.width <= 360
+            && bounds.height > 0 && bounds.height <= 64
+            && labels.some((label) => nativePickerLabel.test(label));
+        });
+      const nativePickers = [...new Set([
+        ...document.querySelectorAll(nativePickerSelector),
+        ...labelMatchedPickers,
+      ]
+        .map((anchor) => anchor.closest('button, [role="button"], [aria-haspopup="menu"]') || anchor))]
+        .filter((candidate) => !candidate.closest('patchwork-model-selector'));
+      const visible = nativePickers.find((candidate) => {
+        const bounds = candidate.getBoundingClientRect();
+        return bounds.width > 0 && bounds.height > 0;
+      }) || null;
+      if (!picker) {
+        picker = createPicker(visible);
+        document.body.append(picker);
+        persistSelection();
+      } else if (visible) positionPicker(picker, visible);
+      for (const nativePicker of nativePickers) {
+        if (!nativePicker.isConnected) continue;
+        if (nativePicker === visible) {
+          let slot = document.getElementById(slotId);
+          if (slot && slot.parentElement !== nativePicker.parentElement) {
+            slot.remove();
+            slot = null;
+          }
+          const nativeBounds = nativePicker.getBoundingClientRect();
+          if (!slot) {
+            slot = document.createElement('patchwork-model-selector-slot');
+            slot.id = slotId;
+            nativePicker.replaceWith(slot);
+          } else {
+            nativePicker.remove();
+          }
+          slot.dataset.nativeWidth = String(nativeBounds.width);
+          slot.dataset.nativeHeight = String(nativeBounds.height);
+          resizeLayoutSlot(picker);
+        } else {
+          nativePicker.remove();
+        }
+      }
+      return picker;
+    };
+
+    globalThis.__patchworkModelPickerObserver?.disconnect();
+    const picker = replaceNativePickers();
+    let observerPending = false;
+    const observer = new MutationObserver(() => {
+      if (observerPending) return;
+      observerPending = true;
+      queueMicrotask(() => {
+        observerPending = false;
+        replaceNativePickers();
+      });
+    });
+    if (document.body) observer.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['aria-label', 'data-testid', 'role', 'style'],
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+    globalThis.__patchworkModelPickerObserver = observer;
+    clearInterval(globalThis.__patchworkNativeModelPickerGuard);
+    globalThis.__patchworkNativeModelPickerGuard = setInterval(replaceNativePickers, 400);
+
+    if (globalThis.__patchworkPickerOutsideHandler) {
+      document.removeEventListener('pointerdown', globalThis.__patchworkPickerOutsideHandler, true);
+    }
+    globalThis.__patchworkPickerOutsideHandler = (event) => {
+      const currentPicker = document.getElementById(pickerId);
+      const currentMenu = document.getElementById(menuId);
+      if (event.target !== currentPicker && event.target !== currentMenu) currentPicker?.__patchworkCloseMenu?.();
+    };
+    document.addEventListener('pointerdown', globalThis.__patchworkPickerOutsideHandler, true);
+
+    return {
+      ok: true,
+      pickerInstalled: Boolean(picker),
+      reason: picker ? null : 'model-picker-anchor-not-found',
+      identity: picker?.tagName || null,
+      model: ${JSON.stringify(requestConfiguration.modelSlug)},
+      thinkingEffort: ${JSON.stringify(requestConfiguration.thinkingEffort)},
+    };
   })()`;
 }
 
@@ -373,6 +589,7 @@ class ChatGPTView {
     this.monitorBusy = false;
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
+    this.configurationPickerTimer = null;
     this.visible = false;
     this.view = new WebContentsView({
       webPreferences: {
@@ -391,7 +608,10 @@ class ChatGPTView {
     this.installMergeDownloadListener();
     this.resultMonitor = setInterval(() => this.monitorPage().catch(() => {}), 1_500);
     this.resultMonitor.unref?.();
-    this.mainWindow.once('closed', () => clearInterval(this.resultMonitor));
+    this.mainWindow.once('closed', () => {
+      clearInterval(this.resultMonitor);
+      clearTimeout(this.configurationPickerTimer);
+    });
     this.view.webContents.loadURL(
       this.activeMerge?.mergeConversationUrl || this.activeTask?.conversationUrl || CHATGPT_URL,
     );
@@ -420,10 +640,20 @@ class ChatGPTView {
     contents.on('did-stop-loading', () => {
       this.onEvent({ type: 'browser-loading', loading: false, url: contents.getURL() });
       this.installResultWatcher();
+      this.scheduleTaskConfigurationPicker();
     });
-    contents.on('dom-ready', () => this.installResultWatcher());
-    contents.on('did-navigate', (_event, url) => this.handleNavigation(url));
-    contents.on('did-navigate-in-page', (_event, url) => this.handleNavigation(url));
+    contents.on('dom-ready', () => {
+      this.installResultWatcher();
+      this.scheduleTaskConfigurationPicker();
+    });
+    contents.on('did-navigate', (_event, url) => {
+      this.handleNavigation(url);
+      this.scheduleTaskConfigurationPicker();
+    });
+    contents.on('did-navigate-in-page', (_event, url) => {
+      this.handleNavigation(url);
+      this.scheduleTaskConfigurationPicker();
+    });
     contents.on('page-title-updated', (_event, title) => this.onEvent({ type: 'browser-title', title }));
     contents.on('render-process-gone', (_event, details) => {
       this.onEvent({ type: 'task-failed', message: `The embedded ChatGPT renderer stopped: ${details.reason}` });
@@ -744,23 +974,174 @@ class ChatGPTView {
   async configureTaskModel(task) {
     const model = String(task?.model || 'default').toLowerCase();
     const reasoningMode = String(task?.reasoningMode || 'default').toLowerCase();
-    if (model === 'default' && reasoningMode === 'default') return true;
     const modelOption = TASK_MODEL_PICKER_OPTIONS[model];
     const reasoningOption = TASK_REASONING_PICKER_OPTIONS[reasoningMode];
     if (model !== 'default' && !modelOption) throw new Error(`Unsupported task model: ${task.model}`);
     if (reasoningMode !== 'default' && !reasoningOption) {
       throw new Error(`Unsupported task reasoning mode: ${task.reasoningMode}`);
     }
-    const result = await this.view.webContents.executeJavaScript(
-      buildTaskConfigurationScript(model, reasoningMode),
-      true,
-    ).catch(() => ({ ok: false, reason: 'picker-script-failed' }));
-    if (!result?.ok) {
-      const requested = result?.target || modelOption?.label || reasoningOption?.label || 'requested task configuration';
-      const available = result?.available?.length ? ` Available options: ${result.available.join(', ')}.` : '';
-      throw new Error(`Could not select ${requested} in ChatGPT before submission.${available}`);
+    let result = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      result = await this.view.webContents.executeJavaScript(
+        buildTaskConfigurationScript(model, reasoningMode, task?.taskId || null),
+        true,
+      ).catch((error) => ({ ok: false, reason: error.message || 'picker-script-failed' }));
+      if (!result?.ok) {
+        throw new Error(`Could not install Patchwork’s model selector: ${result?.reason || 'the replacement script failed'}`);
+      }
+      if (result.pickerInstalled) return true;
+      await delay(200);
     }
-    return true;
+    const requested = modelOption?.label || reasoningOption?.label || 'the requested task configuration';
+    throw new Error(`Could not replace ChatGPT’s model selector with Patchwork’s selector for ${requested}.`);
+  }
+
+  scheduleTaskConfigurationPicker(delayMilliseconds = 180) {
+    clearTimeout(this.configurationPickerTimer);
+    this.configurationPickerTimer = setTimeout(async () => {
+      const task = this.activeTask;
+      if (!task || this.view.webContents.isDestroyed()) return;
+      const composerReady = await this.waitForComposer(10_000);
+      if (!composerReady || this.activeTask?.taskId !== task.taskId) return;
+      await this.configureTaskModel(task).catch(() => {});
+    }, delayMilliseconds);
+    this.configurationPickerTimer.unref?.();
+  }
+
+  async beginTaskRequestEnforcement(task) {
+    const debuggerApi = this.view.webContents.debugger;
+    let attachedHere = false;
+    let fetchEnabled = false;
+    let disposed = false;
+    let completed = false;
+    let resolveResult;
+    const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+    const complete = (result) => {
+      if (completed) return;
+      completed = true;
+      resolveResult(result);
+    };
+    const readConfiguration = async () => {
+      const selected = await this.view.webContents.executeJavaScript(
+        `(() => {
+          const picker = document.querySelector('patchwork-model-selector#patchwork-task-model-selector');
+          if (!picker) return null;
+          return {
+            model: picker.getAttribute('data-model'),
+            reasoningMode: picker.getAttribute('data-reasoning-mode'),
+          };
+        })()`,
+        true,
+      ).catch(() => null);
+      return {
+        ...taskRequestConfiguration(
+        selected?.model || task?.model || 'default',
+        selected?.reasoningMode || task?.reasoningMode || 'default',
+        ),
+        selectionSource: selected ? 'patchwork-selector' : 'saved-task',
+      };
+    };
+    const continueUnmodified = async (requestId) => {
+      await debuggerApi.sendCommand('Fetch.continueRequest', { requestId }).catch(() => {});
+    };
+    const handlePausedRequest = async (params) => {
+      const requestId = params?.requestId;
+      const request = params?.request || {};
+      if (!requestId) return;
+      let pathname = '';
+      try {
+        pathname = new URL(request.url).pathname;
+      } catch {
+        await continueUnmodified(requestId);
+        return;
+      }
+      const isConversation = request.method === 'POST'
+        && pathname === '/backend-api/f/conversation';
+      const isPrepare = request.method === 'POST'
+        && pathname === '/backend-api/f/conversation/prepare';
+      if (!isConversation && !isPrepare) {
+        await continueUnmodified(requestId);
+        return;
+      }
+      try {
+        const configuration = await readConfiguration();
+        let postData = request.postData;
+        if (typeof postData !== 'string' && request.postDataEntries?.length === 1) {
+          postData = Buffer.from(request.postDataEntries[0].bytes, 'base64').toString('utf8');
+        }
+        if (typeof postData !== 'string' && params.networkId) {
+          const body = await debuggerApi.sendCommand('Network.getRequestPostData', {
+            requestId: params.networkId,
+          });
+          postData = body?.postData;
+        }
+        const rewritten = rewriteConversationRequestBody(postData, configuration);
+        await debuggerApi.sendCommand('Fetch.continueRequest', {
+          requestId,
+          postData: Buffer.from(rewritten.text, 'utf8').toString('base64'),
+        });
+        if (isConversation) {
+          complete({
+            ok: true,
+            model: rewritten.model,
+            thinkingEffort: rewritten.thinkingEffort,
+            selectedModel: configuration.model,
+            selectedReasoningMode: configuration.reasoningMode,
+            selectionSource: configuration.selectionSource,
+          });
+        }
+      } catch (error) {
+        await continueUnmodified(requestId);
+        if (isConversation) complete({ ok: false, error: error.message });
+      }
+    };
+    const onDebuggerMessage = (_event, method, params) => {
+      if (method === 'Fetch.requestPaused') handlePausedRequest(params).catch((error) => {
+        complete({ ok: false, error: error.message });
+      });
+    };
+
+    try {
+      if (!debuggerApi.isAttached()) {
+        debuggerApi.attach('1.3');
+        attachedHere = true;
+      }
+      debuggerApi.on('message', onDebuggerMessage);
+      await debuggerApi.sendCommand('Fetch.enable', {
+        patterns: [{
+          urlPattern: 'https://chatgpt.com/backend-api/f/conversation*',
+          requestStage: 'Request',
+        }],
+      });
+      fetchEnabled = true;
+    } catch (error) {
+      debuggerApi.removeListener?.('message', onDebuggerMessage);
+      if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
+      throw new Error(`Could not verify ChatGPT’s outgoing model request: ${error.message}`);
+    }
+
+    return {
+      wait: async (timeoutMilliseconds = TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS) => {
+        const result = await Promise.race([
+          resultPromise,
+          delay(timeoutMilliseconds).then(() => ({
+            ok: false,
+            error: 'ChatGPT did not send a conversation request after Send.',
+          })),
+        ]);
+        if (!result.ok) throw new Error(result.error || 'Could not verify ChatGPT’s outgoing model request.');
+        return result;
+      },
+      dispose: async () => {
+        if (disposed) return;
+        disposed = true;
+        debuggerApi.removeListener?.('message', onDebuggerMessage);
+        if (fetchEnabled && debuggerApi.isAttached()) {
+          await debuggerApi.sendCommand('Fetch.disable').catch(() => {});
+        }
+        if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
+      },
+    };
   }
 
   async injectPrompt(prompt) {
@@ -996,11 +1377,23 @@ class ChatGPTView {
       });
       throw new Error('ChatGPT is not ready. Sign in inside the embedded browser and retry.');
     }
-    await ChatGPTView.prototype.configureTaskModel.call(this, task);
-    await this.injectPrompt(task.handoffPrompt);
-    await this.uploadPackage(task.packagePath);
-    await ChatGPTView.prototype.uploadAttachments.call(this, task.attachments);
-    await this.clickSend();
+    await this.configureTaskModel(task);
+    const requestEnforcement = await this.beginTaskRequestEnforcement(task);
+    let verifiedRequest;
+    try {
+      await this.injectPrompt(task.handoffPrompt);
+      await this.uploadPackage(task.packagePath);
+      await ChatGPTView.prototype.uploadAttachments.call(this, task.attachments);
+      await this.clickSend();
+      verifiedRequest = await requestEnforcement.wait();
+    } finally {
+      await requestEnforcement.dispose();
+    }
+    await this.onEvent({
+      type: 'task-request-verified',
+      taskId: task.taskId,
+      message: `Verified ChatGPT request from ${verifiedRequest.selectionSource === 'patchwork-selector' ? 'Patchwork’s selector' : 'the saved task'}: ${verifiedRequest.model}${verifiedRequest.thinkingEffort ? ` · ${verifiedRequest.thinkingEffort}` : ''}.`,
+    });
     const conversationUrl = await this.waitForConversationUrl();
     if (!conversationUrl) {
       await this.onEvent({
@@ -1014,6 +1407,8 @@ class ChatGPTView {
       state: 'submitted',
       submittedAt: new Date().toISOString(),
       conversationUrl,
+      model: verifiedRequest.selectedModel || task.model,
+      reasoningMode: verifiedRequest.selectedReasoningMode || task.reasoningMode,
     });
     this.activeTask = submittedTask;
     this.knownTasks.set(task.taskId.toLowerCase(), submittedTask);
@@ -1198,6 +1593,8 @@ module.exports = {
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
   recoverUnconfirmedSubmissions,
+  rewriteConversationRequestBody,
+  taskRequestConfiguration,
   mergeTreeId,
   resultTaskId,
 };

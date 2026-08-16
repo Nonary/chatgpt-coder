@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -15,6 +16,8 @@ const {
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
   recoverUnconfirmedSubmissions,
+  rewriteConversationRequestBody,
+  taskRequestConfiguration,
   mergeTreeId,
   resultTaskId,
 } = require('../src/main/chatgpt-view');
@@ -1014,11 +1017,126 @@ test('ChatGPT task submission only accepts real conversation URLs', () => {
   assert.equal(isChatGPTConversationUrl('https://example.com/c/abc123'), false);
 });
 
-test('task configuration maps Luna to Thinking Mini and supports Extra High reasoning', () => {
-  const script = buildTaskConfigurationScript('luna', 'extra-high');
-  assert.match(script, /Thinking Mini/);
+test('task configuration installs an owned Luna picker outside React and suppresses native controls', () => {
+  const script = buildTaskConfigurationScript('luna', 'extra-high', 'task-123');
   assert.match(script, /GPT-5\.6 Luna/);
+  assert.match(script, /gpt-5-6-t-mini/);
+  assert.match(script, /thinkingEffort: "max"/);
+  assert.match(script, /patchwork-model-selector/);
+  assert.match(script, /patchwork-task-model-selector/);
+  assert.match(script, /patchwork-task-model-selector-slot/);
+  assert.match(script, /document\.body\.append\(picker\)/);
+  assert.match(script, /nativePicker\.remove\(\)/);
+  assert.match(script, /patchwork-native-model-selector-suppression/);
+  assert.match(script, /user_last_used_model_config\?model_slug=/);
+  assert.match(script, /method: 'PATCH'/);
+  assert.match(script, /model-switcher-dropdown/);
+  assert.match(script, /Model selector/);
+  assert.match(script, /--vt-thread-model-switcher/);
+  assert.match(script, /anchor\.closest\('button, \[role="button"\], \[aria-haspopup="menu"\]'\)/);
+  assert.doesNotMatch(script, /button\[style\*="--vt-thread-model-switcher"\]/);
+  assert.match(script, /MutationObserver/);
+  assert.match(script, /attributeFilter: \['aria-label', 'data-testid', 'role', 'style'\]/);
+  assert.match(script, /candidate\.querySelectorAll\(':scope > span'\)/);
+  assert.match(script, /nativePicker\.replaceWith\(slot\)/);
+  assert.match(script, /flex:0 0/);
+  assert.match(script, /compactModelLabel/);
+  assert.match(script, /characterData: true/);
+  assert.doesNotMatch(script, /bounds\.top < 96/);
+  assert.match(script, /attachShadow/);
+  assert.match(script, /aria-expanded/);
+  assert.match(script, /data-reasoning-mode/);
+  assert.match(script, /model-picker-anchor-not-found/);
+  assert.match(script, /__patchworkOwnedModelSelection/);
+  assert.match(script, /task-123/);
   assert.match(script, /Extra High/);
+  assert.doesNotMatch(script, /GPT-5\.6 Terra/);
+});
+
+test('ChatGPT request configuration uses HAR-confirmed Sol and Luna slugs', () => {
+  assert.deepEqual(taskRequestConfiguration('default', 'default'), {
+    model: 'default',
+    reasoningMode: 'default',
+    modelSlug: 'gpt-5-6',
+    thinkingEffort: null,
+  });
+  assert.equal(taskRequestConfiguration('sol', 'instant').modelSlug, 'gpt-5-6-instant');
+  assert.deepEqual(taskRequestConfiguration('sol', 'high'), {
+    model: 'sol',
+    reasoningMode: 'high',
+    modelSlug: 'gpt-5-6-thinking',
+    thinkingEffort: 'extended',
+  });
+  assert.deepEqual(taskRequestConfiguration('luna', 'extra-high'), {
+    model: 'luna',
+    reasoningMode: 'extra-high',
+    modelSlug: 'gpt-5-6-t-mini',
+    thinkingEffort: 'max',
+  });
+  assert.throws(() => taskRequestConfiguration('terra', 'medium'), /unsupported chatgpt model/i);
+});
+
+test('conversation payload rewriting enforces the selected model and thinking effort', () => {
+  const rewritten = rewriteConversationRequestBody(JSON.stringify({
+    action: 'next',
+    model: 'gpt-5-6',
+    messages: [],
+  }), taskRequestConfiguration('luna', 'high'));
+  const payload = JSON.parse(rewritten.text);
+  assert.equal(payload.model, 'gpt-5-6-t-mini');
+  assert.equal(payload.thinking_effort, 'extended');
+  assert.equal(rewritten.model, 'gpt-5-6-t-mini');
+  assert.equal(rewritten.thinkingEffort, 'extended');
+});
+
+test('task request enforcement observes and rewrites ChatGPT’s actual conversation request', async () => {
+  const commands = [];
+  let attached = false;
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => attached;
+  debuggerApi.attach = () => { attached = true; };
+  debuggerApi.detach = () => { attached = false; };
+  debuggerApi.sendCommand = async (command, params) => {
+    commands.push({ command, params });
+    return {};
+  };
+  const view = {
+    view: {
+      webContents: {
+        debugger: debuggerApi,
+        executeJavaScript: async () => ({ model: 'luna', reasoningMode: 'high' }),
+      },
+    },
+  };
+  const enforcement = await ChatGPTView.prototype.beginTaskRequestEnforcement.call(view, {
+    model: 'sol',
+    reasoningMode: 'instant',
+  });
+  debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
+    requestId: 'request-1',
+    request: {
+      method: 'POST',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+      postData: JSON.stringify({ action: 'next', model: 'gpt-5-6' }),
+    },
+  });
+  const verified = await enforcement.wait(500);
+  await enforcement.dispose();
+  const continued = commands.find((item) => item.command === 'Fetch.continueRequest');
+  const payload = JSON.parse(Buffer.from(continued.params.postData, 'base64').toString('utf8'));
+  assert.deepEqual(verified, {
+    ok: true,
+    model: 'gpt-5-6-t-mini',
+    thinkingEffort: 'extended',
+    selectedModel: 'luna',
+    selectedReasoningMode: 'high',
+    selectionSource: 'patchwork-selector',
+  });
+  assert.equal(payload.model, 'gpt-5-6-t-mini');
+  assert.equal(payload.thinking_effort, 'extended');
+  assert.equal(commands[0].command, 'Fetch.enable');
+  assert.equal(commands.at(-1).command, 'Fetch.disable');
+  assert.equal(attached, false);
 });
 
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {
@@ -1059,6 +1177,11 @@ test('task submit does not report success until a ChatGPT conversation exists', 
     },
     onEvent: async (event) => events.push(event),
     waitForComposer: async () => true,
+    configureTaskModel: async () => {},
+    beginTaskRequestEnforcement: async () => ({
+      wait: async () => ({ model: 'gpt-5-6', thinkingEffort: null }),
+      dispose: async () => {},
+    }),
     injectPrompt: async () => {},
     uploadPackage: async () => {},
     clickSend: async () => true,
@@ -1090,6 +1213,11 @@ test('task submit persists the confirmed ChatGPT conversation with submitted sta
     },
     onEvent: async () => {},
     waitForComposer: async () => true,
+    configureTaskModel: async () => {},
+    beginTaskRequestEnforcement: async () => ({
+      wait: async () => ({ model: 'gpt-5-6', thinkingEffort: null }),
+      dispose: async () => {},
+    }),
     injectPrompt: async () => {},
     uploadPackage: async () => {},
     clickSend: async () => true,
@@ -1117,19 +1245,22 @@ test('task submit selects the requested model and reasoning before injecting the
     activeMerge: null,
     activeTask: null,
     knownTasks: new Map(),
-    view: {
-      webContents: {
-        executeJavaScript: async () => {
-          steps.push('configure');
-          return { ok: true };
-        },
-      },
-    },
+    configureTaskModel: async () => steps.push('configure'),
     taskService: {
       updateTask: async (_taskId, next) => ({ ...task, ...next }),
     },
     onEvent: async () => {},
     waitForComposer: async () => true,
+    beginTaskRequestEnforcement: async () => {
+      steps.push('enforce');
+      return {
+        wait: async () => {
+          steps.push('verify');
+          return { model: 'gpt-5-6-t-mini', thinkingEffort: 'extended' };
+        },
+        dispose: async () => {},
+      };
+    },
     injectPrompt: async () => steps.push('prompt'),
     uploadPackage: async () => steps.push('package'),
     clickSend: async () => {
@@ -1141,7 +1272,7 @@ test('task submit selects the requested model and reasoning before injecting the
   };
 
   await ChatGPTView.prototype.submit.call(view, task);
-  assert.deepEqual(steps.slice(0, 4), ['configure', 'prompt', 'package', 'send']);
+  assert.deepEqual(steps, ['configure', 'enforce', 'prompt', 'package', 'send', 'verify']);
 });
 
 test('task upload selects the composer file input and dispatches its change event', async () => {
