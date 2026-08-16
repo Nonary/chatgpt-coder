@@ -652,6 +652,22 @@ test('existing Git worktrees are discovered from workspace repositories', async 
   assert.equal((await trees.list()).length, 0);
 });
 
+test('creating a task tree with the same repository and name reuses the existing tree', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-reused-tree-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const trees = new WorktreeService(path.join(root, 'data'));
+
+  const first = await trees.create(repositoryPath, 'Polish');
+  const reused = await trees.create(repositoryPath, '  polish  ');
+
+  assert.equal(reused.id, first.id);
+  assert.equal(reused.path, first.path);
+  assert.equal((await trees.readRecords()).length, 1);
+  const { stdout } = await runGit(repositoryPath, ['worktree', 'list', '--porcelain']);
+  assert.equal((stdout.match(/^worktree /gm) || []).length, 2);
+});
+
 test('Git porcelain worktree records parse paths and branches', () => {
   const parsed = parseWorktreeList([
     'worktree /repo', 'HEAD a'.padEnd(45, 'a'), 'branch refs/heads/main', '',

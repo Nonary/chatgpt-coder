@@ -194,6 +194,22 @@ class WorktreeService {
     const id = crypto.randomUUID();
     const name = String(requestedName || '').trim() || `Task ${id.slice(0, 8)}`;
     if (name.length > 80) throw new Error('Coding tree names must be 80 characters or fewer.');
+    const normalizedName = name.toLocaleLowerCase();
+    const records = await this.readRecords();
+    for (const record of records) {
+      const recordedRepositoryPath = await fs.realpath(record.repositoryPath)
+        .catch(() => path.resolve(record.repositoryPath));
+      if (recordedRepositoryPath !== repository.path
+        || String(record.name || '').trim().toLocaleLowerCase() !== normalizedName) continue;
+      const existing = await this.inspect(record);
+      if (!existing.available) {
+        throw new Error(`The existing coding tree “${record.name}” is unavailable: ${existing.error}`);
+      }
+      if (!existing.clean) {
+        throw new Error(`The existing coding tree “${record.name}” has uncommitted changes. Commit them before adding a follow-up task.`);
+      }
+      return existing;
+    }
     const branch = `patchwork/${slugify(name).slice(0, 42)}-${id.slice(0, 8)}`;
     const treePath = path.join(this.worktreesRoot, id);
     await runGit(repository.path, ['worktree', 'add', '-b', branch, treePath, repository.baseCommit]);
@@ -217,7 +233,6 @@ class WorktreeService {
       managed: true,
       discovered: false,
     };
-    const records = await this.readRecords();
     records.push(tree);
     await this.writeRecords(records);
     await this.onEvent({ type: 'tree-created', tree, message: `Created coding tree ${name}.` });
