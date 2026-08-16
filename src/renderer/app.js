@@ -2,6 +2,7 @@ const state = {
   repositories: [],
   workspaceRepositories: [],
   tasks: [],
+  trees: [],
   activeTask: null,
   activity: [],
   gitStatus: null,
@@ -13,7 +14,9 @@ const elements = Object.fromEntries(
   [
     'new-task-button', 'chatgpt-session-button', 'task-list', 'page-title',
     'composer-view', 'task-view', 'session-view', 'source-view',
+    'trees-view', 'trees-button', 'tree-count', 'trees-list', 'trees-new-task',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
+    'task-tree-select', 'new-tree-fields', 'tree-name',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'result-card', 'result-summary', 'patch-list',
@@ -68,9 +71,21 @@ function addActivity(message, timestamp = new Date()) {
 
 function renderRepositories() {
   const container = elements['repository-list'];
+  const selectedTree = state.trees.find((tree) => tree.id === elements['task-tree-select'].value);
+  elements['add-repository-button'].disabled = Boolean(selectedTree);
+  if (selectedTree) {
+    container.className = 'repository-list';
+    container.innerHTML = `<div class="repository-row">
+      <div class="repo-icon">${escapeHtml(selectedTree.repositoryName[0]?.toUpperCase() || 'G')}</div>
+      <div class="repo-info"><strong>${escapeHtml(selectedTree.repositoryName)}</strong><span>${escapeHtml(selectedTree.path)}</span></div>
+      <div class="repo-meta">${escapeHtml(selectedTree.branch)}</div>
+      <div class="repo-state">Attached tree</div>
+    </div>`;
+    return;
+  }
   if (state.repositories.length === 0) {
     container.className = 'repository-list empty-state';
-    container.innerHTML = '<div class="empty-icon">⌘</div><strong>No repositories selected</strong><span>Add one or more Git repositories to begin.</span>';
+    container.innerHTML = '<div class="empty-icon">⌘</div><strong>No repository selected</strong><span>Add one Git repository to begin.</span>';
     return;
   }
   container.className = 'repository-list';
@@ -79,7 +94,7 @@ function renderRepositories() {
       <div class="repo-icon">${escapeHtml(repository.name[0]?.toUpperCase() || 'G')}</div>
       <div class="repo-info"><strong>${escapeHtml(repository.name)}</strong><span>${escapeHtml(repository.path)}</span></div>
       <div class="repo-meta">${escapeHtml(repository.branch)} · ${repository.hasHead ? escapeHtml(shortCommit(repository.baseCommit)) : 'No commits'}</div>
-      <div class="repo-state ${repository.isClean ? '' : 'dirty'}">${repository.isClean ? 'Clean' : 'Snapshot needed'}</div>
+      <div class="repo-state ${repository.isClean ? '' : 'dirty'}">${repository.isClean ? 'Ready' : 'Commit or stash'}</div>
       <button class="remove-repo" data-repository-id="${escapeHtml(repository.id)}" aria-label="Remove ${escapeHtml(repository.name)}">×</button>
     </div>`).join('');
   container.querySelectorAll('.remove-repo').forEach((button) => {
@@ -88,6 +103,94 @@ function renderRepositories() {
       renderRepositories();
     });
   });
+}
+
+function renderTaskTreeOptions() {
+  const select = elements['task-tree-select'];
+  const previous = select.value;
+  select.innerHTML = '<option value="">Create a new coding tree</option>' + state.trees
+    .filter((tree) => tree.available && tree.mergeState !== 'submitted')
+    .map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}</option>`)
+    .join('');
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  const existing = Boolean(select.value);
+  elements['new-tree-fields'].classList.toggle('hidden', existing);
+  elements['tree-name'].disabled = existing;
+  renderRepositories();
+}
+
+function renderTrees() {
+  elements['tree-count'].textContent = String(state.trees.length);
+  elements['tree-count'].classList.toggle('hidden', state.trees.length === 0);
+  const container = elements['trees-list'];
+  if (state.trees.length === 0) {
+    container.className = 'trees-list empty-state';
+    container.innerHTML = '<div class="empty-icon">⑃</div><strong>No coding trees yet</strong><span>Start a task to create an isolated workstream.</span>';
+    renderTaskTreeOptions();
+    return;
+  }
+  container.className = 'trees-list';
+  container.innerHTML = state.trees.map((tree) => `<article class="tree-card">
+    <div class="tree-card-heading">
+      <div class="repo-icon">${escapeHtml(tree.repositoryName[0]?.toUpperCase() || 'T')}</div>
+      <div><strong>${escapeHtml(tree.name)}</strong><small>${escapeHtml(tree.branch)}</small></div>
+      <span class="tree-state ${tree.clean && tree.mergeState !== 'failed' ? '' : 'dirty'}">${tree.available ? (tree.mergeState === 'submitted' ? 'Merging' : tree.mergeState === 'failed' ? 'Merge failed' : tree.clean ? 'Clean' : 'Changes') : 'Missing'}</span>
+    </div>
+    <div class="tree-stats">
+      <div class="tree-stat"><strong>${escapeHtml(tree.commitCount || 0)}</strong><small>Tree commits</small></div>
+      <div class="tree-stat"><strong>${escapeHtml((tree.taskIds || []).length)}</strong><small>Tasks</small></div>
+    </div>
+    <div class="tree-last">${tree.lastSubject ? `${escapeHtml(tree.lastCommit)} · ${escapeHtml(tree.lastSubject)}` : 'No task commits yet.'}</div>
+    <div class="tree-actions">
+      <button class="primary tree-continue" data-tree-id="${escapeHtml(tree.id)}" ${!tree.available || tree.mergeState === 'submitted' ? 'disabled' : ''}>Continue task</button>
+      <button class="secondary tree-source" data-tree-id="${escapeHtml(tree.id)}" ${!tree.available ? 'disabled' : ''}>Source control</button>
+      <button class="secondary tree-merge" data-tree-id="${escapeHtml(tree.id)}" ${!tree.available || !tree.clean || !tree.commitCount || tree.mergeState === 'submitted' ? 'disabled' : ''}>Merge tree</button>
+      <button class="secondary tree-reveal" data-tree-id="${escapeHtml(tree.id)}">Reveal</button>
+      <button class="danger tree-remove" data-tree-id="${escapeHtml(tree.id)}">Discard</button>
+    </div>
+  </article>`).join('');
+  container.querySelectorAll('.tree-continue').forEach((button) => button.addEventListener('click', () => {
+    showComposer();
+    elements['task-tree-select'].value = button.dataset.treeId;
+    renderTaskTreeOptions();
+    elements['task-text'].focus();
+  }));
+  container.querySelectorAll('.tree-source').forEach((button) => button.addEventListener('click', async () => {
+    const tree = state.trees.find((item) => item.id === button.dataset.treeId);
+    if (!tree) return;
+    if (!state.workspaceRepositories.some((item) => item.path === tree.path)) {
+      state.workspaceRepositories.push({ name: tree.name, path: tree.path, branch: tree.branch });
+    }
+    state.selectedGitPath = tree.path;
+    await showSourceControl();
+  }));
+  container.querySelectorAll('.tree-merge').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      await window.patchwork.mergeTree(button.dataset.treeId);
+      showSession();
+      showToast('Fresh ChatGPT chat opened to prepare the squash commit.');
+      await refreshTrees();
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }));
+  container.querySelectorAll('.tree-reveal').forEach((button) => button.addEventListener('click', () => (
+    window.patchwork.revealTree(button.dataset.treeId).catch((error) => showToast(error.message, true))
+  )));
+  container.querySelectorAll('.tree-remove').forEach((button) => button.addEventListener('click', async () => {
+    try {
+      state.trees = await window.patchwork.removeTree(button.dataset.treeId);
+      renderTrees();
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  }));
+  renderTaskTreeOptions();
+}
+
+async function refreshTrees() {
+  state.trees = await window.patchwork.listTrees();
+  renderTrees();
 }
 
 function taskLabel(task) {
@@ -117,9 +220,9 @@ function renderTaskList() {
 const statusText = {
   prepared: ['Package prepared', 'Attach the package in ChatGPT and send the copied instructions.'],
   submitted: ['Task submitted', 'ChatGPT is working in the embedded browser. Patchwork is watching for the result.'],
-  ready: ['Patch validated', 'The downloaded result matches the task and is safe to apply.'],
-  applied: ['Changes applied', 'The validated patch is now present in your local repositories.'],
-  'rolled-back': ['Changes rolled back', 'The patch was removed from your local repositories.'],
+  ready: ['Patch validated', 'The plain-text result matches the task and is safe to commit.'],
+  applied: ['Changes committed', 'The validated patch is committed in this task’s coding tree.'],
+  'rolled-back': ['Changes reverted', 'A revert commit was created in this task’s coding tree.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
 };
 
@@ -132,7 +235,7 @@ function renderResult(task) {
     <div class="patch-item">
       <strong>${escapeHtml(patch.name || patch.id)}</strong>
       <pre>${escapeHtml(patch.stat || 'No changes')}</pre>
-    </div>`).join('');
+    </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '');
   elements['apply-button'].classList.toggle('hidden', task.state !== 'ready');
   elements['rollback-button'].classList.toggle('hidden', task.state !== 'applied');
 }
@@ -143,9 +246,11 @@ function showTask(task) {
   elements['composer-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
+  elements['trees-view'].classList.add('hidden');
   elements['task-view'].classList.remove('hidden');
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.remove('active');
+  elements['trees-button'].classList.remove('active');
   elements['page-title'].textContent = taskLabel(task);
   const [title, copy] = statusText[task.state] || statusText.prepared;
   elements['task-status-title'].textContent = title;
@@ -165,11 +270,14 @@ function showComposer() {
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
+  elements['trees-view'].classList.add('hidden');
   elements['composer-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'Prepare a coding task';
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.remove('active');
+  elements['trees-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
+  renderTaskTreeOptions();
   renderTaskList();
 }
 
@@ -177,10 +285,12 @@ function showSession() {
   elements['composer-view'].classList.add('hidden');
   elements['task-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
+  elements['trees-view'].classList.add('hidden');
   elements['session-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'ChatGPT session';
   elements['chatgpt-session-button'].classList.add('active');
   elements['source-control-button'].classList.remove('active');
+  elements['trees-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(true);
   requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
   renderTaskList();
@@ -190,13 +300,29 @@ async function showSourceControl() {
   elements['composer-view'].classList.add('hidden');
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
+  elements['trees-view'].classList.add('hidden');
   elements['source-view'].classList.remove('hidden');
   elements['page-title'].textContent = 'Source control';
   elements['chatgpt-session-button'].classList.remove('active');
   elements['source-control-button'].classList.add('active');
+  elements['trees-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
   renderSourceRepositories();
   await loadGitStatus(elements['source-repository-select'].value || state.selectedGitPath);
+}
+
+function showTrees() {
+  elements['composer-view'].classList.add('hidden');
+  elements['task-view'].classList.add('hidden');
+  elements['session-view'].classList.add('hidden');
+  elements['source-view'].classList.add('hidden');
+  elements['trees-view'].classList.remove('hidden');
+  elements['page-title'].textContent = 'Coding trees';
+  elements['chatgpt-session-button'].classList.remove('active');
+  elements['source-control-button'].classList.remove('active');
+  elements['trees-button'].classList.add('active');
+  window.patchwork.setBrowserVisible(false);
+  refreshTrees().catch((error) => showToast(error.message, true));
 }
 
 function syncBrowserBounds() {
@@ -218,9 +344,7 @@ function syncBrowserBounds() {
 async function chooseRepositories() {
   try {
     const repositories = await window.patchwork.chooseRepositories();
-    const existing = new Map(state.repositories.map((repository) => [repository.path, repository]));
-    repositories.forEach((repository) => existing.set(repository.path, repository));
-    state.repositories = [...existing.values()];
+    if (repositories[0]) state.repositories = [repositories[0]];
     const workspace = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
     repositories.forEach((repository) => workspace.set(repository.path, repository));
     state.workspaceRepositories = [...workspace.values()];
@@ -377,9 +501,12 @@ async function createTask() {
     const task = await window.patchwork.createTask({
       repositories: state.repositories,
       taskText: elements['task-text'].value,
-      autoApply: elements['auto-apply'].checked,
+      autoApply: true,
+      treeId: elements['task-tree-select'].value || null,
+      treeName: elements['tree-name'].value,
     });
     state.tasks.unshift(task);
+    await refreshTrees();
     showTask(task);
     addActivity('Fresh embedded chat prepared');
     showToast('Task package prepared. Submitting through the embedded browser…');
@@ -415,6 +542,13 @@ async function runBrowserAction(action, successMessage) {
 elements['new-task-button'].addEventListener('click', showComposer);
 elements['chatgpt-session-button'].addEventListener('click', showSession);
 elements['source-control-button'].addEventListener('click', showSourceControl);
+elements['trees-button'].addEventListener('click', showTrees);
+elements['trees-new-task'].addEventListener('click', () => {
+  elements['task-tree-select'].value = '';
+  elements['tree-name'].value = '';
+  showComposer();
+});
+elements['task-tree-select'].addEventListener('change', renderTaskTreeOptions);
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
 elements['create-task-button'].addEventListener('click', createTask);
 elements['submit-task-button'].addEventListener('click', () => runTaskAction(window.patchwork.submitTask, 'Task submitted.'));
@@ -475,10 +609,19 @@ new ResizeObserver(syncBrowserBounds).observe(elements['chatgpt-surface']);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
 
 window.patchwork.onTaskEvent((event) => {
+  if (event.task) {
+    const index = state.tasks.findIndex((task) => task.taskId === event.task.taskId);
+    if (index >= 0) state.tasks[index] = event.task;
+    else state.tasks.unshift(event.task);
+  }
   if (event.task && (!state.activeTask || state.activeTask.taskId === event.task.taskId)) showTask(event.task);
   if (event.message) addActivity(event.message);
   if (event.type === 'task-failed') showToast(event.message || 'Task failed.', true);
-  if (event.type === 'task-applied') showToast('ChatGPT changes were validated and applied.');
+  if (event.type === 'task-applied') {
+    showToast('ChatGPT changes were validated and committed to the coding tree.');
+    refreshTrees().catch(() => {});
+  }
+  if (event.type === 'task-applied' && state.selectedGitPath) loadGitStatus(state.selectedGitPath);
   if (event.type === 'result-ready') showToast('The ChatGPT result is ready to review.');
   if (event.type === 'browser-loading') {
     elements['browser-status'].textContent = event.loading ? 'Loading…' : 'Embedded session';
@@ -491,19 +634,35 @@ window.patchwork.onTaskEvent((event) => {
     elements['session-browser-title'].textContent = event.title;
   }
   if (event.type === 'browser-login-required') showToast(event.message, true);
+  if (event.type === 'tree-created' || event.type === 'tree-removed' || event.type === 'tree-merged') {
+    refreshTrees().catch(() => {});
+  }
+  if (event.type === 'tree-merged') showToast('Coding tree merged as one commit and removed.');
+  if (event.type === 'tree-merged' && event.result?.repositoryPath) {
+    state.selectedGitPath = event.result.repositoryPath;
+    if (!elements['source-view'].classList.contains('hidden')) loadGitStatus(state.selectedGitPath);
+  }
+  if (event.type === 'merge-submitted') showToast('ChatGPT is preparing the final squash commit message.');
+  if (event.type === 'merge-failed') {
+    showToast(event.message || 'The coding tree could not be merged.', true);
+    refreshTrees().catch(() => {});
+  }
 });
 
 async function initialize() {
   try {
-    const [tasks, repositories] = await Promise.all([
+    const [tasks, repositories, trees] = await Promise.all([
       window.patchwork.listTasks(),
       window.patchwork.listWorkspaceRepositories(),
+      window.patchwork.listTrees(),
     ]);
     state.tasks = tasks;
+    state.trees = trees;
     state.workspaceRepositories = repositories;
-    state.repositories = repositories.filter((repository) => !repository.unavailable);
+    state.repositories = repositories.filter((repository) => !repository.unavailable).slice(0, 1);
     renderTaskList();
     renderRepositories();
+    renderTrees();
     renderSourceRepositories();
     showSession();
   } catch (error) {

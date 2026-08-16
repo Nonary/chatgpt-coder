@@ -2,12 +2,19 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 const { test } = require('node:test');
 const AdmZip = require('adm-zip');
+const {
+  buildLimitNoticeDismissalScript,
+  isDismissibleLimitNotice,
+  resultTaskId,
+} = require('../src/main/chatgpt-view');
 const { runGit } = require('../src/main/git');
 const { GitService, parsePorcelainStatus } = require('../src/main/git-service');
-const { ResultService, safeArchivePath } = require('../src/main/result-service');
+const { ResultService, parsePlainTextResult, safeArchivePath } = require('../src/main/result-service');
 const { TaskService } = require('../src/main/task-service');
+const { WorktreeService, parseMergeResult, validateCommitMessage } = require('../src/main/worktree-service');
 
 async function createRepository(root) {
   const repositoryPath = path.join(root, 'sample-repository');
@@ -21,7 +28,7 @@ async function createRepository(root) {
   return repositoryPath;
 }
 
-test('task packages contain instructions, a manifest, and a verified Git bundle', async (context) => {
+test('task packages transfer every file through a plain-text envelope', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
@@ -35,16 +42,22 @@ test('task packages contain instructions, a manifest, and a verified Git bundle'
     autoApply: false,
   });
 
-  const zip = new AdmZip(task.packagePath);
-  const entries = zip.getEntries().map((entry) => entry.entryName);
-  assert.ok(entries.includes('AGENTS.md'));
-  assert.ok(entries.includes('TASK.md'));
-  assert.ok(entries.includes('manifest.json'));
-  assert.ok(entries.includes(`repositories/${repository.id}.bundle`));
-  const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
+  assert.match(task.packagePath, /\.txt$/);
+  assert.equal(task.transport, 'plain-text-base64');
+  const envelope = JSON.parse(await fs.readFile(task.packagePath, 'utf8'));
+  assert.equal(envelope.format, 'patchwork-task-plain-text-v1');
+  const entries = new Map(envelope.files.map((entry) => [entry.path, entry]));
+  assert.ok(entries.has('AGENTS.md'));
+  assert.ok(entries.has('TASK.md'));
+  assert.ok(entries.has('manifest.json'));
+  assert.ok(entries.has(`repositories/${repository.id}.bundle`));
+  assert.ok(envelope.files.every((entry) => entry.encoding === 'base64' && /^[a-zA-Z0-9+/]*={0,2}$/.test(entry.content)));
+  const manifest = JSON.parse(Buffer.from(entries.get('manifest.json').content, 'base64').toString('utf8'));
   assert.equal(manifest.taskId, task.taskId);
   assert.equal(manifest.repositories[0].baseCommit, repository.baseCommit);
   assert.equal(JSON.stringify(manifest).includes(repositoryPath), false);
+  const agentInstructions = Buffer.from(entries.get('AGENTS.md').content, 'base64').toString('utf8');
+  assert.match(agentInstructions, /PATCHWORK_RESULT_V1/);
 });
 
 test('an unborn repository is snapshotted without changing the source and accepts its result', async (context) => {
@@ -163,6 +176,151 @@ test('archive paths cannot escape the result container', () => {
   assert.equal(safeArchivePath('patches/repo.patch'), 'patches/repo.patch');
   assert.throws(() => safeArchivePath('../../outside.patch'), /unsafe path/);
   assert.throws(() => safeArchivePath('/absolute.patch'), /unsafe path/);
+});
+
+test('result downloads match ChatGPT filenames including duplicate suffixes', () => {
+  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId}.zip`), taskId);
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId} (2).zip`), taskId);
+  assert.equal(resultTaskId('unrelated.zip'), null);
+});
+
+test('ChatGPT request-limit dialogs are recognized and dismissed without broad clicking', () => {
+  assert.equal(isDismissibleLimitNotice('Too many requests'), true);
+  assert.equal(isDismissibleLimitNotice('Messages limit reached'), true);
+  assert.equal(isDismissibleLimitNotice('You’ve reached your daily usage limit.'), true);
+  assert.equal(isDismissibleLimitNotice('This patch exceeds its configured size limit.'), false);
+
+  let clicked = false;
+  const button = {
+    textContent: 'Got it',
+    disabled: false,
+    getAttribute: () => null,
+    click: () => { clicked = true; },
+  };
+  const modal = {
+    textContent: 'Too many requests Please wait a few minutes before trying again. Got it',
+    querySelectorAll: () => [button],
+  };
+  const document = {
+    querySelector: (selector) => (
+      selector === '[data-testid="modal-conversation-history-rate-limit"]' ? modal : null
+    ),
+    querySelectorAll: () => [],
+  };
+  const result = vm.runInNewContext(buildLimitNoticeDismissalScript(), { document });
+  assert.equal(result.dismissed, true);
+  assert.equal(result.action, 'Got it');
+  assert.equal(clicked, true);
+});
+
+test('a visible plain-text ChatGPT result validates and applies automatically', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting.', repositories: [repository], autoApply: true,
+  });
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'plain text result\n');
+  const { stdout: patchBody } = await runGit(repositoryPath, ['diff', '--binary', task.repositories[0].baseCommit, '--', '.']);
+  await runGit(repositoryPath, ['restore', 'hello.txt']);
+  const responseText = `Implementation complete.\nPATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Changed the greeting through text transport.',
+    repositories: [{
+      id: repository.id,
+      baseCommit: repository.baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patchBody).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+  assert.equal(parsePlainTextResult(responseText).taskId, task.taskId);
+
+  const results = new ResultService(tasks);
+  const current = await results.ingestText(task.taskId, responseText);
+  assert.equal(current.state, 'applied');
+  assert.equal(current.result.transport, 'plain-text-base64');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'plain text result\n');
+});
+
+test('coding trees commit task results, accept follow-ups, and squash merge', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+
+  const tree = await trees.create(repositoryPath, 'Modern source control');
+  assert.equal(tree.clean, true);
+  assert.match(tree.branch, /^patchwork\/modern-source-control-/);
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting in the coding tree.',
+    repositories: [{ path: tree.path }],
+    tree,
+    autoApply: true,
+  });
+  await trees.attachTask(tree.id, task.taskId);
+
+  await fs.writeFile(path.join(tree.path, 'hello.txt'), 'changed in coding tree\n');
+  const { stdout: patchBody } = await runGit(tree.path, ['diff', '--binary', task.repositories[0].baseCommit, '--', '.']);
+  await runGit(tree.path, ['restore', 'hello.txt']);
+  const responseText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Changed the coding-tree greeting.',
+    commitMessage: 'feat(greeting): update coding tree message',
+    repositories: [{
+      id: task.repositories[0].id,
+      baseCommit: task.repositories[0].baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patchBody).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+  const result = await new ResultService(tasks).ingestText(task.taskId, responseText);
+  assert.equal(result.state, 'applied');
+  assert.match(result.result.commits[0].commit, /^[0-9a-f]{40}$/);
+  assert.equal((await runGit(tree.path, ['log', '-1', '--pretty=%s'])).stdout.trim(), 'feat(greeting): update coding tree message');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'hello\n');
+
+  const followUp = await tasks.createTask({
+    taskText: 'Follow up on the same tree.', repositories: [{ path: tree.path }], tree, autoApply: true,
+  });
+  assert.equal(followUp.repositories[0].baseCommit, result.result.commits[0].commit);
+
+  const request = await trees.buildMergeRequest(tree.id);
+  assert.match(request.prompt, /feat\(greeting\): update coding tree message/);
+  await trees.markMergeSubmitted(tree.id, 'https://chatgpt.com/c/example');
+  let mergeState = await trees.markMergeFailed(tree.id, new Error('Conflicting change'));
+  assert.equal(mergeState.mergeState, 'failed');
+  assert.equal(mergeState.mergeError, 'Conflicting change');
+  const mergeText = `PATCHWORK_MERGE_V1\n${JSON.stringify({
+    schemaVersion: 1,
+    treeId: tree.id,
+    summary: 'Updated the greeting.',
+    commitMessage: 'feat(greeting): modernize greeting behavior',
+  })}\nPATCHWORK_MERGE_END`;
+  assert.equal(parseMergeResult(mergeText, tree.id).commitMessage, 'feat(greeting): modernize greeting behavior');
+  const merged = await trees.mergeFromText(tree.id, mergeText);
+  assert.match(merged.commit, /^[0-9a-f]{40}$/);
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'changed in coding tree\n');
+  assert.equal((await runGit(repositoryPath, ['log', '-1', '--pretty=%s'])).stdout.trim(), 'feat(greeting): modernize greeting behavior');
+  assert.equal((await trees.list()).length, 0);
+});
+
+test('commit messages used for coding trees must be conventional', () => {
+  assert.equal(validateCommitMessage('fix(parser): preserve blank lines'), 'fix(parser): preserve blank lines');
+  assert.throws(() => validateCommitMessage('Updated the parser'), /Conventional Commit/);
 });
 
 test('source control stages, diffs, commits, and records history', async (context) => {

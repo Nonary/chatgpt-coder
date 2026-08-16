@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-coding-ide",
-  "version": "0.3.0",
+  "version": "0.5.1",
   "description": "A local-first Electron IDE companion for exchanging Git patches with ChatGPT.",
   "main": "src/main/app.js",
   "type": "commonjs",

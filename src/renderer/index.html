@@ -28,6 +28,9 @@
         <button id="source-control-button" class="sidebar-session-button wide">
           <span>⑂</span> Source control <small id="source-count" class="nav-count hidden">0</small>
         </button>
+        <button id="trees-button" class="sidebar-session-button wide">
+          <span>⑃</span> Coding trees <small id="tree-count" class="nav-count hidden">0</small>
+        </button>
 
         <div class="side-heading">Recent tasks</div>
         <nav id="task-list" class="task-list" aria-label="Recent tasks">
@@ -127,21 +130,35 @@
           </div>
         </section>
 
+        <section id="trees-view" class="trees-view hidden">
+          <div class="trees-header">
+            <div>
+              <p class="eyebrow">ISOLATED WORKSTREAMS</p>
+              <h2>Coding trees</h2>
+              <p>Each tree has its own branch, tasks, and commits. Continue work concurrently, then squash it into the original branch when ready.</p>
+            </div>
+            <button id="trees-new-task" class="primary">＋ New coding tree</button>
+          </div>
+          <div id="trees-list" class="trees-list"></div>
+        </section>
+
         <section id="composer-view" class="content-grid hidden">
           <div class="main-column">
             <article class="card">
               <div class="card-heading">
                 <div>
                   <span class="step-number">1</span>
-                  <h2>Choose repositories</h2>
+                  <h2>Choose a coding tree</h2>
                 </div>
-                <button id="add-repository-button" class="secondary">Add repositories</button>
               </div>
-              <p class="card-copy">Committed repositories are bundled directly. Local changes and brand-new repositories are captured in an isolated snapshot without modifying your working tree.</p>
-              <div id="repository-list" class="repository-list empty-state">
-                <div class="empty-icon">⌘</div>
-                <strong>No repositories selected</strong>
-                <span>Add one or more Git repositories to begin.</span>
+              <p class="card-copy">Start an isolated worktree for this task, or attach a follow-up to an existing tree. Every task opens a fresh ChatGPT chat.</p>
+              <label class="field-label" for="task-tree-select">Coding tree</label>
+              <select id="task-tree-select" class="field-control">
+                <option value="">Create a new coding tree</option>
+              </select>
+              <div id="new-tree-fields" class="new-tree-fields">
+                <label class="field-label" for="tree-name">New tree name</label>
+                <input id="tree-name" class="field-control" type="text" maxlength="80" placeholder="For example: Modern source control" />
               </div>
             </article>
 
@@ -149,6 +166,22 @@
               <div class="card-heading">
                 <div>
                   <span class="step-number">2</span>
+                  <h2>Choose a repository</h2>
+                </div>
+                <button id="add-repository-button" class="secondary">Add repository</button>
+              </div>
+              <p class="card-copy">New coding trees start from one clean, committed repository. Existing trees already know which repository they belong to.</p>
+              <div id="repository-list" class="repository-list empty-state">
+                <div class="empty-icon">⌘</div>
+                <strong>No repository selected</strong>
+                <span>Add one Git repository to begin.</span>
+              </div>
+            </article>
+
+            <article class="card">
+              <div class="card-heading">
+                <div>
+                  <span class="step-number">3</span>
                   <h2>Describe the change</h2>
                 </div>
               </div>
@@ -158,12 +191,12 @@
                 rows="9"
                 placeholder="For example: Add keyboard navigation to the command palette, update the tests, and document the shortcuts."
               ></textarea>
-              <label class="toggle-row">
-                <input id="auto-apply" type="checkbox" checked />
+              <label class="toggle-row always-on">
+                <input id="auto-apply" type="checkbox" checked disabled />
                 <span class="toggle"><span></span></span>
                 <span>
-                  <strong>Apply automatically after validation</strong>
-                  <small>The app verifies task identity, base commits, and every patch before changing files.</small>
+                  <strong>Validate, apply, and commit to the coding tree</strong>
+                  <small>ChatGPT supplies a Conventional Commit message. The original branch is untouched until you merge the tree.</small>
                 </span>
               </label>
             </article>
@@ -176,10 +209,10 @@
           <aside class="guide-card">
             <p class="eyebrow">HOW IT WORKS</p>
             <ol>
-              <li><span>1</span><div><strong>Snapshot</strong><small>Git bundles preserve the exact starting commits.</small></div></li>
-              <li><span>2</span><div><strong>Hand off</strong><small>You use the normal ChatGPT website and your own account.</small></div></li>
-              <li><span>3</span><div><strong>Wait</strong><small>Patchwork watches for the named result download.</small></div></li>
-              <li><span>4</span><div><strong>Validate and apply</strong><small>Unsafe, stale, or conflicting patches are stopped.</small></div></li>
+              <li><span>1</span><div><strong>Isolate</strong><small>A Git worktree and Patchwork branch keep this stream independent.</small></div></li>
+              <li><span>2</span><div><strong>Hand off</strong><small>The repository bundle crosses the browser boundary as plain text.</small></div></li>
+              <li><span>3</span><div><strong>Commit</strong><small>Validated response text is applied and committed in the tree.</small></div></li>
+              <li><span>4</span><div><strong>Merge</strong><small>ChatGPT summarizes the tree before Patchwork squashes it into the original branch.</small></div></li>
             </ol>
             <div class="boundary-note">
               <strong>Visible browser boundary</strong>

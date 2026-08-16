@@ -1,7 +1,6 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const AdmZip = require('adm-zip');
 const { createBundle, createSnapshotBundle, inspectRepository } = require('./git');
 
 const SCHEMA_VERSION = 1;
@@ -10,15 +9,16 @@ function buildAgentInstructions(taskId) {
   return `# Patchwork task protocol
 
 You are working on a software task supplied by the user through Patchwork IDE.
-The uploaded ZIP is a self-contained transport package. Do not merely describe a solution: inspect the repositories, make the requested changes, and return the exact result artifact described below.
+The uploaded TXT file is a self-contained plain-text transport envelope. Do not merely describe a solution: reconstruct the repositories, make the requested changes, and return the exact plain-text result described below. Do not create a downloadable result file.
 
 ## Set up the repositories
 
-1. Extract this ZIP into a writable directory.
-2. Read \`manifest.json\` and \`TASK.md\` completely.
-3. For each entry in \`manifest.json.repositories\`, clone \`bundleFile\` into \`workspace/<id>\`.
-4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
-5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
+1. Read the uploaded JSON envelope. It has \`format: "patchwork-task-plain-text-v1"\` and a \`files\` array.
+2. For every file entry, base64-decode \`content\` to its relative \`path\` in a writable directory. This reconstructs \`manifest.json\`, \`TASK.md\`, \`AGENTS.md\`, and each Git bundle without using a binary attachment.
+3. Read \`manifest.json\` and \`TASK.md\` completely.
+4. For each entry in \`manifest.json.repositories\`, clone \`bundleFile\` into \`workspace/<id>\`.
+5. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
+6. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
 
 You may create commits as checkpoints. Do not rewrite the supplied base history and do not add generated dependencies, build output, credentials, or unrelated files.
 
@@ -26,45 +26,43 @@ You may create commits as checkpoints. Do not rewrite the supplied base history 
 
 Follow any repository-specific \`AGENTS.md\` files found after cloning. Implement the task in \`TASK.md\`, run relevant checks when possible, and inspect the final diff. Keep changes focused on the requested task.
 
-## Produce the result
+## Produce the plain-text result
 
-Create a directory named \`result\` containing:
-
-- \`result.json\`
-- one binary-safe patch per repository under \`patches/<id>.patch\`
-
-Generate each patch from the supplied base commit so checkpoint commits are included:
+Generate one binary-safe patch per repository from the supplied base commit so checkpoint commits are included:
 
 \`git diff --binary <baseCommit> -- . > ../../result/patches/<id>.patch\`
 
-Use this exact JSON shape in \`result/result.json\`:
+Base64-encode each patch file. In your final response, output the start marker on its own line, then one JSON object with this exact shape, then the end marker on its own line:
+
+\`PATCHWORK_RESULT_V1\`
 
 \`\`\`json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
+  "transport": "plain-text-base64",
   "taskId": "${taskId}",
   "status": "completed",
   "summary": "A concise summary of the implementation and verification performed.",
+  "commitMessage": "A Conventional Commit message, for example feat(editor): add split diff view",
   "repositories": [
     {
       "id": "the repository id from manifest.json",
       "baseCommit": "the exact base commit from manifest.json",
-      "patchFile": "patches/the-repository-id.patch"
+      "patchEncoding": "base64",
+      "patch": "the complete base64-encoded git diff --binary output"
     }
   ]
 }
 \`\`\`
 
-Include every repository from the input manifest, even when its patch is empty. Finally, ZIP the contents of \`result\` as:
+\`PATCHWORK_RESULT_END\`
 
-\`chatgpt-ide-result-${taskId}.zip\`
-
-Your final response must briefly summarize the work and provide that ZIP as a downloadable file. Do not paste large patches into the conversation.
+The commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). The markers and JSON must be visible response text, not a download, attachment, link, or image. Do not abbreviate, omit, or truncate patch data. You may put the complete envelope in a single code block, but put no commentary inside the markers.
 `;
 }
 
 function buildHandoffPrompt(taskId, taskText) {
-  return `I attached a Patchwork IDE task package. Extract it, read AGENTS.md and TASK.md completely, then solve the task against the bundled Git repositories. Return the required downloadable file named chatgpt-ide-result-${taskId}.zip.\n\nTask summary:\n${taskText}`;
+  return `I attached a Patchwork IDE plain-text task envelope. Reconstruct it, read AGENTS.md and TASK.md completely, then solve the task against the bundled Git repositories. Return the required PATCHWORK_RESULT_V1 plain-text envelope directly in your final response; do not create a downloadable file.\n\nTask summary:\n${taskText}`;
 }
 
 class TaskService {
@@ -156,22 +154,27 @@ class TaskService {
       fs.writeFile(path.join(taskDir, 'AGENTS.md'), agentInstructions),
     ]);
 
-    const packagePath = path.join(taskDir, `chatgpt-ide-task-${taskId}.zip`);
-    const zip = new AdmZip();
-    zip.addLocalFile(path.join(taskDir, 'manifest.json'));
-    zip.addLocalFile(path.join(taskDir, 'TASK.md'));
-    zip.addLocalFile(path.join(taskDir, 'AGENTS.md'));
-    for (const repository of publicRepositories) {
-      zip.addLocalFile(path.join(taskDir, repository.bundleFile), 'repositories');
-    }
-    await new Promise((resolve, reject) => {
-      zip.writeZip(packagePath, (error) => (error ? reject(error) : resolve()));
-    });
+    const transportFiles = ['manifest.json', 'TASK.md', 'AGENTS.md', ...publicRepositories.map((item) => item.bundleFile)];
+    const files = await Promise.all(transportFiles.map(async (relativePath) => ({
+      path: relativePath,
+      encoding: 'base64',
+      content: (await fs.readFile(path.join(taskDir, relativePath))).toString('base64'),
+    })));
+    const packagePath = path.join(taskDir, `chatgpt-ide-task-${taskId}.txt`);
+    await fs.writeFile(packagePath, `${JSON.stringify({
+      format: 'patchwork-task-plain-text-v1',
+      taskId,
+      files,
+    }, null, 2)}\n`, 'utf8');
 
     const record = {
       ...manifest,
       taskText,
       autoApply: input.autoApply !== false,
+      transport: 'plain-text-base64',
+      treeId: input.tree?.id || null,
+      treeName: input.tree?.name || null,
+      sourceRepositoryPath: input.tree?.repositoryPath || null,
       packagePath,
       handoffPrompt: buildHandoffPrompt(taskId, taskText),
       repositories: taskRepositories,
