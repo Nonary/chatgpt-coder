@@ -210,8 +210,8 @@
             <p class="eyebrow">HOW IT WORKS</p>
             <ol>
               <li><span>1</span><div><strong>Isolate</strong><small>A Git worktree and Patchwork branch keep this stream independent.</small></div></li>
-              <li><span>2</span><div><strong>Hand off</strong><small>The repository bundle crosses the browser boundary as plain text.</small></div></li>
-              <li><span>3</span><div><strong>Commit</strong><small>Validated response text is applied and committed in the tree.</small></div></li>
+              <li><span>2</span><div><strong>Hand off</strong><small>A ZIP containing the Git bundle and task instructions is uploaded to ChatGPT.</small></div></li>
+              <li><span>3</span><div><strong>Commit</strong><small>The downloaded text result is validated, applied, and committed in the tree.</small></div></li>
               <li><span>4</span><div><strong>Merge</strong><small>ChatGPT summarizes the tree before Patchwork squashes it into the original branch.</small></div></li>
             </ol>
             <div class="boundary-note">
@@ -254,6 +254,7 @@
                 <div id="patch-list" class="patch-list"></div>
                 <div class="result-actions">
                   <button id="apply-button" class="primary">Apply changes</button>
+                  <button id="resolve-conflicts-button" class="primary hidden">Resubmit to resolve conflicts</button>
                   <button id="rollback-button" class="danger hidden">Roll back</button>
                 </div>
               </article>

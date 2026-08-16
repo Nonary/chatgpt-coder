@@ -1,7 +1,15 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const AdmZip = require('adm-zip');
-const { applyPatch, checkPatch, inspectRepository, runGit, verifyHead } = require('./git');
+const {
+  applyPatch,
+  checkPatch,
+  fingerprintRepository,
+  inspectPatch,
+  inspectRepository,
+  listConflictedFiles,
+  runGit,
+} = require('./git');
 const { validateCommitMessage } = require('./worktree-service');
 
 const MAX_RESULT_BYTES = 128 * 1024 * 1024;
@@ -71,6 +79,14 @@ function requireTaskRepository(task, repositoryId) {
   return repository;
 }
 
+async function matchesPackagedState(repository, current) {
+  if (repository.isSnapshot) {
+    if (current.baseCommit !== repository.sourceHead) return false;
+    return (await fingerprintRepository(repository.path)) === repository.snapshotFingerprint;
+  }
+  return current.baseCommit === repository.baseCommit && current.isClean;
+}
+
 class ResultService {
   constructor(taskService, onEvent = () => {}) {
     this.taskService = taskService;
@@ -89,6 +105,17 @@ class ResultService {
     return this.ingestResult(taskId, 'Decoding and validating the plain-text result…', (task) => (
       this.readPlainTextResult(task, text)
     ));
+  }
+
+  async ingestTextFile(taskId, downloadedPath) {
+    return this.ingestResult(taskId, 'Validating the downloaded text result…', async (task) => {
+      const stat = await fs.stat(downloadedPath);
+      if (stat.size > MAX_RESULT_BYTES) {
+        throw new Error('The downloaded text result is larger than the 128 MB safety limit.');
+      }
+      const text = await fs.readFile(downloadedPath, 'utf8');
+      return this.readPlainTextResult(task, text, downloadedPath);
+    });
   }
 
   async ingestResult(taskId, message, readResult) {
@@ -115,7 +142,7 @@ class ResultService {
     }
   }
 
-  async readPlainTextResult(task, text) {
+  async readPlainTextResult(task, text, downloadedPath = null) {
     const manifest = parsePlainTextResult(text);
     if (manifest.taskId !== task.taskId) throw new Error('This result belongs to a different Patchwork task.');
     if (manifest.status !== 'completed') throw new Error(`ChatGPT returned task status: ${manifest.status}`);
@@ -139,7 +166,7 @@ class ResultService {
       summary: String(manifest.summary || '').trim(),
       commitMessage: task.treeId ? validateCommitMessage(manifest.commitMessage) : null,
       transport: 'plain-text-base64',
-      downloadedPath: null,
+      downloadedPath,
       patches,
     };
   }
@@ -217,17 +244,34 @@ class ResultService {
       if (patch.baseCommit !== repository.baseCommit) {
         throw new Error(`${repository.name} patch targets the wrong base commit.`);
       }
-      await verifyHead(repository);
       const patchBody = await fs.readFile(patch.localPath, 'utf8');
       if (patchBody.length === 0) {
         previews.push({ ...patch, name: repository.name, stat: 'No changes', numstat: '', preview: '' });
         continue;
       }
-      const stats = await checkPatch(repository.path, patch.localPath);
+      const current = await inspectRepository(repository.path);
+      const exactState = await matchesPackagedState(repository, current);
+      let stats;
+      let applyMode = 'direct';
+      if (exactState) {
+        stats = await checkPatch(repository.path, patch.localPath);
+      } else {
+        stats = await inspectPatch(repository.path, patch.localPath);
+        if (!current.isClean) {
+          applyMode = 'conflict';
+        } else {
+          try {
+            await checkPatch(repository.path, patch.localPath);
+          } catch {
+            applyMode = 'three-way';
+          }
+        }
+      }
       previews.push({
         ...patch,
         name: repository.name,
         ...stats,
+        applyMode,
         preview: patchBody.slice(0, 200_000),
         previewTruncated: patchBody.length > 200_000,
       });
@@ -251,17 +295,41 @@ class ResultService {
     try {
       for (const patch of task.result.patches) {
         const repository = task.repositories.find((item) => item.id === patch.id);
-        await verifyHead(repository);
         const body = await fs.readFile(patch.localPath);
         if (body.length === 0) continue;
-        await checkPatch(repository.path, patch.localPath);
-      }
-      for (const patch of task.result.patches) {
-        const repository = task.repositories.find((item) => item.id === patch.id);
-        const body = await fs.readFile(patch.localPath);
-        if (body.length === 0) continue;
-        await applyPatch(repository.path, patch.localPath);
-        applied.push({ repository, patch });
+        const current = await inspectRepository(repository.path);
+        const exactState = await matchesPackagedState(repository, current);
+        if (!exactState && !current.isClean) {
+          return this.markConflicted(task, repository, new Error(
+            `${repository.name} has new uncommitted or unmerged changes since this task was packaged.`,
+          ));
+        }
+
+        let applyMode = 'direct';
+        if (!exactState) {
+          try {
+            await checkPatch(repository.path, patch.localPath);
+          } catch {
+            applyMode = 'three-way';
+          }
+        } else {
+          await checkPatch(repository.path, patch.localPath);
+        }
+
+        try {
+          await applyPatch(repository.path, patch.localPath, applyMode === 'three-way'
+            ? { threeWay: true, index: true }
+            : {});
+        } catch (error) {
+          return this.markConflicted(task, repository, error);
+        }
+        applied.push({
+          repository,
+          patch,
+          applyMode,
+          wasClean: current.isClean,
+          headBefore: current.baseCommit,
+        });
       }
       if (task.treeId) {
         for (const item of applied) {
@@ -282,8 +350,12 @@ class ResultService {
       for (const item of applied.reverse()) {
         if (committed.some((commit) => commit.repository.path === item.repository.path)) continue;
         try {
-          await runGit(item.repository.path, ['reset', '--mixed', '--quiet', 'HEAD']).catch(() => {});
-          await applyPatch(item.repository.path, item.patch.localPath, true);
+          if (item.wasClean && item.headBefore) {
+            await runGit(item.repository.path, ['reset', '--hard', item.headBefore]);
+          } else {
+            await runGit(item.repository.path, ['reset', '--mixed', '--quiet', 'HEAD']).catch(() => {});
+            await applyPatch(item.repository.path, item.patch.localPath, { reverse: true });
+          }
         } catch {
           // Preserve the original error; the UI will point the user to the saved patch.
         }
@@ -305,6 +377,29 @@ class ResultService {
     });
     await this.onEvent({ type: 'task-applied', task });
     return task;
+  }
+
+  async markConflicted(task, repository, error) {
+    const files = await listConflictedFiles(repository.path).catch(() => []);
+    const detail = String(error?.message || error || 'The patch did not apply cleanly.');
+    const message = files.length
+      ? `${repository.name} has merge conflicts in ${files.length} file${files.length === 1 ? '' : 's'}.`
+      : `${repository.name} changed and the result could not be applied cleanly.`;
+    const conflictedTask = await this.taskService.updateTask(task.taskId, {
+      state: 'conflicted',
+      error: `${message} Resubmit a conflict-resolution task to preserve both versions.`,
+      result: {
+        ...task.result,
+        conflicts: [{
+          repositoryId: repository.id,
+          repositoryName: repository.name,
+          files,
+          error: detail,
+        }],
+      },
+    });
+    await this.onEvent({ type: 'task-conflicted', task: conflictedTask, message });
+    return conflictedTask;
   }
 
   async rollback(taskId) {

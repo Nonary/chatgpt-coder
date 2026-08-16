@@ -5,7 +5,7 @@ const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('el
 
 const CHATGPT_URL = 'https://chatgpt.com/';
 const PARTITION = 'persist:patchwork-chatgpt';
-const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.zip/i;
+const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 const RESULT_RETRY_MILLISECONDS = 6_000;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
@@ -162,14 +162,14 @@ class ChatGPTView {
       const pending = this.pendingDownload && Date.now() - this.pendingDownload.startedAt < 20_000
         ? this.pendingDownload
         : null;
-      const taskId = namedTaskId || (pending && /\.zip$/i.test(originalName) ? pending.taskId : null);
+      const taskId = namedTaskId || (pending && /\.txt$/i.test(originalName) ? pending.taskId : null);
       const task = taskId ? this.knownTasks.get(taskId.toLowerCase()) : null;
       // Downloads unrelated to an active Patchwork task use Chromium's normal behavior.
       if (!task) return;
 
       this.pendingDownload = null;
       this.processingTasks.add(task.taskId);
-      const safeName = `chatgpt-ide-result-${task.taskId}.zip`;
+      const safeName = `chatgpt-ide-result-${task.taskId}.txt`;
       const incomingDir = path.join(this.taskService.taskDirectory(task.taskId), 'incoming');
       const savePath = path.join(incomingDir, safeName);
       try {
@@ -195,7 +195,7 @@ class ChatGPTView {
           return;
         }
         try {
-          await this.onResult(task.taskId, savePath);
+          await this.onResult(task.taskId, savePath, 'text-file');
           this.knownTasks.delete(task.taskId.toLowerCase());
           if (this.activeTask?.taskId === task.taskId) this.activeTask = null;
         } catch {
@@ -218,7 +218,7 @@ class ChatGPTView {
       }
       return;
     }
-    if (!this.activeTask || this.activeTask.state !== 'submitted') return;
+    if (!this.activeTask || !['prepared', 'submitted'].includes(this.activeTask.state)) return;
     if (!/^https:\/\/chatgpt\.com\/c\//i.test(url)) return;
     if (this.activeTask.conversationUrl === url) return;
     const taskId = this.activeTask.taskId;
@@ -242,6 +242,42 @@ class ChatGPTView {
     this.visible = Boolean(visible);
     this.view.setVisible(this.visible);
     if (!this.visible) this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+  }
+
+  async openTaskConversation(task) {
+    const currentUrl = this.view.webContents.getURL();
+    let conversationUrl = String(task.conversationUrl || '');
+    if (!conversationUrl
+      && this.activeTask?.taskId === task.taskId
+      && /^https:\/\/chatgpt\.com\/c\//i.test(currentUrl)) {
+      task = await this.taskService.updateTask(task.taskId, { conversationUrl: currentUrl });
+      conversationUrl = currentUrl;
+    }
+    if (conversationUrl && !/^https:\/\/chatgpt\.com\/c\//i.test(conversationUrl)) {
+      throw new Error('This task has an invalid saved ChatGPT conversation URL.');
+    }
+
+    this.activeMerge = null;
+    this.activeTask = task;
+    this.knownTasks.set(task.taskId.toLowerCase(), task);
+    if (!conversationUrl) {
+      return {
+        opened: false,
+        url: currentUrl,
+        message: task.state === 'prepared'
+          ? 'This task has not been submitted to ChatGPT yet.'
+          : 'ChatGPT has not assigned this task a conversation URL yet.',
+      };
+    }
+    if (currentUrl !== conversationUrl) await this.view.webContents.loadURL(conversationUrl);
+    this.installResultWatcher();
+    await this.onEvent({
+      type: 'task-chat-opened',
+      taskId: task.taskId,
+      url: conversationUrl,
+      message: 'Opened this task’s ChatGPT conversation.',
+    });
+    return { opened: true, url: conversationUrl };
   }
 
   async prepare(task) {
@@ -513,22 +549,9 @@ class ChatGPTView {
 
     this.monitorBusy = true;
     try {
-      const expectedName = `chatgpt-ide-result-${task.taskId}.zip`;
+      const expectedName = `chatgpt-ide-result-${task.taskId}.txt`;
       const script = `(() => {
         const expected = ${JSON.stringify(expectedName.toLowerCase())};
-        const taskId = ${JSON.stringify(task.taskId.toLowerCase())};
-        const startMarker = 'PATCHWORK_RESULT_V1';
-        const endMarker = 'PATCHWORK_RESULT_END';
-        const resultContainers = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-        for (let index = resultContainers.length - 1; index >= 0; index -= 1) {
-          const text = String(resultContainers[index].textContent || '');
-          const start = text.indexOf(startMarker);
-          const end = text.indexOf(endMarker, start + startMarker.length);
-          if (start >= 0 && end >= 0) {
-            const payload = text.slice(start, end + endMarker.length);
-            if (payload.toLowerCase().includes(taskId)) return { kind: 'text', payload };
-          }
-        }
         const roots = [document];
         const candidates = [];
         const visited = new Set();
@@ -559,35 +582,13 @@ class ChatGPTView {
       // A fresh, synchronous user gesture is required for ChatGPT's generated-file link.
       // A click fired later by a page-owned timer can be silently blocked by Chromium.
       const result = await this.view.webContents.executeJavaScript(script, true).catch(() => ({ kind: 'none' }));
-      if (result?.kind === 'text') {
-        const fingerprint = crypto.createHash('sha256').update(result.payload).digest('hex');
-        if (this.resultTextsSeen.get(task.taskId) === fingerprint) return false;
-        this.resultTextsSeen.set(task.taskId, fingerprint);
-        this.resultAttempts.set(task.taskId, Date.now());
-        this.processingTasks.add(task.taskId);
-        await this.onEvent({
-          type: 'result-text-detected',
-          taskId: task.taskId,
-          message: 'Found the completed plain-text result; decoding and validating it…',
-        });
-        try {
-          await this.onResult(task.taskId, result.payload, 'text');
-          this.knownTasks.delete(task.taskId.toLowerCase());
-          if (this.activeTask?.taskId === task.taskId) this.activeTask = null;
-        } catch {
-          // ResultService emits the detailed validation error.
-        } finally {
-          this.processingTasks.delete(task.taskId);
-        }
-        return true;
-      }
       if (result?.kind !== 'download') return false;
       this.resultAttempts.set(task.taskId, Date.now());
       this.pendingDownload = { taskId: task.taskId, startedAt: Date.now() };
       await this.onEvent({
         type: 'result-link-activated',
         taskId: task.taskId,
-        message: `Found ${expectedName}; starting the secure download…`,
+        message: `Found ${expectedName}; downloading the completed text result…`,
       });
       return true;
     } finally {
@@ -659,10 +660,7 @@ class ChatGPTView {
     });
     if (response.canceled || response.filePaths.length === 0) return null;
     const selectedPath = response.filePaths[0];
-    if (selectedPath.toLowerCase().endsWith('.txt')) {
-      const text = fsSync.readFileSync(selectedPath, 'utf8');
-      if (text.includes('PATCHWORK_RESULT_V1')) return this.onResult(task.taskId, text, 'text');
-    }
+    if (selectedPath.toLowerCase().endsWith('.txt')) return this.onResult(task.taskId, selectedPath, 'text-file');
     return this.onResult(task.taskId, selectedPath);
   }
 }

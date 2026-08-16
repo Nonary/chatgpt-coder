@@ -6,6 +6,8 @@ const vm = require('node:vm');
 const { test } = require('node:test');
 const AdmZip = require('adm-zip');
 const {
+  CHATGPT_URL,
+  ChatGPTView,
   buildLimitNoticeDismissalScript,
   isDismissibleLimitNotice,
   resultTaskId,
@@ -28,7 +30,24 @@ async function createRepository(root) {
   return repositoryPath;
 }
 
-test('task packages transfer every file through a plain-text envelope', async (context) => {
+function plainTextResult(task, patch, commitMessage = 'fix(task): apply generated changes') {
+  return `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Implemented the requested change.',
+    commitMessage,
+    repositories: [{
+      id: task.repositories[0].id,
+      baseCommit: task.repositories[0].baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patch).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+}
+
+test('outbound task packages are ZIP archives containing real Git bundles', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
@@ -42,22 +61,177 @@ test('task packages transfer every file through a plain-text envelope', async (c
     autoApply: false,
   });
 
-  assert.match(task.packagePath, /\.txt$/);
-  assert.equal(task.transport, 'plain-text-base64');
-  const envelope = JSON.parse(await fs.readFile(task.packagePath, 'utf8'));
-  assert.equal(envelope.format, 'patchwork-task-plain-text-v1');
-  const entries = new Map(envelope.files.map((entry) => [entry.path, entry]));
+  assert.match(task.packagePath, /\.zip$/);
+  assert.equal(task.transport, 'zip-git-bundle');
+  assert.equal(task.resultTransport, 'downloaded-text-file');
+  const zip = new AdmZip(task.packagePath);
+  const entries = new Map(zip.getEntries().map((entry) => [entry.entryName, entry]));
   assert.ok(entries.has('AGENTS.md'));
   assert.ok(entries.has('TASK.md'));
   assert.ok(entries.has('manifest.json'));
   assert.ok(entries.has(`repositories/${repository.id}.bundle`));
-  assert.ok(envelope.files.every((entry) => entry.encoding === 'base64' && /^[a-zA-Z0-9+/]*={0,2}$/.test(entry.content)));
-  const manifest = JSON.parse(Buffer.from(entries.get('manifest.json').content, 'base64').toString('utf8'));
+  const manifest = JSON.parse(entries.get('manifest.json').getData().toString('utf8'));
   assert.equal(manifest.taskId, task.taskId);
   assert.equal(manifest.repositories[0].baseCommit, repository.baseCommit);
   assert.equal(JSON.stringify(manifest).includes(repositoryPath), false);
-  const agentInstructions = Buffer.from(entries.get('AGENTS.md').content, 'base64').toString('utf8');
+  const agentInstructions = entries.get('AGENTS.md').getData().toString('utf8');
   assert.match(agentInstructions, /PATCHWORK_RESULT_V1/);
+  assert.match(agentInstructions, new RegExp(`chatgpt-ide-result-${task.taskId}\\.txt`));
+  assert.match(agentInstructions, /do not print or paste the result envelope/i);
+  const packagedBundle = entries.get(`repositories/${repository.id}.bundle`).getData();
+  const sourceBundle = await fs.readFile(path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`));
+  assert.deepEqual(packagedBundle, sourceBundle);
+  const extractedBundle = path.join(root, 'uploaded-repository.bundle');
+  await fs.writeFile(extractedBundle, packagedBundle);
+  await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
+});
+
+test('dirty repositories keep their full history and capture unstaged files as a task tip', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-working-snapshot-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'locally changed\n');
+  await fs.writeFile(path.join(repositoryPath, 'untracked.txt'), 'local context\n');
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+
+  const task = await tasks.createTask({
+    taskText: 'Continue from the supplied local changes.',
+    repositories: [{ path: repositoryPath }],
+    autoApply: false,
+  });
+  const taskRepository = task.repositories[0];
+  assert.equal(taskRepository.isSnapshot, true);
+  assert.equal(taskRepository.workingChanges, true);
+  assert.notEqual(taskRepository.baseCommit, taskRepository.sourceHead);
+  assert.equal((await runGit(repositoryPath, ['rev-parse', `${taskRepository.baseCommit}^`])).stdout.trim(), taskRepository.sourceHead);
+
+  const zip = new AdmZip(task.packagePath);
+  const bundleEntry = zip.getEntry(`repositories/${taskRepository.id}.bundle`);
+  assert.equal(bundleEntry.header.method, 0);
+  const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.repositories[0].workingChanges, true);
+  assert.match(manifest.repositories[0].workingStatus, /hello\.txt/);
+  assert.match(zip.getEntry('AGENTS.md').getData().toString('utf8'), /view those captured files as unstaged changes/i);
+
+  const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${taskRepository.id}.bundle`);
+  const clonePath = path.join(root, 'history-clone');
+  await runGit(root, ['clone', bundlePath, clonePath]);
+  await runGit(clonePath, ['checkout', '--detach', taskRepository.baseCommit]);
+  assert.equal((await runGit(clonePath, ['rev-list', '--count', taskRepository.baseCommit])).stdout.trim(), '2');
+  assert.equal(await fs.readFile(path.join(clonePath, 'hello.txt'), 'utf8'), 'locally changed\n');
+  assert.equal(await fs.readFile(path.join(clonePath, 'untracked.txt'), 'utf8'), 'local context\n');
+  const { stdout: suppliedDiff } = await runGit(clonePath, [
+    'diff', taskRepository.sourceHead, taskRepository.baseCommit, '--', '.',
+  ]);
+  assert.match(suppliedDiff, /locally changed/);
+  assert.match(suppliedDiff, /untracked\.txt/);
+});
+
+test('results apply and commit after the coding tree HEAD advances', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-advanced-head-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+  const tree = await trees.create(repositoryPath, 'Advanced head');
+  const task = await tasks.createTask({
+    taskText: 'Update the greeting.', repositories: [{ path: tree.path }], tree, autoApply: true,
+  });
+
+  const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${task.repositories[0].id}.bundle`);
+  const clonePath = path.join(root, 'chatgpt-advanced');
+  await runGit(root, ['clone', bundlePath, clonePath]);
+  await runGit(clonePath, ['checkout', '--detach', task.repositories[0].baseCommit]);
+  await fs.writeFile(path.join(clonePath, 'hello.txt'), 'hello from ChatGPT\n');
+  const { stdout: patchBody } = await runGit(clonePath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+
+  await fs.writeFile(path.join(tree.path, 'advanced.txt'), 'newer tree commit\n');
+  await runGit(tree.path, ['add', 'advanced.txt']);
+  await runGit(tree.path, ['commit', '-m', 'chore: advance coding tree']);
+
+  const result = await new ResultService(tasks).ingestText(
+    task.taskId,
+    plainTextResult(task, patchBody, 'fix(greeting): apply after advanced head'),
+  );
+  assert.equal(result.state, 'applied');
+  assert.equal(await fs.readFile(path.join(tree.path, 'advanced.txt'), 'utf8'), 'newer tree commit\n');
+  assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'hello from ChatGPT\n');
+  assert.equal((await runGit(tree.path, ['log', '-1', '--pretty=%s'])).stdout.trim(), 'fix(greeting): apply after advanced head');
+});
+
+test('conflicting results remain in the tree and can be resubmitted with unstaged context', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+  const tree = await trees.create(repositoryPath, 'Conflict flow');
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting one way.', repositories: [{ path: tree.path }], tree, autoApply: true,
+  });
+
+  const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${task.repositories[0].id}.bundle`);
+  const clonePath = path.join(root, 'chatgpt-conflict');
+  await runGit(root, ['clone', bundlePath, clonePath]);
+  await runGit(clonePath, ['checkout', '--detach', task.repositories[0].baseCommit]);
+  await fs.writeFile(path.join(clonePath, 'hello.txt'), 'ChatGPT version\n');
+  const { stdout: patchBody } = await runGit(clonePath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+
+  await fs.writeFile(path.join(tree.path, 'hello.txt'), 'newer coding tree version\n');
+  await runGit(tree.path, ['add', 'hello.txt']);
+  await runGit(tree.path, ['commit', '-m', 'chore: change the same greeting']);
+  const conflicted = await new ResultService(tasks).ingestText(
+    task.taskId,
+    plainTextResult(task, patchBody, 'fix(greeting): change greeting'),
+  );
+  assert.equal(conflicted.state, 'conflicted');
+  assert.deepEqual(conflicted.result.conflicts[0].files, ['hello.txt']);
+  assert.match(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
+
+  const resolutionTask = await tasks.createTask({
+    taskText: 'Resolve the supplied merge conflict.',
+    repositories: [{ path: tree.path }],
+    tree,
+    autoApply: true,
+    conflictContext: {
+      originalTaskId: task.taskId,
+      error: conflicted.result.conflicts[0].error,
+      files: conflicted.result.conflicts[0].files,
+      patches: conflicted.result.patches,
+    },
+  });
+  assert.equal(resolutionTask.repositories[0].workingChanges, true);
+  const resolutionZip = new AdmZip(resolutionTask.packagePath);
+  assert.ok(resolutionZip.getEntry('CONFLICTS.md'));
+  assert.ok(resolutionZip.getEntry(`conflicts/${task.repositories[0].id}.patch`));
+
+  const resolutionBundle = path.join(
+    tasks.taskDirectory(resolutionTask.taskId), 'repositories', `${resolutionTask.repositories[0].id}.bundle`,
+  );
+  const resolutionClone = path.join(root, 'chatgpt-resolution');
+  await runGit(root, ['clone', resolutionBundle, resolutionClone]);
+  await runGit(resolutionClone, ['checkout', '--detach', resolutionTask.repositories[0].baseCommit]);
+  assert.match(await fs.readFile(path.join(resolutionClone, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
+  await fs.writeFile(path.join(resolutionClone, 'hello.txt'), 'resolved greeting\n');
+  const { stdout: resolutionPatch } = await runGit(resolutionClone, [
+    'diff', '--binary', resolutionTask.repositories[0].baseCommit, '--', '.',
+  ]);
+  const resolved = await new ResultService(tasks).ingestText(
+    resolutionTask.taskId,
+    plainTextResult(resolutionTask, resolutionPatch, 'fix(greeting): resolve concurrent changes'),
+  );
+  assert.equal(resolved.state, 'applied');
+  assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'resolved greeting\n');
+  assert.equal((await runGit(tree.path, ['status', '--porcelain'])).stdout, '');
 });
 
 test('an unborn repository is snapshotted without changing the source and accepts its result', async (context) => {
@@ -180,9 +354,39 @@ test('archive paths cannot escape the result container', () => {
 
 test('result downloads match ChatGPT filenames including duplicate suffixes', () => {
   const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
-  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId}.zip`), taskId);
-  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId} (2).zip`), taskId);
-  assert.equal(resultTaskId('unrelated.zip'), null);
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId}.txt`), taskId);
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId} (2).txt`), taskId);
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId}.zip`), null);
+  assert.equal(resultTaskId('unrelated.txt'), null);
+});
+
+test('opening a task loads its saved ChatGPT conversation', async () => {
+  const loaded = [];
+  const events = [];
+  const task = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    conversationUrl: 'https://chatgpt.com/c/6a80f4cf-1650-83ea-8609-adb411b3e4bc',
+  };
+  const view = Object.create(ChatGPTView.prototype);
+  view.view = { webContents: { getURL: () => CHATGPT_URL, loadURL: async (url) => loaded.push(url) } };
+  view.activeTask = null;
+  view.activeMerge = { id: 'merge-in-progress' };
+  view.knownTasks = new Map();
+  view.taskService = { updateTask: async () => task };
+  view.onEvent = async (event) => events.push(event);
+  view.installResultWatcher = () => {};
+
+  const result = await view.openTaskConversation(task);
+  assert.equal(result.opened, true);
+  assert.deepEqual(loaded, [task.conversationUrl]);
+  assert.equal(view.activeTask, task);
+  assert.equal(view.activeMerge, null);
+  assert.equal(events[0].type, 'task-chat-opened');
+  await assert.rejects(
+    view.openTaskConversation({ ...task, conversationUrl: 'https://example.com/not-chatgpt' }),
+    /invalid saved ChatGPT conversation URL/,
+  );
 });
 
 test('ChatGPT request-limit dialogs are recognized and dismissed without broad clicking', () => {
@@ -214,7 +418,7 @@ test('ChatGPT request-limit dialogs are recognized and dismissed without broad c
   assert.equal(clicked, true);
 });
 
-test('a visible plain-text ChatGPT result validates and applies automatically', async (context) => {
+test('a downloaded text result validates and applies automatically', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
@@ -228,7 +432,7 @@ test('a visible plain-text ChatGPT result validates and applies automatically', 
   await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'plain text result\n');
   const { stdout: patchBody } = await runGit(repositoryPath, ['diff', '--binary', task.repositories[0].baseCommit, '--', '.']);
   await runGit(repositoryPath, ['restore', 'hello.txt']);
-  const responseText = `Implementation complete.\nPATCHWORK_RESULT_V1\n${JSON.stringify({
+  const responseText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
     schemaVersion: 2,
     transport: 'plain-text-base64',
     taskId: task.taskId,
@@ -244,9 +448,12 @@ test('a visible plain-text ChatGPT result validates and applies automatically', 
   assert.equal(parsePlainTextResult(responseText).taskId, task.taskId);
 
   const results = new ResultService(tasks);
-  const current = await results.ingestText(task.taskId, responseText);
+  const downloadedPath = path.join(root, `chatgpt-ide-result-${task.taskId}.txt`);
+  await fs.writeFile(downloadedPath, responseText);
+  const current = await results.ingestTextFile(task.taskId, downloadedPath);
   assert.equal(current.state, 'applied');
   assert.equal(current.result.transport, 'plain-text-base64');
+  assert.equal(current.result.downloadedPath, downloadedPath);
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'plain text result\n');
 });
 

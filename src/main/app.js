@@ -55,9 +55,11 @@ async function attachChatGPTView() {
   chatGPTView = new ChatGPTView(
     mainWindow,
     taskService,
-    (taskId, result, transport) => (
-      transport === 'text' ? resultService.ingestText(taskId, result) : resultService.ingest(taskId, result)
-    ),
+    (taskId, result, transport) => {
+      if (transport === 'text') return resultService.ingestText(taskId, result);
+      if (transport === 'text-file') return resultService.ingestTextFile(taskId, result);
+      return resultService.ingest(taskId, result);
+    },
     emit,
     tasks,
     worktreeService,
@@ -123,7 +125,6 @@ function registerIpc() {
       tree = await worktreeService.get(input.treeId);
       const inspected = await worktreeService.inspect(tree);
       if (!inspected.available) throw new Error(inspected.error);
-      if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
     } else {
       if (!Array.isArray(input.repositories) || input.repositories.length !== 1) {
         throw new Error('Choose exactly one repository when creating a coding tree.');
@@ -143,8 +144,49 @@ function registerIpc() {
     return publicTask(task);
   });
 
+  ipcMain.handle('task:resubmit-conflicts', async (_event, taskId) => {
+    const original = await taskService.getTask(taskId);
+    if (original.state !== 'conflicted' || !original.treeId || !original.result) {
+      throw new Error('This task has no coding-tree conflict to resubmit.');
+    }
+    const tree = await worktreeService.get(original.treeId);
+    const inspected = await worktreeService.inspect(tree);
+    if (!inspected.available) throw new Error(inspected.error);
+    const files = [...new Set((original.result.conflicts || []).flatMap((conflict) => conflict.files || []))];
+    const fileList = files.length ? files.map((file) => `- ${file}`).join('\n') : '- Inspect the saved result patch and current working tree.';
+    const taskText = `Resolve the merge conflicts left by the Patchwork task “${String(original.taskText || '').split('\n')[0]}”.
+
+Inspect all unstaged and unmerged changes, conflict markers, CONFLICTS.md, and the original result patch. Preserve the intended changes from both the current coding tree and the original task result. Finish with a fully resolved, tested working tree.
+
+Conflict files:
+${fileList}
+
+Original task:
+${original.taskText}`;
+    const task = await taskService.createTask({
+      taskText,
+      repositories: [{ path: tree.path }],
+      tree,
+      autoApply: true,
+      conflictContext: {
+        originalTaskId: original.taskId,
+        error: original.result.conflicts?.[0]?.error || original.error,
+        files,
+        patches: original.result.patches,
+      },
+    });
+    await worktreeService.attachTask(tree.id, task.taskId);
+    emit({ type: 'task-prepared', task: publicTask(task) });
+    await chatGPTView.prepare(task);
+    return publicTask(task);
+  });
+
   ipcMain.handle('task:list', async () => (await taskService.listTasks()).map(publicTask));
   ipcMain.handle('task:get', async (_event, taskId) => publicTask(await taskService.getTask(taskId)));
+  ipcMain.handle('task:open-chat', async (_event, taskId) => {
+    const task = await taskService.getTask(taskId);
+    return chatGPTView.openTaskConversation(task);
+  });
   ipcMain.handle('task:submit', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
     return publicTask(await chatGPTView.submit(task));

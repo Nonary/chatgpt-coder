@@ -1,7 +1,13 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { createBundle, createSnapshotBundle, inspectRepository } = require('./git');
+const AdmZip = require('adm-zip');
+const {
+  createBundle,
+  createSnapshotBundle,
+  createWorkingSnapshotBundle,
+  inspectRepository,
+} = require('./git');
 
 const SCHEMA_VERSION = 1;
 
@@ -9,16 +15,25 @@ function buildAgentInstructions(taskId) {
   return `# Patchwork task protocol
 
 You are working on a software task supplied by the user through Patchwork IDE.
-The uploaded TXT file is a self-contained plain-text transport envelope. Do not merely describe a solution: reconstruct the repositories, make the requested changes, and return the exact plain-text result described below. Do not create a downloadable result file.
+The uploaded ZIP is a self-contained task package containing Git bundles. Do not merely describe a solution: extract the package, inspect the repositories, make the requested changes, and return the exact downloadable text result described below.
 
 ## Set up the repositories
 
-1. Read the uploaded JSON envelope. It has \`format: "patchwork-task-plain-text-v1"\` and a \`files\` array.
-2. For every file entry, base64-decode \`content\` to its relative \`path\` in a writable directory. This reconstructs \`manifest.json\`, \`TASK.md\`, \`AGENTS.md\`, and each Git bundle without using a binary attachment.
-3. Read \`manifest.json\` and \`TASK.md\` completely.
-4. For each entry in \`manifest.json.repositories\`, clone \`bundleFile\` into \`workspace/<id>\`.
-5. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
-6. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
+1. Extract the uploaded ZIP into a writable directory.
+2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely.
+3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`.
+4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
+5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
+6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.
+
+## Inspect supplied working changes
+
+For every manifest repository with \`workingChanges: true\`, the supplied \`baseCommit\` captures staged, unstaged, untracked, or unmerged files that already existed in the coding tree. These changes are task input, not work you should discard.
+
+- Read its \`workingStatus\`, then run \`git status --short\` and inspect the files and conflict markers carefully.
+- When \`sourceHead\` is present, inspect the captured working changes with \`git diff --binary <sourceHead> <baseCommit> -- .\`.
+- To view those captured files as unstaged changes, you may run \`git reset --mixed <sourceHead>\`, inspect \`git status\` and \`git diff\`, then run \`git reset --hard <baseCommit>\` before implementing the task.
+- If \`CONFLICTS.md\` exists, read it completely and inspect every original patch under \`conflicts/\`. Resolve the current unmerged or unstaged state while preserving the intended changes from both sides.
 
 You may create commits as checkpoints. Do not rewrite the supplied base history and do not add generated dependencies, build output, credentials, or unrelated files.
 
@@ -26,13 +41,13 @@ You may create commits as checkpoints. Do not rewrite the supplied base history 
 
 Follow any repository-specific \`AGENTS.md\` files found after cloning. Implement the task in \`TASK.md\`, run relevant checks when possible, and inspect the final diff. Keep changes focused on the requested task.
 
-## Produce the plain-text result
+## Produce the downloadable text result
 
 Generate one binary-safe patch per repository from the supplied base commit so checkpoint commits are included:
 
 \`git diff --binary <baseCommit> -- . > ../../result/patches/<id>.patch\`
 
-Base64-encode each patch file. In your final response, output the start marker on its own line, then one JSON object with this exact shape, then the end marker on its own line:
+Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-result-${taskId}.txt\`. Its contents must be the start marker on its own line, then one JSON object with this exact shape, then the end marker on its own line:
 
 \`PATCHWORK_RESULT_V1\`
 
@@ -57,12 +72,46 @@ Base64-encode each patch file. In your final response, output the start marker o
 
 \`PATCHWORK_RESULT_END\`
 
-The commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). The markers and JSON must be visible response text, not a download, attachment, link, or image. Do not abbreviate, omit, or truncate patch data. You may put the complete envelope in a single code block, but put no commentary inside the markers.
+The commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat, but do not print or paste the result envelope into the chat itself.
 `;
 }
 
 function buildHandoffPrompt(taskId, taskText) {
-  return `I attached a Patchwork IDE plain-text task envelope. Reconstruct it, read AGENTS.md and TASK.md completely, then solve the task against the bundled Git repositories. Return the required PATCHWORK_RESULT_V1 plain-text envelope directly in your final response; do not create a downloadable file.\n\nTask summary:\n${taskText}`;
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.\n\nTask summary:\n${taskText}`;
+}
+
+function addStoredLocalFile(zip, localPath, archiveDirectory) {
+  zip.addLocalFile(localPath, archiveDirectory);
+  const entryName = `${archiveDirectory}/${path.basename(localPath)}`.replaceAll('\\', '/');
+  const entry = zip.getEntry(entryName);
+  if (entry) entry.header.method = 0;
+}
+
+function conflictMarkdown(context, patchFiles) {
+  const files = context.files?.length
+    ? context.files.map((file) => `- \`${file}\``).join('\n')
+    : '- Git could not identify a single unmerged path; inspect the original patch and current working tree.';
+  const patches = patchFiles.map((item) => `- \`${item.file}\` for repository \`${item.id}\``).join('\n');
+  return `# Conflict resolution context
+
+Patchwork could not cleanly apply the result from task \`${context.originalTaskId}\` because the coding tree changed or Git reported merge conflicts.
+
+## Current conflict files
+
+${files}
+
+## Original result patches
+
+${patches || '- No non-empty original patch was available.'}
+
+## Apply error
+
+\`\`\`text
+${String(context.error || 'The patch did not apply cleanly.').replaceAll('```', "'''")}
+\`\`\`
+
+The bundled repository base captures the coding tree exactly as it exists now, including unstaged files and conflict markers. Inspect \`git status\`, \`git diff\`, every conflict marker, and the original result patch before editing. Resolve the conflict as part of the requested task; do not merely describe a resolution.
+`;
 }
 
 class TaskService {
@@ -111,7 +160,25 @@ class TaskService {
           sourceHead: repository.baseCommit,
           isSnapshot: false,
           snapshotFingerprint: null,
+          workingChanges: false,
+          workingStatus: '',
         };
+      } else if (repository.hasHead) {
+        const snapshotPath = path.join(taskDir, '.snapshot', repository.id);
+        try {
+          const snapshot = await createWorkingSnapshotBundle(repository, snapshotPath, bundlePath);
+          taskRepository = {
+            ...repository,
+            sourceHead: repository.baseCommit,
+            baseCommit: snapshot.baseCommit,
+            isSnapshot: true,
+            snapshotFingerprint: snapshot.snapshotFingerprint,
+            workingChanges: true,
+            workingStatus: repository.statusSummary,
+          };
+        } finally {
+          await fs.rm(snapshotPath, { recursive: true, force: true });
+        }
       } else {
         const snapshotPath = path.join(taskDir, '.snapshot', repository.id);
         try {
@@ -122,6 +189,8 @@ class TaskService {
             baseCommit: snapshot.baseCommit,
             isSnapshot: true,
             snapshotFingerprint: snapshot.snapshotFingerprint,
+            workingChanges: true,
+            workingStatus: repository.statusSummary,
           };
         } finally {
           await fs.rm(snapshotPath, { recursive: true, force: true });
@@ -133,9 +202,24 @@ class TaskService {
         name: repository.name,
         branch: repository.branch,
         baseCommit: taskRepository.baseCommit,
+        sourceHead: taskRepository.sourceHead,
         snapshot: taskRepository.isSnapshot,
+        workingChanges: taskRepository.workingChanges,
+        workingStatus: taskRepository.workingStatus,
         bundleFile,
       });
+    }
+
+    const conflictPatchFiles = [];
+    if (input.conflictContext) {
+      const conflictDir = path.join(taskDir, 'conflicts');
+      await fs.mkdir(conflictDir, { recursive: true });
+      for (const patch of input.conflictContext.patches || []) {
+        if (!patch?.localPath || !/^[a-z0-9._-]+$/i.test(String(patch.id || ''))) continue;
+        const file = `conflicts/${patch.id}.patch`;
+        await fs.copyFile(patch.localPath, path.join(taskDir, file));
+        conflictPatchFiles.push({ id: patch.id, file });
+      }
     }
 
     const createdAt = new Date().toISOString();
@@ -145,6 +229,13 @@ class TaskService {
       createdAt,
       repositories: publicRepositories,
     };
+    if (input.conflictContext) {
+      manifest.conflictResolution = {
+        originalTaskId: input.conflictContext.originalTaskId,
+        files: input.conflictContext.files || [],
+        patches: conflictPatchFiles,
+      };
+    }
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
     const agentInstructions = buildAgentInstructions(taskId);
 
@@ -152,34 +243,40 @@ class TaskService {
       fs.writeFile(path.join(taskDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
       fs.writeFile(path.join(taskDir, 'TASK.md'), taskMarkdown),
       fs.writeFile(path.join(taskDir, 'AGENTS.md'), agentInstructions),
+      ...(input.conflictContext ? [
+        fs.writeFile(path.join(taskDir, 'CONFLICTS.md'), conflictMarkdown(input.conflictContext, conflictPatchFiles)),
+      ] : []),
     ]);
 
-    const transportFiles = ['manifest.json', 'TASK.md', 'AGENTS.md', ...publicRepositories.map((item) => item.bundleFile)];
-    const files = await Promise.all(transportFiles.map(async (relativePath) => ({
-      path: relativePath,
-      encoding: 'base64',
-      content: (await fs.readFile(path.join(taskDir, relativePath))).toString('base64'),
-    })));
-    const packagePath = path.join(taskDir, `chatgpt-ide-task-${taskId}.txt`);
-    await fs.writeFile(packagePath, `${JSON.stringify({
-      format: 'patchwork-task-plain-text-v1',
-      taskId,
-      files,
-    }, null, 2)}\n`, 'utf8');
+    const packagePath = path.join(taskDir, `chatgpt-ide-task-${taskId}.zip`);
+    const zip = new AdmZip();
+    zip.addLocalFile(path.join(taskDir, 'manifest.json'));
+    zip.addLocalFile(path.join(taskDir, 'TASK.md'));
+    zip.addLocalFile(path.join(taskDir, 'AGENTS.md'));
+    if (input.conflictContext) zip.addLocalFile(path.join(taskDir, 'CONFLICTS.md'));
+    for (const repository of publicRepositories) {
+      addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'repositories');
+    }
+    for (const patch of conflictPatchFiles) zip.addLocalFile(path.join(taskDir, patch.file), 'conflicts');
+    await fs.writeFile(packagePath, await zip.toBufferPromise());
+    const packageStat = await fs.stat(packagePath);
 
     const record = {
       ...manifest,
       taskText,
       autoApply: input.autoApply !== false,
-      transport: 'plain-text-base64',
+      transport: 'zip-git-bundle',
+      resultTransport: 'downloaded-text-file',
       treeId: input.tree?.id || null,
       treeName: input.tree?.name || null,
       sourceRepositoryPath: input.tree?.repositoryPath || null,
       packagePath,
+      packageBytes: packageStat.size,
       handoffPrompt: buildHandoffPrompt(taskId, taskText),
       repositories: taskRepositories,
       state: 'prepared',
       result: null,
+      conflictContext: input.conflictContext ? manifest.conflictResolution : null,
     };
     await this.saveTask(record);
     return record;

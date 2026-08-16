@@ -8,6 +8,7 @@ const { promisify } = require('node:util');
 const execFileAsync = promisify(execFile);
 
 async function runGit(cwd, args, options = {}) {
+  const { env: extraEnvironment, ...commandOptions } = options;
   try {
     const result = await execFileAsync('git', args, {
       cwd,
@@ -16,8 +17,9 @@ async function runGit(cwd, args, options = {}) {
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',
+        ...extraEnvironment,
       },
-      ...options,
+      ...commandOptions,
     });
     return {
       stdout: result.stdout,
@@ -160,8 +162,51 @@ async function createSnapshotBundle(repository, snapshotPath, outputPath) {
   };
 }
 
-async function createBundle(repository, outputPath) {
-  await runGit(repository.path, ['bundle', 'create', outputPath, 'HEAD']);
+async function createWorkingSnapshotBundle(repository, scratchPath, outputPath) {
+  if (!repository.hasHead) {
+    return createSnapshotBundle(repository, path.join(scratchPath, 'repository'), outputPath);
+  }
+
+  const fingerprintBefore = await fingerprintRepository(repository.path);
+  await fs.mkdir(scratchPath, { recursive: true });
+  const temporaryIndex = path.join(scratchPath, 'index');
+  const indexEnvironment = { GIT_INDEX_FILE: temporaryIndex };
+  await runGit(repository.path, ['read-tree', 'HEAD'], { env: indexEnvironment });
+  await runGit(repository.path, ['add', '-A', '--', '.'], { env: indexEnvironment });
+  const { stdout: treeOutput } = await runGit(repository.path, ['write-tree'], { env: indexEnvironment });
+  const snapshotEnvironment = {
+    GIT_AUTHOR_NAME: 'Patchwork Snapshot',
+    GIT_AUTHOR_EMAIL: 'snapshot@patchwork.invalid',
+    GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z',
+    GIT_COMMITTER_NAME: 'Patchwork Snapshot',
+    GIT_COMMITTER_EMAIL: 'snapshot@patchwork.invalid',
+    GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z',
+  };
+  const { stdout: commitOutput } = await runGit(repository.path, [
+    'commit-tree', treeOutput.trim(), '-p', repository.baseCommit,
+    '-m', 'Patchwork supplied working tree snapshot',
+  ], { env: snapshotEnvironment });
+  const snapshotCommit = commitOutput.trim();
+  const fingerprintAfter = await fingerprintRepository(repository.path);
+  if (fingerprintBefore !== fingerprintAfter) {
+    throw new Error(`${repository.name} changed while Patchwork was creating its working-tree snapshot. Try again.`);
+  }
+
+  const snapshotRef = `refs/patchwork/task-bundles/${crypto.randomUUID()}`;
+  await runGit(repository.path, ['update-ref', snapshotRef, snapshotCommit]);
+  try {
+    await createBundle(repository, outputPath, ['HEAD', snapshotRef]);
+  } finally {
+    await runGit(repository.path, ['update-ref', '-d', snapshotRef]).catch(() => {});
+  }
+  return {
+    baseCommit: snapshotCommit,
+    snapshotFingerprint: fingerprintAfter,
+  };
+}
+
+async function createBundle(repository, outputPath, revisions = ['HEAD']) {
+  await runGit(repository.path, ['bundle', 'create', outputPath, ...revisions]);
   await runGit(repository.path, ['bundle', 'verify', outputPath]);
 }
 
@@ -199,11 +244,29 @@ async function checkPatch(repositoryPath, patchPath) {
   return { stat: stat.trim(), numstat: numstat.trim() };
 }
 
-async function applyPatch(repositoryPath, patchPath, reverse = false) {
+async function inspectPatch(repositoryPath, patchPath) {
+  const [{ stdout: stat }, { stdout: numstat }] = await Promise.all([
+    runGit(repositoryPath, ['apply', '--stat', '--binary', patchPath]),
+    runGit(repositoryPath, ['apply', '--numstat', '--binary', patchPath]),
+  ]);
+  return { stat: stat.trim(), numstat: numstat.trim() };
+}
+
+async function applyPatch(repositoryPath, patchPath, options = {}) {
+  if (typeof options === 'boolean') options = { reverse: options };
   const args = ['apply', '--binary'];
-  if (reverse) args.push('--reverse');
+  if (options.reverse) args.push('--reverse');
+  if (options.threeWay) args.push('--3way');
+  if (options.index) args.push('--index');
   args.push(patchPath);
   await runGit(repositoryPath, args);
+}
+
+async function listConflictedFiles(repositoryPath) {
+  const { stdout } = await runGit(repositoryPath, [
+    'diff', '--name-only', '--diff-filter=U', '-z', '--', '.',
+  ]);
+  return stdout.split('\0').filter(Boolean);
 }
 
 module.exports = {
@@ -211,8 +274,11 @@ module.exports = {
   checkPatch,
   createBundle,
   createSnapshotBundle,
+  createWorkingSnapshotBundle,
   fingerprintRepository,
   inspectRepository,
+  inspectPatch,
+  listConflictedFiles,
   listSnapshotPaths,
   runGit,
   slugify,

@@ -20,7 +20,7 @@ const elements = Object.fromEntries(
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'result-card', 'result-summary', 'patch-list',
-    'apply-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
+    'apply-button', 'resolve-conflicts-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
     'chatgpt-surface', 'browser-back-button', 'browser-forward-button',
     'browser-reload-button', 'new-chat-button', 'browser-title', 'browser-status',
     'browser-status-dot',
@@ -198,18 +198,42 @@ function taskLabel(task) {
   return firstLine.length > 34 ? `${firstLine.slice(0, 34)}…` : firstLine;
 }
 
+function formatElapsed(startedAt, now = Date.now()) {
+  const started = new Date(startedAt).getTime();
+  if (!Number.isFinite(started)) return '0s';
+  const elapsedSeconds = Math.max(0, Math.floor((now - started) / 1000));
+  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+  const minutes = Math.floor(elapsedSeconds / 60);
+  const seconds = elapsedSeconds % 60;
+  if (minutes < 60) return `${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function updateTaskElapsedTimes() {
+  elements['task-list'].querySelectorAll('.task-elapsed[data-started-at]').forEach((element) => {
+    element.textContent = formatElapsed(element.dataset.startedAt);
+  });
+}
+
 function renderTaskList() {
   elements['task-list'].innerHTML = state.tasks.length
     ? state.tasks.map((task) => `
       <button class="task-nav-item ${state.activeTask?.taskId === task.taskId ? 'active' : ''}" data-task-id="${escapeHtml(task.taskId)}">
-        <strong>${escapeHtml(taskLabel(task))}</strong>
+        <span class="task-name-row">
+          <strong>${escapeHtml(taskLabel(task))}</strong>
+          ${task.state === 'submitted' && task.submittedAt ? `<time class="task-elapsed" data-started-at="${escapeHtml(task.submittedAt)}">${escapeHtml(formatElapsed(task.submittedAt))}</time>` : ''}
+        </span>
         <span>${escapeHtml(task.state)} · ${escapeHtml(formatTime(task.createdAt))}</span>
       </button>`).join('')
     : '<p class="muted small">No tasks yet.</p>';
   elements['task-list'].querySelectorAll('.task-nav-item').forEach((button) => {
     button.addEventListener('click', async () => {
       try {
-        showTask(await window.patchwork.getTask(button.dataset.taskId));
+        const task = await window.patchwork.getTask(button.dataset.taskId);
+        showTask(task);
+        const opened = await window.patchwork.openTaskChat(task.taskId);
+        if (!opened.opened && opened.message) showToast(opened.message, task.state !== 'prepared');
       } catch (error) {
         showToast(error.message, true);
       }
@@ -219,9 +243,10 @@ function renderTaskList() {
 
 const statusText = {
   prepared: ['Package prepared', 'Attach the package in ChatGPT and send the copied instructions.'],
-  submitted: ['Task submitted', 'ChatGPT is working in the embedded browser. Patchwork is watching for the result.'],
-  ready: ['Patch validated', 'The plain-text result matches the task and is safe to commit.'],
+  submitted: ['Task submitted', 'ChatGPT is working in the embedded browser. Patchwork is watching for the downloadable text result.'],
+  ready: ['Patch validated', 'The downloaded text result matches the task and is safe to commit.'],
   applied: ['Changes committed', 'The validated patch is committed in this task’s coding tree.'],
+  conflicted: ['Merge conflicts need resolution', 'The coding tree and ChatGPT result both contain changes that need to be reconciled.'],
   'rolled-back': ['Changes reverted', 'A revert commit was created in this task’s coding tree.'],
   failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
 };
@@ -235,8 +260,10 @@ function renderResult(task) {
     <div class="patch-item">
       <strong>${escapeHtml(patch.name || patch.id)}</strong>
       <pre>${escapeHtml(patch.stat || 'No changes')}</pre>
-    </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '');
+    </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '')
+    + (task.result.conflicts?.length ? task.result.conflicts.map((conflict) => `<div class="patch-item"><strong>Merge conflict</strong><pre>${escapeHtml((conflict.files || []).length ? conflict.files.join('\n') : conflict.error || 'The patch did not apply cleanly.')}</pre></div>`).join('') : '');
   elements['apply-button'].classList.toggle('hidden', task.state !== 'ready');
+  elements['resolve-conflicts-button'].classList.toggle('hidden', task.state !== 'conflicted' || !task.treeId);
   elements['rollback-button'].classList.toggle('hidden', task.state !== 'applied');
 }
 
@@ -259,6 +286,10 @@ function showTask(task) {
   elements['status-badge'].className = `status-badge ${task.state}`;
   addActivity(`Task ${task.state}`, task.updatedAt || task.createdAt);
   addActivity(`${task.repositories.length} repository snapshot${task.repositories.length === 1 ? '' : 's'} prepared`, task.createdAt);
+  if (task.packageBytes) {
+    const packageMegabytes = task.packageBytes / (1024 * 1024);
+    addActivity(`Task package ${packageMegabytes >= 1 ? `${packageMegabytes.toFixed(1)} MB` : `${Math.ceil(task.packageBytes / 1024)} KB`}`, task.createdAt);
+  }
   renderResult(task);
   renderTaskList();
   window.patchwork.setBrowserVisible(true);
@@ -556,6 +587,21 @@ elements['copy-prompt-button'].addEventListener('click', () => runTaskAction(win
 elements['reveal-package-button'].addEventListener('click', () => runTaskAction(window.patchwork.revealPackage));
 elements['import-result-button'].addEventListener('click', () => runTaskAction(window.patchwork.importResult));
 elements['apply-button'].addEventListener('click', () => runTaskAction(window.patchwork.applyTask, 'Changes applied.'));
+elements['resolve-conflicts-button'].addEventListener('click', async () => {
+  if (!state.activeTask) return;
+  try {
+    const task = await window.patchwork.resubmitConflicts(state.activeTask.taskId);
+    const index = state.tasks.findIndex((item) => item.taskId === task.taskId);
+    if (index >= 0) state.tasks[index] = task;
+    else state.tasks.unshift(task);
+    await refreshTrees();
+    showTask(task);
+    showToast('Conflict context packaged. Submitting it in a fresh ChatGPT chat…');
+    setTimeout(() => runTaskAction(window.patchwork.submitTask), 700);
+  } catch (error) {
+    showToast(error.message, true);
+  }
+});
 elements['rollback-button'].addEventListener('click', () => runTaskAction(window.patchwork.rollbackTask, 'Changes rolled back.'));
 elements['new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
 elements['browser-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));
@@ -607,6 +653,7 @@ window.addEventListener('resize', syncBrowserBounds);
 window.addEventListener('scroll', syncBrowserBounds, true);
 new ResizeObserver(syncBrowserBounds).observe(elements['chatgpt-surface']);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
+setInterval(updateTaskElapsedTimes, 1_000);
 
 window.patchwork.onTaskEvent((event) => {
   if (event.task) {
@@ -617,6 +664,10 @@ window.patchwork.onTaskEvent((event) => {
   if (event.task && (!state.activeTask || state.activeTask.taskId === event.task.taskId)) showTask(event.task);
   if (event.message) addActivity(event.message);
   if (event.type === 'task-failed') showToast(event.message || 'Task failed.', true);
+  if (event.type === 'task-conflicted') {
+    showToast('Merge conflicts need a follow-up resolution task.', true);
+    refreshTrees().catch(() => {});
+  }
   if (event.type === 'task-applied') {
     showToast('ChatGPT changes were validated and committed to the coding tree.');
     refreshTrees().catch(() => {});

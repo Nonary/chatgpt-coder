@@ -40,9 +40,12 @@ button { cursor: pointer; }
 .task-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
 .task-nav-item { border: 0; background: transparent; color: var(--muted); padding: 10px; border-radius: 9px; text-align: left; }
 .task-nav-item:hover, .task-nav-item.active { background: var(--panel); color: var(--text); }
-.task-nav-item strong, .task-nav-item span { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-nav-item strong, .task-nav-item > span:not(.task-name-row) { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-name-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.task-name-row strong { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-elapsed { flex: none; color: var(--accent); font: 700 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .task-nav-item strong { font-size: 12px; }
-.task-nav-item span { margin-top: 4px; font-size: 10px; color: #777d70; }
+.task-nav-item > span:not(.task-name-row) { margin-top: 4px; font-size: 10px; color: #777d70; }
 .privacy-note { margin-top: auto; padding: 13px; border: 1px solid var(--line-soft); border-radius: 11px; color: #7f8678; font-size: 10px; line-height: 1.5; }
 .privacy-dot { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
 
@@ -191,6 +194,7 @@ textarea::placeholder { color: #606659; }
 .status-card p:last-child { margin: 7px 0 0; color: var(--muted); font-size: 12px; }
 .status-badge { padding: 8px 12px; border-radius: 999px; background: #29311e; color: var(--accent); font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
 .status-badge.failed { color: #ff9c8f; background: #301d1a; }
+.status-badge.conflicted { color: #ffd39a; background: #382713; }
 .status-badge.applied { color: #182006; background: var(--accent); }
 .status-badge.submitted { color: #cbe6ff; background: #1b2b38; }
 .task-layout { padding-top: 20px; }
