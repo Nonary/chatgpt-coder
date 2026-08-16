@@ -12,6 +12,7 @@ const TASK_MONITOR_INTERVAL_MILLISECONDS = 1_500;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
+const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
@@ -83,7 +84,8 @@ function delay(milliseconds) {
 }
 
 function resultTaskId(filename) {
-  return RESULT_NAME_PATTERN.exec(path.basename(String(filename || '')))?.[1]?.toLowerCase() || null;
+  const basename = path.basename(String(filename || ''));
+  return RESULT_NAME_PATTERN.exec(basename)?.[1]?.toLowerCase() || null;
 }
 
 function conversationIdFromStreamStatusUrl(value) {
@@ -171,6 +173,12 @@ function isChatGPTConversationUrl(value) {
   }
 }
 
+function normalizeConversationTitle(value) {
+  const title = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!title || /^(?:ChatGPT|New chat)$/i.test(title)) return '';
+  return title;
+}
+
 async function recoverUnconfirmedSubmissions(taskService, tasks) {
   return Promise.all(tasks.map((task) => {
     if (task.state !== 'submitted' || isChatGPTConversationUrl(task.conversationUrl)) return task;
@@ -179,6 +187,7 @@ async function recoverUnconfirmedSubmissions(taskService, tasks) {
       submittedAt: null,
       conversationUrl: null,
       conversationId: null,
+      conversationTitle: null,
       chatStatus: null,
       chatStatusRaw: null,
       chatFinishedAt: null,
@@ -509,8 +518,93 @@ function buildTaskConfigurationScript(model, reasoningMode, taskId = null) {
   })()`;
 }
 
-function buildTaskResultDetectionScript(taskId, streamFinished = false) {
-  const expectedName = `chatgpt-ide-result-${taskId}.txt`;
+function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = false) {
+  return `(() => {
+    const filename = ${JSON.stringify(filename)};
+    const visible = (element) => {
+      if (!element) return false;
+      const style = getComputedStyle(element);
+      const bounds = element.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0;
+    };
+    const roots = [document];
+    const visited = new Set();
+    const notices = [];
+    const candidates = [];
+    const fileInputs = [];
+    while (roots.length) {
+      const root = roots.shift();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      notices.push(...root.querySelectorAll('[role="dialog"], [role="alert"], [aria-live]'));
+      fileInputs.push(...root.querySelectorAll('input[type="file"]'));
+      candidates.push(...root.querySelectorAll(
+        '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div'
+      ));
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+      }
+    }
+    const duplicateNotice = notices.filter(visible).find((element) => /already (?:been )?uploaded|already uploaded|duplicate file/i.test(
+      [element.textContent, element.getAttribute('aria-label')].filter(Boolean).join(' '),
+    ));
+    let dismissedDuplicate = false;
+    if (duplicateNotice && ${Boolean(dismissDuplicateNotice)}) {
+      const buttons = [...duplicateNotice.querySelectorAll('button')];
+      const dismiss = buttons.find((button) => /^(?:got it|close|dismiss|ok|okay)$/i.test([
+        button.textContent, button.getAttribute('aria-label'), button.getAttribute('title'),
+      ].filter(Boolean).join(' ').trim()))
+        || duplicateNotice.querySelector('button[data-testid*="close"], button[aria-label="Close"]');
+      if (dismiss) {
+        dismiss.click();
+        dismissedDuplicate = true;
+      }
+    }
+    const selectedByInput = fileInputs.some((input) => [...(input.files || [])]
+      .some((file) => file.name === filename));
+    // DOM.setFileInputFiles selected the exact unique package. Treat that as
+    // authoritative before inspecting attachment-chip text: broad page-level
+    // containers also contain the filename and can include unrelated progress
+    // indicators, which would otherwise look like an upload that is busy forever.
+    // clickSend separately waits for ChatGPT to enable submission.
+    if (selectedByInput) return {
+      attached: true,
+      busy: false,
+      duplicateNotice: Boolean(duplicateNotice),
+      dismissedDuplicate,
+    };
+    // Source Control intentionally keeps the embedded ChatGPT view hidden at
+    // zero bounds while a summary runs. Attachment chips still exist in the
+    // page DOM in that state, but their client rectangles are empty. The task
+    // package filename contains a unique task ID, so DOM presence is the
+    // reliable confirmation signal here; rendered geometry is not.
+    const attachment = candidates.find((element) => [
+      element.textContent,
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+    ].filter(Boolean).some((value) => String(value).includes(filename)));
+    if (!attachment) return {
+      attached: false,
+      busy: false,
+      duplicateNotice: Boolean(duplicateNotice),
+      dismissedDuplicate,
+    };
+    const card = attachment.closest('[data-testid*="file"], [data-testid*="attach"]') || attachment.parentElement;
+    const statusText = [card?.textContent, card?.getAttribute?.('aria-label')].filter(Boolean).join(' ');
+    const busy = /uploading|processing|attaching/i.test(statusText)
+      || Boolean(card?.querySelector?.('[role="progressbar"], progress, [aria-busy="true"]'));
+    return {
+      attached: true,
+      busy,
+      duplicateNotice: Boolean(duplicateNotice),
+      dismissedDuplicate,
+    };
+  })()`;
+}
+
+function buildTaskResultDetectionScript(taskOrId, streamFinished = false) {
+  const task = typeof taskOrId === 'string' ? { taskId: taskOrId } : taskOrId;
+  const expectedName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
   return `(() => {
     const expected = ${JSON.stringify(expectedName.toLowerCase())};
     const streamFinished = ${Boolean(streamFinished)};
@@ -640,7 +734,7 @@ class ChatGPTView {
     this.worktreeService = worktreeService;
     this.onMergeResult = onMergeResult;
     this.knownTasks = new Map(restoredTasks
-      .filter((task) => !['applied', 'resolved', 'rolled-back'].includes(task.state))
+      .filter((task) => !['applied', 'completed', 'resolved', 'rolled-back'].includes(task.state))
       .map((task) => [task.taskId.toLowerCase(), task]));
     this.activeTask = restoredTasks
       .filter((task) => task.state === 'submitted' && isChatGPTConversationUrl(task.conversationUrl))
@@ -651,6 +745,7 @@ class ChatGPTView {
       .sort((left, right) => String(right.updatedAt || right.createdAt)
         .localeCompare(String(left.updatedAt || left.createdAt)))[0] || null;
     this.resultAttempts = new Map();
+    this.resultWaiters = new Map();
     this.pendingDownload = null;
     this.processingTasks = new Set();
     this.monitorBusy = false;
@@ -724,10 +819,41 @@ class ChatGPTView {
       this.handleNavigation(url);
       this.scheduleTaskConfigurationPicker();
     });
-    contents.on('page-title-updated', (_event, title) => this.onEvent({ type: 'browser-title', title }));
+    contents.on('page-title-updated', (_event, title) => {
+      this.handlePageTitleUpdated(title).catch(() => {});
+    });
     contents.on('render-process-gone', (_event, details) => {
       this.onEvent({ type: 'task-failed', message: `The embedded ChatGPT renderer stopped: ${details.reason}` });
     });
+  }
+
+  async handlePageTitleUpdated(title) {
+    const normalizedTitle = normalizeConversationTitle(title);
+    const event = { type: 'browser-title', title };
+    const task = this.activeTask;
+    if (!normalizedTitle || !task?.conversationUrl) {
+      await this.onEvent(event);
+      return;
+    }
+
+    const currentUrl = this.view.webContents.getURL();
+    const currentConversationId = conversationIdFromRouteUrl(currentUrl);
+    const taskConversationId = conversationIdFromRouteUrl(task.conversationUrl) || task.conversationId;
+    const sameConversation = currentUrl === task.conversationUrl
+      || Boolean(taskConversationId && currentConversationId === taskConversationId);
+    if (!sameConversation || task.conversationTitle === normalizedTitle) {
+      await this.onEvent(event);
+      return;
+    }
+
+    try {
+      const saved = await this.taskService.updateTask(task.taskId, { conversationTitle: normalizedTitle });
+      if (this.activeTask?.taskId === task.taskId) this.activeTask = saved;
+      this.knownTasks.set(task.taskId.toLowerCase(), saved);
+      await this.onEvent({ ...event, task: saved });
+    } catch {
+      await this.onEvent(event);
+    }
   }
 
   installConversationStatusListener() {
@@ -785,7 +911,7 @@ class ChatGPTView {
 
       this.pendingDownload = null;
       this.processingTasks.add(task.taskId);
-      const safeName = `chatgpt-ide-result-${task.taskId}.txt`;
+      const safeName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
       const incomingDir = path.join(this.taskService.taskDirectory(task.taskId), 'incoming');
       const savePath = path.join(incomingDir, safeName);
       try {
@@ -801,7 +927,11 @@ class ChatGPTView {
       }
 
       item.once('done', async (_downloadEvent, state) => {
+        const taskKey = task.taskId.toLowerCase();
+        const waiter = this.resultWaiters.get(taskKey);
         if (state !== 'completed') {
+          waiter?.reject(new Error(`The ChatGPT download ended with status: ${state}`));
+          this.resultWaiters.delete(taskKey);
           this.processingTasks.delete(task.taskId);
           await this.onEvent({
             type: 'task-failed',
@@ -811,12 +941,15 @@ class ChatGPTView {
           return;
         }
         try {
-          await this.onResult(task.taskId, savePath);
-          this.knownTasks.delete(task.taskId.toLowerCase());
+          const processedTask = await this.onResult(task.taskId, savePath);
+          waiter?.resolve(processedTask);
+          this.knownTasks.delete(taskKey);
           if (this.activeTask?.taskId === task.taskId) this.activeTask = null;
-        } catch {
+        } catch (error) {
+          waiter?.reject(error);
           // ResultService emits the detailed validation error.
         } finally {
+          this.resultWaiters.delete(taskKey);
           this.processingTasks.delete(task.taskId);
         }
       });
@@ -931,6 +1064,23 @@ class ChatGPTView {
         ? `A fresh chat in ChatGPT project “${task.chatgptProject.name}” is ready for automated submission.`
         : 'A fresh embedded ChatGPT chat is ready for automated submission.',
     });
+  }
+
+  async restoreActiveContext(task = null, merge = null) {
+    this.activeTask = task || null;
+    this.activeMerge = merge || null;
+    if (task?.taskId) this.knownTasks.set(task.taskId.toLowerCase(), task);
+
+    const conversationUrl = merge?.mergeConversationUrl || task?.conversationUrl || null;
+    if (conversationUrl && isChatGPTConversationUrl(conversationUrl)) {
+      const currentUrl = this.view.webContents.getURL();
+      const currentConversationId = conversationIdFromRouteUrl(currentUrl);
+      const targetConversationId = conversationIdFromRouteUrl(conversationUrl);
+      const conversationAlreadyOpen = currentUrl === conversationUrl
+        || Boolean(targetConversationId && currentConversationId === targetConversationId);
+      if (!conversationAlreadyOpen) await this.view.webContents.loadURL(conversationUrl);
+    }
+    this.installResultWatcher();
   }
 
   async openTaskConversation(task) {
@@ -1440,55 +1590,10 @@ class ChatGPTView {
   }
 
   async packageAttachmentStatus(filename, dismissDuplicateNotice = false) {
-    return this.view.webContents.executeJavaScript(`(() => {
-      const filename = ${JSON.stringify(filename)};
-      const visible = (element) => {
-        const style = getComputedStyle(element);
-        const bounds = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && bounds.width > 0 && bounds.height > 0;
-      };
-      const notices = [...document.querySelectorAll('[role="dialog"], [role="alert"], [aria-live]')]
-        .filter(visible);
-      const duplicateNotice = notices.find((element) => /already (?:been )?uploaded|already uploaded|duplicate file/i.test(
-        [element.textContent, element.getAttribute('aria-label')].filter(Boolean).join(' '),
-      ));
-      let dismissedDuplicate = false;
-      if (duplicateNotice && ${Boolean(dismissDuplicateNotice)}) {
-        const buttons = [...duplicateNotice.querySelectorAll('button')];
-        const dismiss = buttons.find((button) => /^(?:got it|close|dismiss|ok|okay)$/i.test([
-          button.textContent, button.getAttribute('aria-label'), button.getAttribute('title'),
-        ].filter(Boolean).join(' ').trim()))
-          || duplicateNotice.querySelector('button[data-testid*="close"], button[aria-label="Close"]');
-        if (dismiss) {
-          dismiss.click();
-          dismissedDuplicate = true;
-        }
-      }
-      const candidates = [...document.querySelectorAll(
-        '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div'
-      )].filter(visible);
-      const attachment = candidates.find((element) => [
-        element.textContent,
-        element.getAttribute('aria-label'),
-        element.getAttribute('title'),
-      ].filter(Boolean).some((value) => String(value).includes(filename)));
-      if (!attachment) return {
-        attached: false,
-        busy: false,
-        duplicateNotice: Boolean(duplicateNotice),
-        dismissedDuplicate,
-      };
-      const card = attachment.closest('[data-testid*="file"], [data-testid*="attach"]') || attachment.parentElement;
-      const statusText = [card?.textContent, card?.getAttribute?.('aria-label')].filter(Boolean).join(' ');
-      const busy = /uploading|processing|attaching/i.test(statusText)
-        || Boolean(card?.querySelector?.('[role="progressbar"], progress, [aria-busy="true"]'));
-      return {
-        attached: true,
-        busy,
-        duplicateNotice: Boolean(duplicateNotice),
-        dismissedDuplicate,
-      };
-    })()`, true).catch(() => ({
+    return this.view.webContents.executeJavaScript(
+      buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice),
+      true,
+    ).catch(() => ({
       attached: false,
       busy: false,
       duplicateNotice: false,
@@ -1545,10 +1650,13 @@ class ChatGPTView {
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
+    const summaryOnly = Boolean(task.summaryOnly);
     await this.onEvent({
       type: 'automation-started',
       taskId: task.taskId,
-      message: 'Injecting the task into the embedded ChatGPT composer…',
+      message: summaryOnly
+        ? 'Injecting the Git Summary request into the embedded ChatGPT composer…'
+        : 'Injecting the task into the embedded ChatGPT composer…',
     });
     const composerReady = await this.waitForComposer();
     if (!composerReady) {
@@ -1585,11 +1693,13 @@ class ChatGPTView {
       });
       throw new Error('Patchwork could not confirm a ChatGPT conversation after Send. Check the embedded browser before retrying.');
     }
-    this.conversationStatusUrls.clear();
+    this.conversationStatusUrls?.clear();
+    const currentConversationTitle = normalizeConversationTitle(this.view?.webContents?.getTitle?.());
     const submittedTask = await this.taskService.updateTask(task.taskId, {
       state: 'submitted',
       submittedAt: new Date().toISOString(),
       conversationUrl,
+      conversationTitle: currentConversationTitle || task.conversationTitle || null,
       chatStatus: 'streaming',
       chatStatusRaw: 'IS_STREAMING',
       chatFinishedAt: null,
@@ -1602,9 +1712,48 @@ class ChatGPTView {
     await this.onEvent({
       type: 'task-submitted',
       task: submittedTask,
-      message: 'Task uploaded and submitted through the ChatGPT page.',
+      message: summaryOnly
+        ? 'Git Summary uploaded and submitted through the ChatGPT page.'
+        : 'Task uploaded and submitted through the ChatGPT page.',
     });
     return submittedTask;
+  }
+
+  async submitAndWaitForResult(task, timeoutMilliseconds = GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS) {
+    const taskId = String(task?.taskId || '').trim();
+    if (!taskId) throw new Error('The Git summary task is missing its task ID.');
+    const key = taskId.toLowerCase();
+    if (this.resultWaiters.has(key)) {
+      throw new Error('A result download is already in progress for this task.');
+    }
+
+    let resultTimeout = null;
+    const resultPromise = new Promise((resolve, reject) => {
+      resultTimeout = setTimeout(() => {
+        reject(new Error(`Timed out waiting for ${task.resultFilename || `chatgpt-ide-result-${taskId}.txt`} to finish downloading.`));
+      }, timeoutMilliseconds);
+      this.resultWaiters.set(key, {
+        resolve: (value) => {
+          clearTimeout(resultTimeout);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(resultTimeout);
+          reject(error);
+        },
+      });
+    });
+
+    try {
+      await this.submit(task);
+      return await resultPromise;
+    } catch (error) {
+      this.resultWaiters.get(key)?.reject(error);
+      throw error;
+    } finally {
+      clearTimeout(resultTimeout);
+      this.resultWaiters.delete(key);
+    }
   }
 
   async submitMerge(request) {
@@ -1684,7 +1833,9 @@ class ChatGPTView {
     }
     this.conversationStatusBusy = true;
     try {
-      const conversationId = await this.discoverConversationId(task);
+      const conversationId = this.discoverConversationId
+        ? await this.discoverConversationId(task)
+        : task.conversationId || conversationIdFromRouteUrl(this.view.webContents.getURL?.() || '');
       if (!conversationId) return null;
       const result = await this.view.webContents.executeJavaScript(
         buildConversationStatusScript(conversationId),
@@ -1751,23 +1902,24 @@ class ChatGPTView {
     }
   }
 
-  async checkForResult() {
+  async checkForResult({ force = false } = {}) {
     if (this.activeMerge) return this.checkForMerge();
     const task = this.activeTask;
-    if (this.monitorBusy || !task || task.state !== 'submitted') return false;
+    const allowedState = force ? ['submitted', 'conflicted'] : ['submitted'];
+    if (this.monitorBusy || !task || !allowedState.includes(task.state)) return false;
     if (task.chatStatus === 'failed') return false;
     if (this.processingTasks.has(task.taskId) || this.view.webContents.isDestroyed()) return false;
     const attemptedAt = this.resultAttempts.get(task.taskId) || 0;
-    if (Date.now() - attemptedAt < RESULT_RETRY_MILLISECONDS) return false;
+    if (!force && Date.now() - attemptedAt < RESULT_RETRY_MILLISECONDS) return false;
 
     this.monitorBusy = true;
     try {
-      const expectedName = `chatgpt-ide-result-${task.taskId}.txt`;
+      const expectedName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
       this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
       // A fresh, synchronous user gesture is required for ChatGPT's generated-file link.
       // A click fired later by a page-owned timer can be silently blocked by Chromium.
       const result = await this.view.webContents.executeJavaScript(
-        buildTaskResultDetectionScript(task.taskId, task.chatStatus === 'completed'),
+        buildTaskResultDetectionScript(task, task.chatStatus === 'completed'),
         true,
       ).catch(() => ({ kind: 'none' }));
       if (result?.kind !== 'download') {
@@ -1785,6 +1937,67 @@ class ChatGPTView {
       return true;
     } finally {
       this.monitorBusy = false;
+    }
+  }
+
+  async refreshTaskResult(task) {
+    if (!task?.taskId || !isChatGPTConversationUrl(task.conversationUrl)) {
+      throw new Error('This task has no saved ChatGPT conversation to refresh its result from.');
+    }
+    const taskId = task.taskId;
+    const key = taskId.toLowerCase();
+    if (this.resultWaiters.has(key)) {
+      throw new Error('A result download is already in progress for this task.');
+    }
+
+    this.activeMerge = null;
+    this.activeTask = task;
+    this.knownTasks.set(key, task);
+    let resultTimeout = null;
+    const waitForResult = new Promise((resolve, reject) => {
+      resultTimeout = setTimeout(() => {
+        reject(new Error(`Timed out waiting for chatgpt-ide-result-${taskId}.txt to finish downloading.`));
+      }, 30_000);
+      this.resultWaiters.set(key, {
+        resolve: (value) => {
+          clearTimeout(resultTimeout);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(resultTimeout);
+          reject(error);
+        },
+      });
+    });
+
+    try {
+      const currentUrl = this.view.webContents.getURL();
+      const currentConversationId = conversationIdFromRouteUrl(currentUrl);
+      const taskConversationId = conversationIdFromRouteUrl(task.conversationUrl) || task.conversationId;
+      const conversationAlreadyOpen = currentUrl === task.conversationUrl
+        || Boolean(taskConversationId && currentConversationId === taskConversationId);
+      if (!conversationAlreadyOpen) {
+        await this.view.webContents.loadURL(task.conversationUrl);
+      }
+
+      this.resultAttempts.delete(taskId);
+      let started = false;
+      for (let attempt = 0; attempt < 10 && !started; attempt += 1) {
+        while (this.monitorBusy) await delay(100);
+        started = await this.checkForResult({ force: true });
+        if (!started) await delay(250);
+      }
+      if (!started && !this.processingTasks.has(taskId)) {
+        throw new Error(`Could not find chatgpt-ide-result-${taskId}.txt in the saved ChatGPT conversation.`);
+      }
+
+      return await waitForResult;
+    } catch (error) {
+      this.resultWaiters.get(key)?.reject(error);
+      throw error;
+    } finally {
+      clearTimeout(resultTimeout);
+      this.resultWaiters.delete(key);
     }
   }
 
@@ -1826,6 +2039,9 @@ class ChatGPTView {
 
   forgetTask(taskId) {
     const key = String(taskId).toLowerCase();
+    const waiter = this.resultWaiters.get(key);
+    if (waiter) waiter.reject(new Error('This task was removed while its result was being downloaded.'));
+    this.resultWaiters.delete(key);
     this.knownTasks.delete(key);
     this.processingTasks.delete(taskId);
     this.resultAttempts.delete(taskId);
@@ -1862,6 +2078,7 @@ module.exports = {
   buildTaskConfigurationScript,
   chatGPTProjectUrl,
   buildLimitNoticeDismissalScript,
+  buildPackageAttachmentStatusScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   buildConversationStatusScript,

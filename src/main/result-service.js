@@ -138,9 +138,14 @@ class ResultService {
         localPath: outputPath,
       });
     }
+    const commitMessage = task.summaryOnly
+      ? validateCommitMessage(manifest.commitMessage)
+      : (task.treeId
+        ? validateCommitMessage(manifest.commitMessage)
+        : (manifest.commitMessage == null ? null : String(manifest.commitMessage)));
     return {
       summary: String(manifest.summary || '').trim(),
-      commitMessage: task.treeId ? validateCommitMessage(manifest.commitMessage) : null,
+      commitMessage,
       transport: 'plain-text-base64',
       downloadedPath,
       patches,
@@ -166,6 +171,9 @@ class ResultService {
       const patchBody = await fs.readFile(patch.localPath, 'utf8');
       if (repository.readOnly && patchBody.length > 0) {
         throw new Error(`${repository.name} was supplied as read-only conflict context, but ChatGPT tried to change it.`);
+      }
+      if (task.summaryOnly && patchBody.length > 0) {
+        throw new Error('Git summary results must not contain repository changes.');
       }
       if (patchBody.length === 0) {
         previews.push({ ...patch, name: repository.name, stat: 'No changes', numstat: '', preview: '' });
@@ -205,8 +213,61 @@ class ResultService {
     };
   }
 
+  async prepareConflictResolution(taskId) {
+    let task = await this.taskService.getTask(taskId);
+    if (task.state !== 'conflicted' || !task.result?.patches?.length) {
+      throw new Error('This task does not have a result conflict to resolve.');
+    }
+    task = await this.rebindMissingResolutionTarget(task, false);
+
+    const conflict = task.result.conflicts?.[0];
+    const repository = task.repositories.find((item) => item.id === conflict?.repositoryId);
+    const patch = task.result.patches.find((item) => item.id === conflict?.repositoryId);
+    if (!repository || !patch) {
+      throw new Error('The conflicted result is missing its repository patch.');
+    }
+    if (repository.readOnly) {
+      throw new Error(`${repository.name} is read-only conflict context and cannot be reapplied.`);
+    }
+
+    const body = await fs.readFile(patch.localPath);
+    if (body.length === 0) return inspectRepository(repository.path);
+
+    const conflictedFiles = await listConflictedFiles(repository.path);
+    const wasApplyAttempted = typeof conflict?.applyAttempted === 'boolean'
+      ? conflict.applyAttempted
+      : !/new uncommitted or unmerged changes since this task was packaged/i.test(String(conflict?.error || ''));
+    if (conflictedFiles.length > 0) {
+      // The unresolved index already contains the conflict context that the
+      // resolution task needs. Do not attempt another apply (which could
+      // replace those entries); package it alongside the saved result patch.
+      return inspectRepository(repository.path);
+    }
+
+    try {
+      // `git apply --3way --index` needs the index to represent the current
+      // local version. Stage it before creating the three-way conflict so Git
+      // can retain the user's changes as the "ours" side of the resolution.
+      if (!wasApplyAttempted) await runGit(repository.path, ['add', '-A', '--', '.']);
+      await applyPatch(repository.path, patch.localPath, { threeWay: true, index: true });
+    } catch (error) {
+      const afterConflict = await listConflictedFiles(repository.path).catch(() => []);
+      if (afterConflict.length > 0) return inspectRepository(repository.path);
+
+      try {
+        await runGit(repository.path, ['apply', '--reverse', '--check', '--binary', patch.localPath]);
+        return inspectRepository(repository.path);
+      } catch {
+        throw new Error(`Could not re-apply the conflicted result for ${repository.name}: ${error.message}`);
+      }
+    }
+
+    return inspectRepository(repository.path);
+  }
+
   async apply(taskId) {
     let task = await this.taskService.getTask(taskId);
+    task = await this.rebindMissingResolutionTarget(task);
     if (!task.result || !['ready', 'failed', 'conflicted'].includes(task.state)) {
       if (task.state === 'applied') return task;
       throw new Error('This result is not ready to apply.');
@@ -222,9 +283,10 @@ class ResultService {
         const current = await inspectRepository(repository.path);
         const exactState = await matchesPackagedState(repository, current);
         if (!exactState && !current.isClean) {
+          const previousConflict = task.result.conflicts?.find((item) => item.repositoryId === repository.id);
           return this.markConflicted(task, repository, new Error(
             `${repository.name} has new uncommitted or unmerged changes since this task was packaged.`,
-          ));
+          ), previousConflict?.applyAttempted === true);
         }
         let applyMode = 'direct';
         if (!exactState) {
@@ -241,16 +303,17 @@ class ResultService {
             ? { threeWay: true, index: true }
             : {});
         } catch (error) {
-          return this.markConflicted(task, repository, error);
+          return this.markConflicted(task, repository, error, true);
         }
         applied.push({ repository, patch, applyMode, wasClean: current.isClean, headBefore: current.baseCommit });
       }
       if (task.treeId) {
+        const commitMessage = validateCommitMessage(task.result.commitMessage);
         for (const item of applied) {
           await runGit(item.repository.path, ['add', '-A', '--', '.']);
-          await runGit(item.repository.path, ['commit', '-m', task.result.commitMessage]);
+          await runGit(item.repository.path, ['commit', '-m', commitMessage]);
           const { stdout } = await runGit(item.repository.path, ['rev-parse', 'HEAD']);
-          committed.push({ ...item, commit: stdout.trim(), message: task.result.commitMessage });
+          committed.push({ ...item, commit: stdout.trim(), message: commitMessage });
         }
       }
     } catch (error) {
@@ -317,7 +380,24 @@ class ResultService {
     return task;
   }
 
-  async markConflicted(task, repository, error) {
+  async rebindMissingResolutionTarget(task, requireResolutionTask = true) {
+    if (!task?.treeId || (requireResolutionTask && !task?.resolvesTaskId)) return task;
+    const writableRepository = (Array.isArray(task.repositories) ? task.repositories : [])
+      .find((repository) => !repository.readOnly);
+    if (!writableRepository) return task;
+    const current = await inspectRepository(writableRepository.path).catch(() => null);
+    if (current) return task;
+    if (!task.sourceRepositoryPath) {
+      throw new Error('The conflict-resolution worktree is unavailable and no original repository target was saved.');
+    }
+    const source = await inspectRepository(task.sourceRepositoryPath).catch(() => null);
+    if (!source) {
+      throw new Error('The conflict-resolution worktree was deleted and the original repository is unavailable.');
+    }
+    return this.taskService.setTarget(task.taskId, { repositoryPath: source.path, tree: null });
+  }
+
+  async markConflicted(task, repository, error, applyAttempted = false) {
     const files = await listConflictedFiles(repository.path).catch(() => []);
     const detail = String(error?.message || error || 'The patch did not apply cleanly.');
     const message = files.length
@@ -325,7 +405,7 @@ class ResultService {
       : `${repository.name} changed and the result could not be applied cleanly.`;
     const conflictedTask = await this.taskService.updateTask(task.taskId, {
       state: 'conflicted',
-      error: `${message} Resubmit a conflict-resolution task to preserve both versions.`,
+      error: `${message} Clean up the target and retry the saved result, or resubmit a conflict-resolution task to preserve both versions.`,
       result: {
         ...task.result,
         conflicts: [{
@@ -333,6 +413,7 @@ class ResultService {
           repositoryName: repository.name,
           files,
           error: detail,
+          applyAttempted: Boolean(applyAttempted),
         }],
       },
     });

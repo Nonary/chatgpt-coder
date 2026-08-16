@@ -14,6 +14,42 @@ const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
 const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high']);
 
+const DEFAULT_GIT_SUMMARY_PROMPT = `# Git Changes Review + Conventional Commit Prompt
+
+Review all **uncommitted Git changes** in the current repository and produce a single accurate, detailed Conventional Commit message.
+
+Inspect both staged and unstaged changes, including relevant surrounding code when necessary. Do not summarize the diff line-by-line. Determine the actual behavioral intent of the changes by understanding how the modified files, functions, components, types, tests, configuration, and call sites interact.
+
+Pay particular attention to:
+
+* What behavior changed and why
+* How modified code interacts across files or layers
+* Whether changes introduce, remove, fix, or refactor functionality
+* Important implementation details that explain the resulting behavior
+* Tests, migrations, configuration, dependencies, or API changes that materially affect the commit
+* Breaking changes, if any
+
+Then output **only the Conventional Commit message** in this format:
+
+\`\`\`text
+<type>(<optional-scope>): <concise summary>
+
+<concise but detailed body explaining the meaningful changes and how they work together>
+
+<optional BREAKING CHANGE footer>
+\`\`\`
+
+Use the most appropriate Conventional Commit type, such as \`feat\`, \`fix\`, \`refactor\`, \`perf\`, \`test\`, \`docs\`, \`build\`, \`ci\`, or \`chore\`.
+
+Keep the subject concise and specific. Keep the body dense with useful information, focusing on intent and behavior rather than filenames or mechanical implementation details. Avoid vague statements, redundant bullets, speculation, and details that do not help someone understand the commit from Git history alone.
+
+If the changes contain multiple related modifications, synthesize them into one cohesive commit description based on their shared purpose. If the diff appears to contain genuinely unrelated work, mention that clearly instead of inventing a misleading unifying description.`;
+
+function resolveGitSummaryPrompt(value) {
+  const prompt = String(value || '').replaceAll('\r\n', '\n').trim();
+  return prompt || DEFAULT_GIT_SUMMARY_PROMPT;
+}
+
 function normalizeTaskModel(value) {
   const model = String(value || 'default').trim().toLowerCase();
   if (!TASK_MODELS.has(model)) throw new Error(`Unsupported ChatGPT model: ${value}`);
@@ -26,8 +62,9 @@ function normalizeReasoningMode(value) {
   return mode;
 }
 
-function buildAgentInstructions(taskId, skills = []) {
+function buildAgentInstructions(taskId, skills = [], options = {}) {
   const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
+  const summaryOnly = Boolean(options.summaryOnly);
   const skillInstructions = skills.length
     ? `## Optional task skills
 
@@ -41,14 +78,14 @@ Task packages may include selected local skills under the \`skills/\` directory.
 `;
   return `# Patchwork task protocol
 
-You are working on a software task supplied by the user through Patchwork IDE.
-The uploaded ZIP is a self-contained task package containing Git bundles. Do not merely describe a solution: extract the package, inspect the repositories, make the requested changes, and return the exact downloadable text result described below.
+You are working on a task supplied by the user through Patchwork IDE.
+The uploaded ZIP is a self-contained task package containing Git bundles. Extract the package, inspect the repositories, and return the exact downloadable text result described below.${summaryOnly ? ' This request is read-only; inspect the captured changes without modifying repository files.' : ' Do not merely describe a solution: make the requested changes.'}
 
 ## Set up the repositories
 
 1. Extract the uploaded ZIP into a writable directory.
 2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely. If \`manifest.json.attachments\` is non-empty, also read each listed file under \`attachments/\`; those files are user-provided task context. If \`manifest.json.skills\` is non-empty, the selected skills are bundled under \`skills/\`; use them only when relevant to the task.
-3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`.
+3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`. Some repositories are read-only context: you may inspect them, but never edit them.
 4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
 6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.
@@ -77,7 +114,9 @@ These commands are prohibited even if a repository-specific instruction suggests
 
 ## Solve and inspect the task
 
-Follow repository-specific \`AGENTS.md\` files except where they conflict with the sandbox constraints above. Implement the task in \`TASK.md\`, inspect the final diff carefully, and keep changes focused. In the result summary, state that builds and tests were not run because the task protocol prohibits them in the ChatGPT sandbox; do not present this as an implementation failure.
+${summaryOnly
+    ? 'This is a read-only Git summary task. Inspect the bundled repository and its captured uncommitted changes, including the supplied `workingStatus` and `sourceHead`, then produce the Conventional Commit message requested by `TASK.md`. Do not modify files or create commits. Every repository patch in the result must be empty.'
+    : 'Follow repository-specific `AGENTS.md` files except where they conflict with the sandbox constraints above. Implement the task in `TASK.md`, inspect the final diff carefully, and keep changes focused. In the result summary, state that builds and tests were not run because the task protocol prohibits them in the ChatGPT sandbox; do not present this as an implementation failure.'}
 
 ## Produce the plain-text result
 
@@ -110,18 +149,24 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
 
 \`PATCHWORK_RESULT_END\`
 
-When a coding tree is used, the commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. For tasks without a coding tree, the commit message may be null. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat, but do not print or paste the result envelope into the chat itself.
+When a coding tree is used, the commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. For tasks without a coding tree, the commit message may be null. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
+
+${summaryOnly ? 'For this read-only Git summary task, set `commitMessage` to the single Conventional Commit message requested by `TASK.md`, set every repository `patch` value to an empty string, and do not include code changes in the result.' : ''}
 `;
 }
 
-function buildHandoffPrompt(taskId, taskText, attachments = [], skills = []) {
+function buildHandoffPrompt(taskId, taskText, attachments = [], skills = [], options = {}) {
+  const summaryOnly = Boolean(options.summaryOnly);
   const attachmentNote = attachments.length
     ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
     : '';
   const skillNote = skills.length
     ? `\n\nThe task ZIP also includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under \`skills/\`. Use or invoke a selected skill only when it is relevant to the task, and do not load unrelated skills.`
     : '\n\nThe task ZIP may include selected local skills under \`skills/\`. Use or invoke them only when they are relevant to the task.';
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste its PATCHWORK_RESULT_V1 envelope into the chat.${attachmentNote}${skillNote}\n\nTask summary:\n${taskText}\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
+  if (summaryOnly) {
+    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the generated Conventional Commit message in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}\n\nGit Summary instructions:\n${taskText}`;
+  }
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}\n\nTask summary:\n${taskText}\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
 }
 
 function uniqueAttachmentName(filename, usedNames) {
@@ -337,6 +382,7 @@ class TaskService {
       });
     }
 
+    const summaryOnly = Boolean(input.summaryOnly);
     const createdAt = new Date().toISOString();
     const packageAttachments = attachments.map(({ name, size }) => ({
       name,
@@ -353,7 +399,7 @@ class TaskService {
       skills: packageSkills,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
-    const agentInstructions = buildAgentInstructions(taskId, packageSkills);
+    const agentInstructions = buildAgentInstructions(taskId, packageSkills, { summaryOnly });
 
     await Promise.all([
       fs.writeFile(path.join(taskDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
@@ -383,6 +429,7 @@ class TaskService {
       reasoningMode,
       skills: taskSkills,
       autoApply: input.autoApply !== false,
+      summaryOnly,
       transport: 'zip-git-bundle',
       resultTransport: 'downloaded-text-file',
       treeId: input.tree?.id || null,
@@ -390,11 +437,13 @@ class TaskService {
       mergeResolution: Boolean(input.mergeResolution),
       resolvesTaskId: input.resolvesTaskId ? String(input.resolvesTaskId) : null,
       conversationId: null,
+      conversationTitle: null,
       chatStatus: null,
       chatStatusRaw: null,
       chatFinishedAt: null,
       resultFilename: `chatgpt-ide-result-${taskId}.txt`,
-      sourceRepositoryPath: input.tree?.repositoryPath || null,
+      sourceRepositoryPath: input.tree?.repositoryPath
+        || (taskRepositories.length === 1 ? taskRepositories[0].path : null),
       chatgptProject: input.chatgptProject?.id ? {
         id: String(input.chatgptProject.id),
         shortUrl: input.chatgptProject.shortUrl ? String(input.chatgptProject.shortUrl) : null,
@@ -402,7 +451,7 @@ class TaskService {
       } : null,
       packagePath,
       attachments,
-      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments, packageSkills),
+      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments, packageSkills, { summaryOnly }),
       repositories: taskRepositories,
       state: 'prepared',
       result: null,
@@ -427,6 +476,38 @@ class TaskService {
     const next = { ...task, ...update, updatedAt: new Date().toISOString() };
     await this.saveTask(next);
     return next;
+  }
+
+  async setTarget(taskId, target = {}) {
+    const task = await this.getTask(taskId);
+    if (['applied', 'rolled-back', 'resolved'].includes(task.state)) {
+      throw new Error('This task can no longer change its apply target.');
+    }
+    const writableRepositories = (Array.isArray(task.repositories) ? task.repositories : [])
+      .filter((repository) => !repository.readOnly);
+    if (writableRepositories.length !== 1) {
+      throw new Error('Worktree selection is only available for tasks with one writable repository.');
+    }
+    const repositoryPath = String(target.repositoryPath || '').trim();
+    if (!repositoryPath) throw new Error('Choose a valid task target.');
+    const repository = await inspectRepository(repositoryPath);
+    const targetTree = target.tree || null;
+    const writableId = writableRepositories[0].id;
+    const repositories = task.repositories.map((entry) => (entry.id === writableId
+      ? {
+        ...entry,
+        name: repository.name,
+        path: repository.path,
+        branch: repository.branch,
+        readOnly: false,
+      }
+      : entry));
+    return this.updateTask(taskId, {
+      treeId: targetTree?.id || null,
+      treeName: targetTree?.name || null,
+      sourceRepositoryPath: task.sourceRepositoryPath || targetTree?.repositoryPath || repository.path,
+      repositories,
+    });
   }
 
   async deleteTask(taskId) {
@@ -456,4 +537,6 @@ module.exports = {
   TaskService,
   buildAgentInstructions,
   buildHandoffPrompt,
+  DEFAULT_GIT_SUMMARY_PROMPT,
+  resolveGitSummaryPrompt,
 };

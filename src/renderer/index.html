@@ -40,16 +40,12 @@
           <p class="muted small">No tasks yet.</p>
         </nav>
 
-        <div class="privacy-note">
-          <span class="privacy-dot"></span>
-          Source stays local until you upload a task package in ChatGPT.
-        </div>
       </aside>
 
       <main class="workspace">
         <header class="topbar">
           <div>
-            <p class="eyebrow">LOCAL WORKSPACE</p>
+            <p class="eyebrow">WORKSPACE</p>
             <h1 id="page-title">Prepare a coding task</h1>
           </div>
           <div id="connection-pill" class="pill"><span></span> Ready</div>
@@ -93,7 +89,14 @@
               <div class="commit-box">
                 <label class="sr-only" for="source-commit-message">Commit message</label>
                 <textarea id="source-commit-message" rows="3" placeholder="Commit message"></textarea>
-                <button id="source-commit-button" class="primary wide">Commit staged changes</button>
+                <div class="commit-actions">
+                  <button id="source-ai-summary-button" class="secondary" type="button">✦ AI summary</button>
+                  <button id="source-commit-button" class="primary" type="button">Commit staged changes</button>
+                </div>
+                <div class="commit-summary-help">
+                  <span id="source-git-summary-status" class="field-help"></span>
+                  <button id="source-git-summary-prompt-button" class="text-button" type="button">Edit Git Summary prompt</button>
+                </div>
               </div>
 
               <section class="change-section">
@@ -137,17 +140,30 @@
                   <div class="diff-side-heading"><span>After</span><strong id="diff-after-label">After</strong></div>
                 </div>
                 <div id="diff-rows" class="diff-rows">
-                  <div class="diff-empty-state">No file selected.</div>
+                  <div id="diff-before-rows" class="diff-side-rows" aria-label="Before changes">
+                    <div class="diff-empty-state">No file selected.</div>
+                  </div>
+                  <div id="diff-after-rows" class="diff-side-rows" aria-label="After changes">
+                    <div class="diff-empty-state">No file selected.</div>
+                  </div>
                 </div>
               </div>
             </div>
           </div>
         </section>
 
+        <div id="diff-tab-context-menu" class="diff-tab-context-menu hidden" role="menu" aria-label="Diff tab actions">
+          <button type="button" role="menuitem" data-action="close">Close Tab</button>
+          <button type="button" role="menuitem" data-action="close-right">Close to Right</button>
+          <button type="button" role="menuitem" data-action="close-others">Close Others</button>
+          <div class="diff-tab-context-menu-separator" aria-hidden="true"></div>
+          <button type="button" role="menuitem" data-action="close-all">Close All</button>
+        </div>
+
         <section id="trees-view" class="trees-view hidden">
           <div class="trees-header">
             <div>
-              <p class="eyebrow">ISOLATED WORKSTREAMS</p>
+              <p class="eyebrow">CODING TREES</p>
               <h2>Coding trees</h2>
               <p>Each tree has its own branch, tasks, and commits. Continue work concurrently, then squash it into the original branch when ready.</p>
             </div>
@@ -171,7 +187,7 @@
         <section id="history-view" class="history-view hidden">
           <div class="history-header">
             <div>
-              <p class="eyebrow">SAVED LOCALLY</p>
+              <p class="eyebrow">TASK HISTORY</p>
               <h2>Task history</h2>
               <p>Browse every task Patchwork has prepared, including completed and failed work from coding trees that have already been merged.</p>
             </div>
@@ -184,6 +200,7 @@
                 <option value="prepared">Prepared</option>
                 <option value="submitted">Submitted</option>
                 <option value="ready">Ready</option>
+                <option value="completed">Completed</option>
                 <option value="conflicted">Conflicted</option>
                 <option value="resolved">Resolved</option>
                 <option value="applied">Applied</option>
@@ -204,7 +221,7 @@
                   <h2>Choose a task target</h2>
                 </div>
               </div>
-              <p class="card-copy">Use the current working changes, create an isolated coding tree, or attach a follow-up to an existing tree. Every task opens a fresh ChatGPT chat.</p>
+              <p class="card-copy">Use the current working changes, create a coding tree, or attach a follow-up to an existing tree. Every task opens a fresh ChatGPT chat.</p>
               <label class="field-label" for="task-tree-select">Task target</label>
               <select id="task-tree-select" class="field-control">
                 <option value="">Use current working changes</option>
@@ -224,7 +241,7 @@
                 </div>
                 <button id="add-repository-button" class="secondary">Add repository</button>
               </div>
-              <p class="card-copy">Current-working-change tasks package the selected repository as it is now, including uncommitted changes. New coding trees require one clean repository.</p>
+              <p class="card-copy">Current-working-change tasks use the selected repository as it is now, including uncommitted changes. New coding trees require one clean repository.</p>
               <div id="repository-list" class="repository-list empty-state">
                 <div class="empty-icon">⌘</div>
                 <strong>No repository selected</strong>
@@ -304,7 +321,7 @@
               <div class="task-option-picker">
                 <div>
                   <strong>Task skills</strong>
-                  <small>Optional skills discovered from common Claude Code, Codex, Copilot, and Agent Skills locations.</small>
+                  <small>Optional skills to make available to this task.</small>
                 </div>
                 <button id="configure-skills-button" class="secondary" type="button"><span id="skill-selection-label">Choose skills</span></button>
               </div>
@@ -312,7 +329,7 @@
               <div class="attachment-picker">
                 <div>
                   <strong>Task attachments</strong>
-                  <small>Optional files are included inside the task ZIP and uploaded alongside it before the message is sent.</small>
+                  <small>Optional files to include with this task.</small>
                 </div>
                 <button id="add-attachment-button" class="secondary" type="button">Upload attachment</button>
               </div>
@@ -358,15 +375,11 @@
           <aside class="guide-card">
             <p class="eyebrow">HOW IT WORKS</p>
             <ol>
-              <li><span>1</span><div><strong>Target</strong><small>Use current working changes, create a Git worktree, or continue an existing coding tree.</small></div></li>
+              <li><span>1</span><div><strong>Target</strong><small>Use current working changes, create a coding tree, or continue an existing one.</small></div></li>
               <li><span>2</span><div><strong>Launch</strong><small>Choose a regular chat or a ChatGPT project for the task.</small></div></li>
-              <li><span>3</span><div><strong>Hand off</strong><small>The repository bundle and attachments are submitted through the visible browser.</small></div></li>
-              <li><span>4</span><div><strong>Apply</strong><small>Validated changes are applied to the selected target. Coding-tree changes can later be squashed into the original branch.</small></div></li>
+              <li><span>3</span><div><strong>Submit</strong><small>Send the task with its files and instructions.</small></div></li>
+              <li><span>4</span><div><strong>Apply</strong><small>Review the result, then apply the changes to the selected target.</small></div></li>
             </ol>
-            <div class="boundary-note">
-              <strong>Visible browser boundary</strong>
-              <p>Patchwork does not use the OpenAI developer API or read authentication cookies. Project discovery and creation use ChatGPT’s same-origin web endpoints inside the signed-in browser session.</p>
-            </div>
           </aside>
         </section>
 
@@ -379,12 +392,28 @@
                   <div id="status-badge" class="status-badge prepared">Prepared</div>
                 </div>
                 <h2 id="task-status-title">Package prepared</h2>
-                <p id="task-status-copy">The embedded browser is ready to receive this task.</p>
+                <p id="task-status-copy">This task is ready to submit.</p>
+              </article>
+
+              <article id="task-target-card" class="card task-target-card hidden">
+                <div class="card-heading"><div><span class="step-number">↳</span><h2>Apply target</h2></div></div>
+                <p class="card-copy">Choose which repository or worktree should receive the validated result. This stays editable while the task is waiting to be applied, including after submission.</p>
+                <label class="field-label" for="task-target-select">Worktree</label>
+                <select id="task-target-select" class="field-control">
+                  <option value="">Use original repository</option>
+                  <option value="__new__">Create a new coding tree</option>
+                </select>
+                <div id="task-target-new-fields" class="new-tree-fields hidden">
+                  <label class="field-label" for="task-target-tree-name">New tree name</label>
+                  <input id="task-target-tree-name" class="field-control" type="text" maxlength="80" placeholder="For example: Fix task target" />
+                  <button id="task-target-create-button" class="secondary" type="button">Create and use worktree</button>
+                </div>
+                <p id="task-target-status" class="field-help task-target-status"></p>
               </article>
 
               <article class="card handoff-card">
-                <div class="card-heading"><div><span class="step-number">1</span><h2>Automated handoff</h2></div></div>
-                <p class="automation-copy">Patchwork uploads the task package, injects the instructions, and submits a new chat through the page you can see.</p>
+                <div class="card-heading"><div><span class="step-number">1</span><h2>Submit to ChatGPT</h2></div></div>
+                <p class="automation-copy">Send the task to ChatGPT and track its progress here.</p>
                 <button id="submit-task-button" class="primary wide">Submit automatically</button>
                 <div class="handoff-actions secondary-actions">
                   <button id="copy-prompt-button" class="secondary">Copy prompt</button>
@@ -392,19 +421,17 @@
                   <button id="import-result-button" class="secondary">Import result</button>
                   <button id="delete-task-button" class="danger">Delete task</button>
                 </div>
-                <div class="boundary-note browser-boundary">
-                  <strong>Verified browser automation</strong>
-                  <p>Patchwork replaces ChatGPT’s model control and verifies the selected model on the outgoing task request. Login credentials remain inside ChatGPT and are never read or stored.</p>
-                </div>
               </article>
 
               <article id="result-card" class="card hidden">
-                <div class="card-heading"><div><span class="step-number">2</span><h2>Validated changes</h2></div></div>
+                <div class="card-heading"><div><span class="step-number">2</span><h2>Validated result</h2></div></div>
                 <p id="result-summary" class="result-copy"></p>
                 <div id="patch-list" class="patch-list"></div>
                 <div class="result-actions">
+                  <button id="use-git-summary-button" class="primary hidden">Use in Source Control</button>
                   <button id="apply-button" class="primary">Apply changes</button>
-                  <button id="resolve-conflict-button" class="primary hidden">Resolve with ChatGPT</button>
+                  <button id="retry-apply-button" class="primary hidden">Retry apply</button>
+                  <button id="resolve-conflict-button" class="secondary hidden">Resolve with ChatGPT</button>
                   <button id="rollback-button" class="danger hidden">Roll back</button>
                 </div>
               </article>
@@ -432,7 +459,7 @@
               <div id="chatgpt-surface" class="chatgpt-surface">
                 <div class="browser-placeholder">
                   <strong>Loading ChatGPT…</strong>
-                  <span>Your signed-in browser session will appear here.</span>
+                  <span>Your ChatGPT session will appear here.</span>
                 </div>
               </div>
             </div>
@@ -448,7 +475,7 @@
               </div>
               <button id="skills-close-button" class="icon-button" type="button" aria-label="Close skill drawer">×</button>
             </header>
-            <p class="skill-drawer-copy">Select only the local skills that should be available to this task. Patchwork copies selected skill folders into the task package.</p>
+            <p class="skill-drawer-copy">Select the skills that should be available to this task.</p>
             <div class="skill-drawer-toolbar">
               <label class="sr-only" for="skills-search">Search skills</label>
               <input id="skills-search" class="field-control" type="search" placeholder="Search skills" />
@@ -471,7 +498,7 @@
               </div>
               <button id="prompt-library-close-button" class="icon-button" type="button" aria-label="Close prompt library">×</button>
             </header>
-            <p class="skill-drawer-copy">Save reusable instructions with a clear name and short description. Prompts stay on this device and are copied into each task only when selected.</p>
+            <p class="skill-drawer-copy">Save reusable instructions with a clear name and short description.</p>
             <div class="prompt-manager-toolbar">
               <button id="prompt-manager-new-button" class="primary" type="button">＋ New prompt</button>
               <span id="prompt-manager-count" class="field-help">0 saved prompts</span>
@@ -491,7 +518,7 @@
               <label class="field-label" for="prompt-editor-content">Additional instructions</label>
               <textarea id="prompt-editor-content" class="prompt-editor-content" rows="8" maxlength="12000" placeholder="Review the interface for keyboard navigation, focus states, accessible names, and clear error handling."></textarea>
               <div class="prompt-editor-footer">
-                <span id="prompt-editor-status" class="field-help">This text will be appended to the task only when the prompt is selected.</span>
+                <span id="prompt-editor-status" class="field-help">Saved instructions are added whenever you select this prompt.</span>
                 <button id="prompt-editor-save-button" class="primary" type="submit">Save prompt</button>
               </div>
             </form>
@@ -512,7 +539,7 @@
               <span>Original task</span>
               <strong id="conflict-resolution-task-label">Current task</strong>
             </div>
-            <p class="conflict-resolution-copy">Patchwork will create a fresh resolution task in the existing coding tree. Choose a one-time model override and add any extra context ChatGPT should follow.</p>
+            <p class="conflict-resolution-copy">Before creating the resolution task, Patchwork refreshes the saved ChatGPT result and retries applying it. If the conflict remains, choose one-time model and reasoning overrides and add any extra context ChatGPT should follow.</p>
             <div class="conflict-resolution-fields">
               <div>
                 <label class="field-label" for="conflict-resolution-model-select">Model</label>
@@ -522,6 +549,18 @@
                   <option value="luna">GPT-5.6 Luna</option>
                 </select>
                 <p class="field-help">Starts with the model used by the original task. Changing it only affects this resolution task.</p>
+              </div>
+              <div>
+                <label class="field-label" for="conflict-resolution-reasoning-select">Reasoning</label>
+                <select id="conflict-resolution-reasoning-select" class="field-control">
+                  <option value="default">Model default</option>
+                  <option value="instant">Instant</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="extra-high">Extra High</option>
+                </select>
+                <p class="field-help">Starts with the reasoning used by the original task. Changing it only affects this resolution task.</p>
               </div>
             </div>
             <label class="field-label" for="conflict-resolution-instructions">Additional instructions</label>

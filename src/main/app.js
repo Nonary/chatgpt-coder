@@ -1,11 +1,12 @@
 const path = require('node:path');
+const fs = require('node:fs/promises');
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
 const { ResultService } = require('./result-service');
 const { SkillService } = require('./skill-service');
-const { TaskService } = require('./task-service');
-const { WorktreeService } = require('./worktree-service');
+const { resolveGitSummaryPrompt, TaskService } = require('./task-service');
+const { validateCommitMessage, WorktreeService } = require('./worktree-service');
 
 const HEADLESS = process.env.PATCHWORK_HEADLESS === '1';
 if (process.env.PATCHWORK_DEBUG_PORT) {
@@ -30,6 +31,10 @@ function publicTask(task) {
 }
 
 function taskTitle(task) {
+  if (task.summaryOnly) {
+    const repositoryName = task.repositories?.[0]?.name;
+    return repositoryName ? `Git Summary · ${repositoryName}` : 'Git Summary';
+  }
   const firstLine = String(task.taskText || 'this task').split('\n')[0].trim();
   return firstLine.length > 80 ? `${firstLine.slice(0, 79)}…` : firstLine;
 }
@@ -38,6 +43,27 @@ function buildConflictResolutionTaskText(task, conflict, additionalInstructions 
   const base = `Resolve the failed Patchwork result application described below. Inspect the current coding tree, including any conflict markers, and the original result patch in CONFLICTS.md. Preserve the intended changes from both the original task and the returned result, then complete the work and verify the final diff.\n\nOriginal task:\n${task.taskText}\n\nApply failure:\n${conflict.error || task.error || 'The result could not be applied cleanly.'}`;
   const extra = String(additionalInstructions || '').replaceAll('\r\n', '\n').trim().slice(0, 12_000);
   return extra ? `${base}\n\nAdditional instructions from the user:\n${extra}` : base;
+}
+
+async function retryTaskApplication(task) {
+  let current = task;
+  if (current.conversationUrl) {
+    try {
+      current = await chatGPTView.refreshTaskResult(current);
+      current = await taskService.getTask(current.taskId);
+    } catch (error) {
+      const savedTask = await taskService.getTask(current.taskId);
+      if (savedTask.state !== 'conflicted' || !savedTask.result?.patches?.length) throw error;
+      current = savedTask;
+    }
+  }
+  if (current.state === 'ready') {
+    return resultService.apply(current.taskId);
+  }
+  if (current.state === 'conflicted') {
+    return resultService.apply(current.taskId);
+  }
+  return current;
 }
 
 function createMainWindow() {
@@ -122,6 +148,92 @@ function registerIpc() {
   ipcMain.handle('git:diff', async (_event, repositoryPath, filePath, staged) => (
     gitService.diff(repositoryPath, filePath, staged)
   ));
+  ipcMain.handle('git:summary', async (_event, repositoryPath, customPrompt) => {
+    const status = await gitService.status(repositoryPath);
+    if (status.changes.length === 0) throw new Error('There are no uncommitted changes to summarize.');
+
+    const suspendedTaskId = chatGPTView.activeTask?.taskId || null;
+    const suspendedMergeId = chatGPTView.activeMerge?.id || null;
+    const prompt = resolveGitSummaryPrompt(customPrompt);
+    const task = await taskService.createTask({
+      taskText: prompt,
+      repositories: [{ path: status.repository.path }],
+      model: 'luna',
+      reasoningMode: 'medium',
+      autoApply: false,
+      summaryOnly: true,
+    });
+    const usedCustomPrompt = String(customPrompt || '').trim().length > 0;
+    emit({ type: 'task-prepared', task: publicTask(task) });
+    emit({
+      type: 'git-summary-started',
+      repositoryPath: status.repository.path,
+      message: `Packaging ${status.changes.length} uncommitted change${status.changes.length === 1 ? '' : 's'} for Git Summary…`,
+    });
+    try {
+      await chatGPTView.prepare(task);
+      const completed = await chatGPTView.submitAndWaitForResult(task);
+      const commitMessage = validateCommitMessage(completed?.result?.commitMessage);
+      emit({
+        type: 'git-summary-ready',
+        task: publicTask(completed),
+        repositoryPath: status.repository.path,
+        commitMessage,
+        message: 'AI generated a Conventional Commit message. Use it in Source Control when ready.',
+      });
+      return { taskId: task.taskId, commitMessage, usedCustomPrompt };
+    } catch (error) {
+      let failedTask = null;
+      try {
+        const currentTask = await taskService.getTask(task.taskId);
+        failedTask = currentTask.state === 'failed'
+          ? currentTask
+          : await taskService.updateTask(task.taskId, { state: 'failed', error: error.message });
+      } catch {
+        // The task may have been explicitly deleted while the summary was running.
+      }
+      emit({
+        type: 'git-summary-failed',
+        task: failedTask ? publicTask(failedTask) : undefined,
+        repositoryPath: status.repository.path,
+        message: error.message,
+      });
+      throw error;
+    } finally {
+      chatGPTView.forgetTask(task.taskId);
+
+      const [suspendedTask, suspendedMerge] = await Promise.all([
+        suspendedTaskId ? taskService.getTask(suspendedTaskId).catch(() => null) : null,
+        suspendedMergeId ? worktreeService.get(suspendedMergeId).catch(() => null) : null,
+      ]);
+      await chatGPTView.restoreActiveContext(suspendedTask, suspendedMerge).catch(() => {});
+    }
+  });
+
+  ipcMain.handle('task:use-git-summary', async (_event, taskId) => {
+    const task = await taskService.getTask(taskId);
+    if (!task.summaryOnly || !task.result?.commitMessage) {
+      throw new Error('This task does not contain a Git Summary result.');
+    }
+    if (!['ready', 'completed'].includes(task.state)) {
+      throw new Error('This Git Summary is not ready to use in Source Control.');
+    }
+    validateCommitMessage(task.result.commitMessage);
+    const completed = task.state === 'completed'
+      ? task
+      : await taskService.updateTask(task.taskId, {
+        state: 'completed',
+        completedAt: new Date().toISOString(),
+      });
+    emit({
+      type: 'git-summary-applied',
+      task: publicTask(completed),
+      repositoryPath: completed.sourceRepositoryPath || completed.repositories?.[0]?.path,
+      commitMessage: completed.result.commitMessage,
+      message: 'Git Summary moved to the Source Control commit editor.',
+    });
+    return publicTask(completed);
+  });
 
   ipcMain.handle('trees:list', async () => worktreeService.list());
   ipcMain.handle('trees:reveal', async (_event, treeId) => {
@@ -260,19 +372,95 @@ function registerIpc() {
     const task = await taskService.getTask(taskId);
     return publicTask(await chatGPTView.submit(task));
   });
-  ipcMain.handle('task:resolve-conflict', async (_event, taskId, options = {}) => {
+  ipcMain.handle('task:set-target', async (_event, taskId, input = {}) => {
     const task = await taskService.getTask(taskId);
+    const writableRepositories = (Array.isArray(task.repositories) ? task.repositories : [])
+      .filter((repository) => !repository.readOnly);
+    if (['applied', 'rolled-back', 'resolved'].includes(task.state)) {
+      throw new Error('This task can no longer change its apply target.');
+    }
+    if (writableRepositories.length !== 1) {
+      throw new Error('Worktree selection is only available for tasks with one writable repository.');
+    }
+
+    const previousTreeId = task.treeId || null;
+    const selection = input && typeof input === 'object' ? input : {};
+    let tree = null;
+    let repositoryPath = task.sourceRepositoryPath || writableRepositories[0].path;
+
+    if (selection.createTree) {
+      tree = await worktreeService.create(repositoryPath, selection.treeName);
+      repositoryPath = tree.path;
+    } else if (selection.treeId) {
+      const candidate = await worktreeService.get(String(selection.treeId));
+      tree = await worktreeService.inspect(candidate);
+      if (!tree.available) throw new Error(tree.error || 'The selected coding tree is unavailable.');
+      if (tree.mergeState === 'submitted') throw new Error('The selected coding tree is already being merged.');
+      const sourcePath = task.sourceRepositoryPath || writableRepositories[0].path;
+      const [expectedRoot, selectedRoot] = await Promise.all([
+        fs.realpath(sourcePath).catch(() => path.resolve(sourcePath)),
+        fs.realpath(tree.repositoryPath).catch(() => path.resolve(tree.repositoryPath)),
+      ]);
+      if (expectedRoot !== selectedRoot) {
+        throw new Error('Choose a worktree from the same repository as this task.');
+      }
+      repositoryPath = tree.path;
+    } else if (task.sourceRepositoryPath) {
+      repositoryPath = task.sourceRepositoryPath;
+    }
+
+    const updated = await taskService.setTarget(taskId, { repositoryPath, tree });
+    if (previousTreeId && previousTreeId !== tree?.id) {
+      await worktreeService.detachTask(previousTreeId, taskId).catch(() => {});
+    }
+    if (tree) {
+      await worktreeService.attachTask(tree.id, taskId);
+    }
+    emit({
+      type: 'task-target-changed',
+      task: publicTask(updated),
+      message: tree ? `Task target changed to ${tree.name}.` : 'Task target changed to the original repository.',
+    });
+    return publicTask(updated);
+  });
+  ipcMain.handle('task:retry-apply', async (_event, taskId) => {
+    const task = await taskService.getTask(taskId);
+    if (task.state !== 'conflicted' || !task.result?.patches?.length) {
+      throw new Error('This task does not have a result conflict to retry.');
+    }
+    return publicTask(await retryTaskApplication(task));
+  });
+  ipcMain.handle('task:resolve-conflict', async (_event, taskId, options = {}) => {
+    let task = await taskService.getTask(taskId);
     if (task.state !== 'conflicted' || !task.result?.patches?.length) {
       throw new Error('This task does not have a result conflict to resolve.');
     }
+    task = await retryTaskApplication(task);
+    if (task.state === 'applied') return publicTask(task);
+    if (task.state !== 'conflicted') {
+      throw new Error('The result could not be retried before conflict resolution.');
+    }
     let tree = null;
-    if (task.treeId) tree = await worktreeService.get(task.treeId).catch(() => null);
+    if (task.treeId) {
+      const candidate = await worktreeService.get(task.treeId).catch(() => null);
+      if (candidate) {
+        const inspected = await worktreeService.inspect(candidate);
+        if (inspected.available) tree = inspected;
+      }
+    }
     if (!tree) tree = await worktreeService.findForTask(task);
-    const repositories = tree
+    const writableRepositories = task.repositories
+      .filter((repository) => !repository.readOnly)
+      .map((repository) => ({ path: repository.path }));
+    let repositories = tree
       ? [{ path: tree.path }]
-      : task.repositories.filter((repository) => !repository.readOnly).map((repository) => ({ path: repository.path }));
+      : writableRepositories;
+    if (!tree && task.sourceRepositoryPath && writableRepositories.length === 1) {
+      repositories = [{ path: task.sourceRepositoryPath }];
+    }
     if (repositories.length === 0) throw new Error('This conflicted task has no writable repository to resolve.');
     const conflict = task.result.conflicts?.[0] || {};
+    await resultService.prepareConflictResolution(task.taskId);
     const resolutionOptions = options && typeof options === 'object' ? options : {};
     const resolutionTask = await taskService.createTask({
       taskText: buildConflictResolutionTaskText(task, conflict, resolutionOptions.additionalInstructions),
@@ -281,7 +469,9 @@ function registerIpc() {
       tree,
       autoApply: true,
       model: Object.prototype.hasOwnProperty.call(resolutionOptions, 'model') ? resolutionOptions.model : task.model,
-      reasoningMode: task.reasoningMode,
+      reasoningMode: Object.prototype.hasOwnProperty.call(resolutionOptions, 'reasoningMode')
+        ? resolutionOptions.reasoningMode
+        : task.reasoningMode,
       resolvesTaskId: task.taskId,
       conflictContext: {
         originalTaskId: task.taskId,

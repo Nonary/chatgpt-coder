@@ -11,8 +11,11 @@ Repositories added to Patchwork are kept in a local workspace and are available 
 - staged, unstaged, and untracked file groups;
 - textual previews for tracked changes and safe content previews for untracked files;
 - stage/unstage actions for individual files or all changes;
+- AI-generated Conventional Commit messages from all uncommitted changes;
 - commit creation using the repository's configured Git identity; and
 - recent commit history with commit IDs and authors.
+
+Select **AI summary** to package the repository's staged, unstaged, and untracked changes through the same Git-bundle ZIP workflow used for coding tasks. Patchwork uses the saved prompt named **Git Summary** when one exists in the local Prompt library. Otherwise it uses the built-in Git Changes Review + Conventional Commit prompt. The generated message is placed into the commit editor without changing or staging files.
 
 Patchwork deliberately does not expose discard, hard reset, or forced checkout actions in this initial Git workflow. Those operations can erase local work and require a separate, explicit confirmation design.
 
@@ -41,7 +44,7 @@ The generated task instructions tell ChatGPT that skills may be present and to r
 
 ## Prompt library
 
-The task composer includes a local **Prompt library** dropdown directly below model selection. Saved prompts have a name, short description, and reusable instruction text. Multiple prompts can be selected for a task, removed from the selection as chips, and managed from the prompt library drawer. The instruction text is appended to the task only when selected, and the saved library stays local to the Patchwork installation.
+The task composer includes a local **Prompt library** dropdown directly below model selection. Saved prompts have a name, short description, and reusable instruction text. Multiple prompts can be selected for a task, removed from the selection as chips, and managed from the prompt library drawer. The instruction text is appended to the task only when selected, and the saved library stays local to the Patchwork installation. A saved prompt named **Git Summary** is also used by Source control's AI summary action.
 
 ## Current workflow
 
@@ -54,7 +57,7 @@ The task composer includes a local **Prompt library** dropdown directly below mo
 7. Patchwork's application-level monitor activates that exact download, reads the text file locally, verifies the task ID, repository set, base commits, size limits, and base64 integrity, then applies the patch to the task target. Coding-tree tasks also verify the Conventional Commit message and commit the patch. If the target's `HEAD` advanced, Patchwork first tries a clean contextual apply and then Git's three-way merge.
 8. When **Merge tree** is chosen, Patchwork opens another fresh ChatGPT chat with the tree's commit history and diff summary. It reads the returned merge envelope, creates one squash commit on the original branch through a temporary integration worktree, and removes the coding tree.
 
-If Git reports conflicts, Patchwork leaves the conflict markers and unmerged files in the coding tree, reports the affected files, and offers **Resolve with ChatGPT**. That action opens a new ChatGPT task containing the current dirty tree, `CONFLICTS.md`, the original result patch, and the original task attachments.
+If Git reports conflicts, Patchwork leaves the conflict markers and unmerged files in the target, reports the affected files, and offers **Retry apply**. It also offers **Resolve with ChatGPT** when the task has a writable target, which opens a new ChatGPT task containing the current dirty target, `CONFLICTS.md`, the original result patch, and the original task attachments.
 
 If page automation is temporarily unavailable because ChatGPT's markup changed, the embedded browser remains fully usable. **Copy prompt**, **Show package**, and **Import result** remain available.
 

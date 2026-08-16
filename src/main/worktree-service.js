@@ -134,9 +134,13 @@ class WorktreeService {
   async findForTask(task) {
     const trees = await this.syncDiscoveredWorktrees();
     const taskId = String(task?.taskId || '').trim();
-    if (taskId) {
-      const attached = trees.find((tree) => Array.isArray(tree.taskIds) && tree.taskIds.includes(taskId));
-      if (attached) return this.inspect(attached);
+    if (taskId && task?.treeId) {
+      const attached = trees.find((tree) => tree.id === task.treeId
+        && Array.isArray(tree.taskIds) && tree.taskIds.includes(taskId));
+      if (attached) {
+        const inspected = await this.inspect(attached);
+        if (inspected.available) return inspected;
+      }
     }
 
     const repositoryPaths = (Array.isArray(task?.repositories) ? task.repositories : [])
@@ -148,7 +152,9 @@ class WorktreeService {
       fs.realpath(repositoryPath).catch(() => path.resolve(repositoryPath)))));
     for (const tree of trees) {
       const treePath = await fs.realpath(tree.path).catch(() => path.resolve(tree.path));
-      if (resolvedPaths.has(treePath)) return this.inspect(tree);
+      if (!resolvedPaths.has(treePath)) continue;
+      const inspected = await this.inspect(tree);
+      if (inspected.available) return inspected;
     }
     return null;
   }
@@ -254,6 +260,7 @@ class WorktreeService {
     const branch = `patchwork/${slugify(name).slice(0, 42)}-${id.slice(0, 8)}`;
     const treePath = path.join(this.worktreesRoot, id);
     await runGit(repository.path, ['worktree', 'add', '-b', branch, treePath, repository.baseCommit]);
+    const resolvedTreePath = await fs.realpath(treePath);
 
     const createdAt = new Date().toISOString();
     const tree = {
@@ -262,7 +269,7 @@ class WorktreeService {
       repositoryId: repository.id,
       repositoryName: repository.name,
       repositoryPath: repository.path,
-      path: treePath,
+      path: resolvedTreePath,
       branch,
       sourceBranch: repository.branch,
       baseCommit: repository.baseCommit,
@@ -317,6 +324,21 @@ class WorktreeService {
     if (chatgptProject !== undefined) {
       records[index].chatgptProject = normalizeChatGPTProject(chatgptProject);
     }
+    await this.writeRecords(records);
+    return this.inspect(records[index]);
+  }
+
+  async detachTask(treeId, taskId) {
+    const records = await this.readRecords();
+    const index = records.findIndex((item) => item.id === treeId);
+    if (index < 0) return null;
+    const nextTaskIds = (records[index].taskIds || []).filter((id) => id !== taskId);
+    if (nextTaskIds.length === records[index].taskIds?.length) return this.inspect(records[index]);
+    records[index] = {
+      ...records[index],
+      taskIds: nextTaskIds,
+      updatedAt: new Date().toISOString(),
+    };
     await this.writeRecords(records);
     return this.inspect(records[index]);
   }

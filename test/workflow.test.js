@@ -12,6 +12,7 @@ const {
   buildConversationStatusScript,
   buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
+  buildPackageAttachmentStatusScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   conversationIdFromRouteUrl,
@@ -29,7 +30,7 @@ const { fingerprintRepository, runGit } = require('../src/main/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/main/git-service');
 const { ResultService, parsePlainTextResult } = require('../src/main/result-service');
 const { SkillService } = require('../src/main/skill-service');
-const { TaskService } = require('../src/main/task-service');
+const { DEFAULT_GIT_SUMMARY_PROMPT, resolveGitSummaryPrompt, TaskService } = require('../src/main/task-service');
 const {
   WorktreeService,
   mergeResultFilename,
@@ -58,6 +59,13 @@ async function ingestDownloadedText(results, tasks, task, text) {
   return results.ingestTextFile(task.taskId, downloadedPath);
 }
 
+test('Git Summary prompts use the saved prompt when present and the built-in prompt otherwise', () => {
+  assert.equal(resolveGitSummaryPrompt('  Review these changes.  '), 'Review these changes.');
+  assert.equal(resolveGitSummaryPrompt('\r\n'), DEFAULT_GIT_SUMMARY_PROMPT);
+  assert.match(DEFAULT_GIT_SUMMARY_PROMPT, /Review all \*\*uncommitted Git changes\*\*/);
+  assert.ok(DEFAULT_GIT_SUMMARY_PROMPT.includes('<type>(<optional-scope>): <concise summary>'));
+});
+
 function plainTextResult(task, patch, commitMessage = 'fix(task): apply generated changes') {
   return `PATCHWORK_RESULT_V1\n${JSON.stringify({
     schemaVersion: 2,
@@ -74,6 +82,77 @@ function plainTextResult(task, patch, commitMessage = 'fix(task): apply generate
     }],
   })}\nPATCHWORK_RESULT_END`;
 }
+
+test('Git Summary tasks package staged and unstaged changes into a visible read-only task', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-summary-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'staged change\n');
+  await runGit(repositoryPath, ['add', 'hello.txt']);
+  await fs.writeFile(path.join(repositoryPath, 'unstaged.txt'), 'unstaged change\n');
+
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Review uncommitted changes.',
+    repositories: [repository],
+    autoApply: false,
+    summaryOnly: true,
+  });
+
+  assert.equal(task.summaryOnly, true);
+  assert.equal(task.repositories[0].workingChanges, true);
+  assert.match(task.resultFilename, /^chatgpt-ide-result-[0-9a-f-]{36}\.txt$/i);
+  assert.match(task.handoffPrompt, /PATCHWORK_RESULT_V1/);
+  assert.match(task.handoffPrompt, /Return an empty patch for every repository/i);
+  assert.equal((await tasks.listTasks()).length, 1);
+
+  const zip = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.repositories[0].workingChanges, true);
+  assert.equal(manifest.repositories[0].snapshot, true);
+  const agentInstructions = zip.getEntry('AGENTS.md').getData().toString('utf8');
+  assert.match(agentInstructions, /read-only Git summary task/i);
+  assert.match(agentInstructions, /PATCHWORK_RESULT_V1/);
+  assert.match(agentInstructions, /Every repository patch in the result must be empty/i);
+  assert.ok(zip.getEntry(`repositories/${repository.id}.bundle`));
+
+  const result = await ingestDownloadedText(
+    new ResultService(tasks),
+    tasks,
+    task,
+    plainTextResult(task, '', 'fix(source-control): generate AI commit summaries'),
+  );
+  assert.equal(result.state, 'ready');
+  assert.equal(result.result.commitMessage, 'fix(source-control): generate AI commit summaries');
+});
+
+test('Source Control summaries run as persistent Luna Medium tasks with an explicit handoff', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
+  const summaryHandler = appSource.slice(
+    appSource.indexOf("ipcMain.handle('git:summary'"),
+    appSource.indexOf("ipcMain.handle('trees:list'"),
+  );
+
+  assert.match(summaryHandler, /model: 'luna',[\s\S]*reasoningMode: 'medium'/);
+  assert.match(summaryHandler, /type: 'task-prepared'/);
+  assert.match(summaryHandler, /state: 'completed'/);
+  assert.match(summaryHandler, /type: 'git-summary-ready',[\s\S]*task: publicTask\(completed\)/);
+  assert.match(summaryHandler, /ipcMain\.handle\('task:use-git-summary'/);
+  assert.doesNotMatch(summaryHandler, /deleteTask\(task\.taskId\)/);
+  assert.doesNotMatch(renderer, /const hiddenTask = Boolean\(event\.task\?\.summaryOnly\)/);
+  assert.match(renderer, /task\.summaryOnly \|\| task\.state !== 'ready'/);
+  assert.match(renderer, /Generating Git Summary/);
+  assert.match(renderer, /useActiveGitSummary/);
+  assert.match(renderer, /source-commit-message'\]\.value = completed\.result\.commitMessage/);
+  assert.doesNotMatch(renderer, /source-commit-message'\]\.value = result\.commitMessage/);
+  assert.match(markup, /id="use-git-summary-button"[^>]*>Use in Source Control<\/button>/);
+  assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
+});
 
 test('outbound task packages are ZIP archives containing real Git bundles', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
@@ -178,6 +257,46 @@ test('task model and reasoning selections are persisted with the task', async (c
   assert.equal(lowTask.reasoningMode, 'low');
   const storedLowTask = await tasks.getTask(lowTask.taskId);
   assert.equal(storedLowTask.reasoningMode, 'low');
+});
+
+test('submitted tasks can change their apply target without rebuilding the task package', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-target-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+
+  const firstTree = await trees.create(repositoryPath, 'First target');
+  const secondTree = await trees.create(repositoryPath, 'Second target');
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting.',
+    repositories: [{ path: firstTree.path }],
+    tree: firstTree,
+    autoApply: false,
+  });
+  await tasks.updateTask(task.taskId, { state: 'submitted' });
+
+  const changed = await tasks.setTarget(task.taskId, {
+    repositoryPath: secondTree.path,
+    tree: secondTree,
+  });
+  assert.equal(changed.state, 'submitted');
+  assert.equal(changed.treeId, secondTree.id);
+  assert.equal(changed.treeName, secondTree.name);
+  assert.equal(changed.repositories[0].path, secondTree.path);
+  assert.equal(changed.repositories[0].baseCommit, task.repositories[0].baseCommit);
+  assert.equal(changed.packagePath, task.packagePath);
+  assert.equal(changed.sourceRepositoryPath, await fs.realpath(repositoryPath));
+
+  const restored = await tasks.setTarget(task.taskId, {
+    repositoryPath,
+    tree: null,
+  });
+  assert.equal(restored.treeId, null);
+  assert.equal(restored.treeName, null);
+  assert.equal(restored.repositories[0].path, await fs.realpath(repositoryPath));
 });
 
 test('selected local skills are discovered, copied into the task package, and described in the prompt', async (context) => {
@@ -325,6 +444,73 @@ test('results apply and commit after the coding tree HEAD advances', async (cont
   assert.equal((await runGit(tree.path, ['log', '-1', '--pretty=%s'])).stdout.trim(), 'fix(greeting): apply after advanced head');
 });
 
+test('conflict resolution reapplies a result blocked by dirty changes before packaging', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-reapply-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const tasks = new TaskService(dataRoot);
+  await tasks.initialize();
+
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting.',
+    repositories: [repository],
+    autoApply: true,
+  });
+
+  const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`);
+  const clonePath = path.join(root, 'chatgpt-conflict-reapply');
+  await runGit(root, ['clone', bundlePath, clonePath]);
+  await runGit(clonePath, ['checkout', '--detach', task.repositories[0].baseCommit]);
+  await fs.writeFile(path.join(clonePath, 'hello.txt'), 'ChatGPT version\n');
+  const { stdout: patchBody } = await runGit(clonePath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'local version\n');
+  const conflicted = await ingestDownloadedText(new ResultService(tasks), tasks, task, plainTextResult(task, patchBody));
+  assert.equal(conflicted.state, 'conflicted');
+  assert.equal(conflicted.result.conflicts[0].applyAttempted, false);
+  assert.equal((await runGit(repositoryPath, ['diff', '--cached', '--name-only'])).stdout.trim(), '');
+
+  const results = new ResultService(tasks);
+  await results.prepareConflictResolution(task.taskId);
+  assert.equal((await runGit(repositoryPath, ['diff', '--name-only', '--diff-filter=U'])).stdout.trim(), 'hello.txt');
+  const unmergedIndex = (await runGit(repositoryPath, ['ls-files', '-u', '--', 'hello.txt'])).stdout;
+  assert.match(unmergedIndex, /\b1\thello\.txt/);
+  assert.match(unmergedIndex, /\b2\thello\.txt/);
+  assert.match(unmergedIndex, /\b3\thello\.txt/);
+  assert.equal((await runGit(repositoryPath, ['status', '--porcelain'])).stdout.trim(), 'UU hello.txt');
+  assert.match(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
+
+  // Retrying the resolution action must reuse existing conflict entries
+  // instead of blocking before the task package can be created.
+  const reusedConflict = await results.prepareConflictResolution(task.taskId);
+  assert.equal(reusedConflict.isClean, false);
+  assert.equal((await runGit(repositoryPath, ['status', '--porcelain'])).stdout.trim(), 'UU hello.txt');
+
+  const resolutionTask = await tasks.createTask({
+    taskText: 'Resolve the supplied merge conflict.',
+    repositories: [{ path: repositoryPath }],
+    autoApply: false,
+    resolvesTaskId: task.taskId,
+    conflictContext: {
+      originalTaskId: task.taskId,
+      error: conflicted.result.conflicts[0].error,
+      files: conflicted.result.conflicts[0].files,
+      patches: conflicted.result.patches,
+    },
+  });
+  const resolutionClone = path.join(root, 'chatgpt-resolution-reapply');
+  const resolutionBundle = path.join(
+    tasks.taskDirectory(resolutionTask.taskId), 'repositories', `${resolutionTask.repositories[0].id}.bundle`,
+  );
+  await runGit(root, ['clone', resolutionBundle, resolutionClone]);
+  await runGit(resolutionClone, ['checkout', '--detach', resolutionTask.repositories[0].baseCommit]);
+  assert.match(await fs.readFile(path.join(resolutionClone, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
+});
+
 test('conflicting results remain in the tree and can be resubmitted with unstaged context', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -352,6 +538,7 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
   await runGit(tree.path, ['commit', '-m', 'chore: change the same greeting']);
   const conflicted = await ingestDownloadedText(new ResultService(tasks), tasks, task, plainTextResult(task, patchBody, 'fix(greeting): change greeting'));
   assert.equal(conflicted.state, 'conflicted');
+  assert.match(conflicted.error, /retry the saved result/i);
   assert.deepEqual(conflicted.result.conflicts[0].files, ['hello.txt']);
   assert.match(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
 
@@ -395,6 +582,102 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
   assert.equal(resolvedOriginal.error, null);
   assert.equal(resolvedOriginal.resolutionTaskId, resolutionTask.taskId);
   assert.ok(Number.isFinite(Date.parse(resolvedOriginal.resolvedAt)));
+});
+
+test('a conflict-resolution result falls back to the original repository when its worktree is deleted', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-resolution-target-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+
+  const tree = await trees.create(repositoryPath, 'Resolution target');
+  const originalTask = await tasks.createTask({
+    taskText: 'Change the greeting.',
+    repositories: [{ path: tree.path }],
+    tree,
+    autoApply: false,
+  });
+  await tasks.updateTask(originalTask.taskId, {
+    state: 'conflicted',
+    error: 'The result could not be applied cleanly.',
+    result: { conflicts: [{ repositoryId: originalTask.repositories[0].id, files: ['hello.txt'] }] },
+  });
+  const resolutionTask = await tasks.createTask({
+    taskText: 'Resolve the greeting conflict.',
+    repositories: [{ path: tree.path }],
+    tree,
+    autoApply: false,
+    resolvesTaskId: originalTask.taskId,
+  });
+
+  await fs.writeFile(path.join(tree.path, 'hello.txt'), 'resolved by ChatGPT\n');
+  const { stdout: patchBody } = await runGit(tree.path, [
+    'diff', '--binary', resolutionTask.repositories[0].baseCommit, '--', '.',
+  ]);
+  await runGit(tree.path, ['restore', 'hello.txt']);
+  const resultDir = path.join(tasks.taskDirectory(resolutionTask.taskId), 'result');
+  await fs.mkdir(resultDir, { recursive: true });
+  const patchPath = path.join(resultDir, `${resolutionTask.repositories[0].id}.patch`);
+  await fs.writeFile(patchPath, patchBody);
+  await tasks.updateTask(resolutionTask.taskId, {
+    state: 'ready',
+    result: {
+      summary: 'Resolved the greeting conflict.',
+      commitMessage: 'fix(greeting): resolve concurrent changes',
+      transport: 'downloaded-text-file',
+      patches: [{
+        id: resolutionTask.repositories[0].id,
+        baseCommit: resolutionTask.repositories[0].baseCommit,
+        patchEncoding: 'base64',
+        localPath: patchPath,
+      }],
+    },
+  });
+
+  await trees.remove(tree.id, true);
+  const resolved = await new ResultService(tasks).apply(resolutionTask.taskId);
+  assert.equal(resolved.state, 'applied');
+  assert.equal(resolved.treeId, null);
+  assert.equal(resolved.repositories[0].path, await fs.realpath(repositoryPath));
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'resolved by ChatGPT\n');
+  assert.equal((await tasks.getTask(originalTask.taskId)).state, 'resolved');
+});
+
+test('a conflicted result can be retried after the target is cleaned up', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-retry-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const tasks = new TaskService(dataRoot);
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting.', repositories: [repository], autoApply: true,
+  });
+
+  const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`);
+  const clonePath = path.join(root, 'chatgpt-retry');
+  await runGit(root, ['clone', bundlePath, clonePath]);
+  await runGit(clonePath, ['checkout', '--detach', repository.baseCommit]);
+  await fs.writeFile(path.join(clonePath, 'hello.txt'), 'ChatGPT version\n');
+  const { stdout: patchBody } = await runGit(clonePath, [
+    'diff', '--binary', repository.baseCommit, '--', '.',
+  ]);
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'temporary conflicting change\n');
+  const results = new ResultService(tasks);
+  let current = await ingestDownloadedText(results, tasks, task, plainTextResult(task, patchBody));
+  assert.equal(current.state, 'conflicted');
+  assert.match(current.error, /retry the saved result/i);
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'temporary conflicting change\n');
+
+  await runGit(repositoryPath, ['restore', 'hello.txt']);
+  current = await results.apply(task.taskId);
+  assert.equal(current.state, 'applied');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'ChatGPT version\n');
 });
 
 test('an unborn repository is snapshotted without changing the source and accepts its result', async (context) => {
@@ -1096,13 +1379,58 @@ test('resolved task status is presented separately from applied work', async () 
   assert.match(markup, /<option value="resolved">Resolved<\/option>/);
 });
 
-test('conflicted results retain both retry apply and ChatGPT resolution actions', async () => {
+test('conflicted results expose a separate retry action and ChatGPT resolution action', async () => {
   const service = await fs.readFile(path.join(__dirname, '../src/main/result-service.js'), 'utf8');
   const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
   assert.match(service, /\['ready', 'failed', 'conflicted'\]\.includes\(task\.state\)/);
-  assert.match(renderer, /task\.state === 'ready' \|\| task\.state === 'conflicted'/);
-  assert.match(renderer, /task\.state === 'conflicted' \? 'Retry apply' : 'Apply changes'/);
-  assert.match(renderer, /classList\.toggle\('hidden', task\.state !== 'conflicted'\)/);
+  assert.match(renderer, /elements\['apply-button'\]\.classList\.toggle\('hidden', task\.summaryOnly \|\| task\.state !== 'ready'\)/);
+  assert.match(renderer, /elements\['retry-apply-button'\]\.classList\.toggle\('hidden', task\.state !== 'conflicted'\)/);
+  assert.match(renderer, /retryApplyTask\(state\.activeTask\.taskId\)/);
+  assert.match(renderer, /elements\['resolve-conflict-button'\]\.classList\.toggle\('hidden', task\.state !== 'conflicted'\)/);
+});
+
+test('conflict retry refreshes the ChatGPT result before applying and before creating a resolution task', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  const viewSource = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8');
+  const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
+  assert.match(appSource, /ipcMain\.handle\('task:retry-apply'/);
+  assert.match(appSource, /retryTaskApplication\(task\)[\s\S]*refreshTaskResult\(current\)[\s\S]*resultService\.apply/);
+  assert.match(appSource, /task = await retryTaskApplication\(task\)[\s\S]*await resultService\.prepareConflictResolution/);
+  assert.match(viewSource, /async refreshTaskResult\(task\)/);
+  assert.match(viewSource, /resultWaiters/);
+  assert.match(viewSource, /checkForResult\(\{ force: true \}\)/);
+  assert.match(preload, /retryApplyTask: \(taskId\) => ipcRenderer\.invoke\('task:retry-apply', taskId\)/);
+});
+
+test('conflict resolution modal hides the native ChatGPT view and restores its bounds', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const openModal = renderer.slice(renderer.indexOf('function openConflictResolutionModal'), renderer.indexOf('function closeConflictResolutionModal'));
+  const closeModal = renderer.slice(renderer.indexOf('function closeConflictResolutionModal'), renderer.indexOf('async function submitConflictResolution'));
+  const submitModal = renderer.slice(renderer.indexOf('async function submitConflictResolution'), renderer.indexOf('function renderChatGPTProjects'));
+  assert.match(openModal, /window\.patchwork\.setBrowserVisible\(false\)/);
+  assert.match(closeModal, /window\.patchwork\.setBrowserVisible\(true\)/);
+  assert.match(closeModal, /requestAnimationFrame\(\(\) => requestAnimationFrame\(syncBrowserBounds\)\)/);
+  assert.match(submitModal, /catch \(error\) \{[\s\S]*closeConflictResolutionModal\(\);[\s\S]*showToast\(error\.message, true\)/);
+});
+
+test('conflict resolution preserves the original configuration by default and submits a reasoning override', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(markup, /id="conflict-resolution-reasoning-select"/);
+  assert.match(renderer, /conflict-resolution-reasoning-select/);
+  assert.match(renderer, /reasoningMode: elements\['conflict-resolution-reasoning-select'\]\.value/);
+  assert.match(appSource, /Object\.prototype\.hasOwnProperty\.call\(resolutionOptions, 'reasoningMode'\)/);
+  assert.match(appSource, /resolve-conflict[\s\S]*reasoningMode: Object\.prototype\.hasOwnProperty\.call\(resolutionOptions, 'reasoningMode'\)/);
+});
+
+test('conflict resolution reapplies the original patch before creating the resolution task', async () => {
+  const service = await fs.readFile(path.join(__dirname, '../src/main/result-service.js'), 'utf8');
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(service, /async prepareConflictResolution\(taskId\)/);
+  assert.match(service, /applyPatch\(repository\.path, patch\.localPath, \{ threeWay: true, index: true \}\)/);
+  assert.match(service, /applyAttempted: Boolean\(applyAttempted\)/);
+  assert.match(appSource, /await resultService\.prepareConflictResolution\(task\.taskId\)/);
 });
 
 test('conflict resolution can recover a coding tree from the original task association', async (context) => {
@@ -1120,6 +1448,105 @@ test('conflict resolution can recover a coding tree from the original task assoc
   const recovered = await trees.findForTask(task);
   assert.equal(recovered.id, tree.id);
   assert.equal(recovered.path, tree.path);
+});
+
+test('task target and conflict fallback wiring is exposed through the task UI', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
+  assert.match(appSource, /ipcMain\.handle\('task:set-target'/);
+  assert.match(appSource, /tree = await worktreeService\.inspect\(candidate\)/);
+  assert.match(appSource, /task\.sourceRepositoryPath/);
+  assert.match(renderer, /\['prepared', 'submitted', 'ready', 'failed', 'conflicted'\]/);
+  assert.match(renderer, /setTaskTarget\(task\.taskId/);
+  assert.match(markup, /id="task-target-card"/);
+  assert.match(markup, /Use original repository/);
+  assert.match(preload, /setTaskTarget: \(taskId, input\)/);
+});
+
+test('worktree lookup skips unavailable matching records so conflict resolution can fall back', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-missing-tree-lookup-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const trees = new WorktreeService(path.join(root, 'data'));
+  const tree = await trees.create(repositoryPath, 'Missing tree lookup');
+  await trees.attachTask(tree.id, 'conflicted-task');
+
+  const records = await trees.readRecords();
+  records[0].path = path.join(root, 'missing-tree');
+  await trees.writeRecords(records);
+
+  const recovered = await trees.findForTask({
+    taskId: 'conflicted-task',
+    treeId: tree.id,
+    repositories: [{ path: records[0].path, readOnly: false }],
+  });
+  assert.equal(recovered, null);
+});
+
+test('conflict resolution preparation falls back to the original repository when its worktree is deleted', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-target-rebind-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+
+  const tree = await trees.create(repositoryPath, 'Conflict target rebind');
+  const task = await tasks.createTask({
+    taskText: 'Resolve the greeting conflict.',
+    repositories: [{ path: tree.path }],
+    tree,
+    autoApply: true,
+  });
+  const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${task.repositories[0].id}.bundle`);
+  const clonePath = path.join(root, 'chatgpt-rebind');
+  await runGit(root, ['clone', bundlePath, clonePath]);
+  await runGit(clonePath, ['checkout', '--detach', task.repositories[0].baseCommit]);
+  await fs.writeFile(path.join(clonePath, 'hello.txt'), 'ChatGPT version\n');
+  const { stdout: patchBody } = await runGit(clonePath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+  const resultDir = path.join(tasks.taskDirectory(task.taskId), 'result');
+  await fs.mkdir(resultDir, { recursive: true });
+  const patchPath = path.join(resultDir, `${task.repositories[0].id}.patch`);
+  await fs.writeFile(patchPath, patchBody);
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'local version\n');
+  await tasks.updateTask(task.taskId, {
+    state: 'conflicted',
+    error: 'The result could not be applied cleanly.',
+    result: {
+      summary: 'The result conflicted with local changes.',
+      commitMessage: 'fix(greeting): resolve concurrent changes',
+      transport: 'downloaded-text-file',
+      conflicts: [{
+        repositoryId: task.repositories[0].id,
+        repositoryName: task.repositories[0].name,
+        files: [],
+        error: 'The target changed before the result could be applied.',
+        applyAttempted: false,
+      }],
+      patches: [{
+        id: task.repositories[0].id,
+        baseCommit: task.repositories[0].baseCommit,
+        patchEncoding: 'base64',
+        localPath: patchPath,
+      }],
+    },
+  });
+
+  await trees.remove(tree.id, true);
+  const results = new ResultService(tasks);
+  const prepared = await results.prepareConflictResolution(task.taskId);
+  const rebound = await tasks.getTask(task.taskId);
+
+  assert.equal(rebound.treeId, null);
+  assert.equal(rebound.repositories[0].path, await fs.realpath(repositoryPath));
+  assert.equal(prepared.isClean, false);
+  assert.equal((await runGit(repositoryPath, ['diff', '--name-only', '--diff-filter=U'])).stdout.trim(), 'hello.txt');
 });
 
 test('conflict resolution backend does not require a coding tree', async () => {
@@ -1628,6 +2055,81 @@ test('task upload reuses an attachment that is already in the composer', async (
   assert.equal(debuggerAccessed, false);
 });
 
+test('task attachment confirmation finds uploaded packages in a hidden view and inside shadow roots', () => {
+  const filename = 'chatgpt-ide-task-shadow-root.zip';
+  const card = {
+    textContent: filename,
+    getAttribute: () => null,
+    querySelector: () => null,
+  };
+  const attachment = {
+    textContent: filename,
+    getAttribute: () => null,
+    // Source Control collapses the hidden ChatGPT WebContentsView to zero
+    // bounds while its summary automation continues in the page DOM.
+    getBoundingClientRect: () => ({ width: 0, height: 0 }),
+    closest: () => card,
+    parentElement: card,
+  };
+  const shadowRoot = {
+    querySelectorAll: (selector) => {
+      if (selector === '[role="dialog"], [role="alert"], [aria-live]') return [];
+      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') {
+        return [attachment];
+      }
+      if (selector === '*') return [];
+      return [];
+    },
+  };
+  const host = { shadowRoot };
+  const document = {
+    querySelectorAll: (selector) => {
+      if (selector === '*') return [host];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  });
+
+  assert.equal(result.attached, true);
+  assert.equal(result.busy, false);
+});
+
+test('task attachment confirmation trusts the selected input before broad busy page matches', () => {
+  const filename = 'chatgpt-ide-task-hidden-input.zip';
+  const fileInput = { files: [{ name: filename }] };
+  const broadPageMatch = {
+    textContent: `Chat history ${filename} unrelated processing status`,
+    getAttribute: () => null,
+    parentElement: {
+      textContent: `Chat history ${filename} unrelated processing status`,
+      getAttribute: () => null,
+      querySelector: () => ({ role: 'progressbar' }),
+    },
+    closest: () => null,
+  };
+  const document = {
+    querySelectorAll: (selector) => {
+      if (selector === 'input[type="file"]') return [fileInput];
+      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') {
+        return [broadPageMatch];
+      }
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  });
+
+  assert.equal(result.attached, true);
+  assert.equal(result.busy, false);
+});
+
 test('task attachments upload after the package and before ChatGPT is sent', async () => {
   const uploads = [];
   const view = {
@@ -1640,6 +2142,31 @@ test('task attachments upload after the package and before ChatGPT is sent', asy
   ]);
 
   assert.deepEqual(uploads, ['/tasks/context.png', '/tasks/specification.pdf']);
+});
+
+
+test('Source Control summary result detection uses the standard task result filename', () => {
+  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
+  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
+  let clicked = false;
+  const link = {
+    getAttribute: (name) => (name === 'download' ? resultFilename : null),
+    textContent: resultFilename,
+    scrollIntoView: () => {},
+    click: () => { clicked = true; },
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => {
+      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [link];
+      if (selector === '*') return [];
+      return [];
+    },
+  };
+  const result = vm.runInNewContext(buildTaskResultDetectionScript({ taskId, resultFilename }), { document });
+  assert.equal(result.kind, 'download');
+  assert.equal(clicked, true);
+  assert.equal(resultTaskId(resultFilename), taskId);
 });
 
 test('task result detection accepts only the requested text attachment after generation stops', () => {
