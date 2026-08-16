@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   createTask: (input) => ipcRenderer.invoke('task:create', input),
   listTasks: () => ipcRenderer.invoke('task:list'),
   getTask: (taskId) => ipcRenderer.invoke('task:get', taskId),
+  deleteTask: (taskId) => ipcRenderer.invoke('task:delete', taskId),
   openTask: (taskId) => ipcRenderer.invoke('task:open', taskId),
   submitTask: (taskId) => ipcRenderer.invoke('task:submit', taskId),
   resolveTaskConflict: (taskId) => ipcRenderer.invoke('task:resolve-conflict', taskId),

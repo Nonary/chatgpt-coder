@@ -203,6 +203,7 @@ textarea::placeholder { color: #606659; }
 .task-history-result code { color: #adb5a5; font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .task-history-actions { display: flex; gap: 7px; margin-top: 13px; }
 .task-history-actions button { padding: 7px 10px; font-size: 9px; }
+.task-history-actions .danger { color: #ff9c8f; }
 .source-layout { height: 100%; display: grid; grid-template-columns: 370px minmax(0, 1fr); }
 .source-panel { min-height: 0; overflow-y: auto; background: #141712; border-right: 1px solid var(--line); }
 .source-repository-header { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 5px; padding: 12px; background: #141712; border-bottom: 1px solid var(--line-soft); }
@@ -258,11 +259,11 @@ textarea::placeholder { color: #606659; }
 .diff-side-heading:last-child { border-right: 0; }
 .diff-side-heading span { font-size: 8px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
 .diff-side-heading strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #b7beb0; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
-.diff-rows { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-auto-rows: minmax(20px, auto); align-content: start; overflow: auto; color: #c2c8bb; background: #0d0f0c; font: 11px/20px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; tab-size: 2; }
-.diff-line { min-width: 0; display: grid; grid-template-columns: 48px minmax(0, 1fr); border-right: 1px solid #242820; }
+.diff-rows { flex: 1; min-width: 100%; min-height: 0; display: grid; grid-template-columns: minmax(50%, max-content) minmax(50%, max-content); grid-auto-rows: minmax(20px, auto); align-content: start; overflow: auto; color: #c2c8bb; background: #0d0f0c; font: 11px/20px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; tab-size: 2; }
+.diff-line { min-width: max-content; display: grid; grid-template-columns: 48px max-content; border-right: 1px solid #242820; }
 .diff-line:nth-child(even) { border-right: 0; }
 .diff-line-number { padding: 0 9px 0 5px; color: #596153; background: #11140f; text-align: right; user-select: none; }
-.diff-line code { min-width: 0; display: block; overflow: hidden; padding: 0 10px; color: inherit; font: inherit; white-space: pre; }
+.diff-line code { min-width: max-content; display: block; overflow: visible; padding: 0 10px; color: inherit; font: inherit; white-space: pre; }
 .diff-line.removed { background: rgba(248, 81, 73, .16); }
 .diff-line.removed .diff-line-number { color: #c77b73; background: rgba(248, 81, 73, .10); }
 .diff-line.added { background: rgba(46, 160, 67, .18); }

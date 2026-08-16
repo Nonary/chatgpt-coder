@@ -853,6 +853,35 @@ class ChatGPTView {
 
   async listProjects() {
     const result = await this.view.webContents.executeJavaScript(`(async () => {
+      const sessionResponse = await fetch('/api/auth/session', {
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
+      if (!sessionResponse.ok) return { ok: false, kind: 'auth', status: sessionResponse.status };
+      let session = null;
+      try {
+        session = await sessionResponse.json();
+      } catch {
+        return { ok: false, kind: 'auth', status: 401 };
+      }
+      const accessToken = session?.accessToken || session?.access_token;
+      if (!accessToken) return { ok: false, kind: 'auth', status: 401 };
+      const readStorage = (key) => {
+        try { return localStorage.getItem(key); } catch { return null; }
+      };
+      const deviceId = readStorage('oai-device-id')
+        || readStorage('oai/apps/uuid')
+        || document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/)?.[1]
+        || null;
+      const headers = {
+        Accept: 'application/json',
+        Authorization: 'Bearer ' + accessToken,
+      };
+      if (deviceId) headers['oai-device-id'] = deviceId;
+      const accountId = session?.account?.id || session?.accountId || null;
+      if (accountId) headers['ChatGPT-Account-Id'] = accountId;
+
       const projects = [];
       let cursor = null;
       let page = 0;
@@ -862,9 +891,13 @@ class ChatGPTView {
         url.searchParams.set('owned_only', 'true');
         url.searchParams.set('limit', '20');
         if (cursor) url.searchParams.set('cursor', cursor);
-        const response = await fetch(url.toString(), { credentials: 'include' });
+        const response = await fetch(url.toString(), {
+          credentials: 'include',
+          cache: 'no-store',
+          headers,
+        });
         if (!response.ok) {
-          return { ok: false, status: response.status, message: (await response.text()).slice(0, 240) };
+          return { ok: false, kind: 'projects', status: response.status, message: (await response.text()).slice(0, 240) };
         }
         const data = await response.json();
         for (const item of data.items || []) {
@@ -880,9 +913,9 @@ class ChatGPTView {
         page += 1;
       } while (cursor && page < 20);
       return { ok: true, projects };
-    })()`, true).catch((error) => ({ ok: false, status: 0, message: error.message }));
+    })()`, true).catch((error) => ({ ok: false, kind: 'projects', status: 0, message: error.message }));
     if (!result?.ok) {
-      if ([401, 403].includes(result?.status)) throw new Error('Sign in to ChatGPT before loading projects.');
+      if (result?.kind === 'auth') throw new Error('Sign in to ChatGPT before loading projects.');
       throw new Error(`Could not load ChatGPT projects${result?.status ? ` (${result.status})` : ''}.`);
     }
     const unique = new Map();
@@ -896,16 +929,46 @@ class ChatGPTView {
     const projectName = String(name || '').trim();
     if (!projectName) throw new Error('Enter a name for the new ChatGPT project.');
     const result = await this.view.webContents.executeJavaScript(`(async () => {
+      const sessionResponse = await fetch('/api/auth/session', {
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
+      if (!sessionResponse.ok) return { ok: false, kind: 'auth', status: sessionResponse.status };
+      let session = null;
+      try {
+        session = await sessionResponse.json();
+      } catch {
+        return { ok: false, kind: 'auth', status: 401 };
+      }
+      const accessToken = session?.accessToken || session?.access_token;
+      if (!accessToken) return { ok: false, kind: 'auth', status: 401 };
+      const readStorage = (key) => {
+        try { return localStorage.getItem(key); } catch { return null; }
+      };
+      const deviceId = readStorage('oai-device-id')
+        || readStorage('oai/apps/uuid')
+        || document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/)?.[1]
+        || null;
+      const headers = {
+        Accept: 'application/json',
+        Authorization: 'Bearer ' + accessToken,
+        'Content-Type': 'application/json',
+      };
+      if (deviceId) headers['oai-device-id'] = deviceId;
+      const accountId = session?.account?.id || session?.accountId || null;
+      if (accountId) headers['ChatGPT-Account-Id'] = accountId;
       const response = await fetch('/backend-api/projects', {
         method: 'POST',
         credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
+        headers,
         body: JSON.stringify({ name: ${JSON.stringify(projectName)}, instructions: '' }),
       });
       const text = await response.text();
       let data = {};
       try { data = text ? JSON.parse(text) : {}; } catch {}
-      if (!response.ok) return { ok: false, status: response.status, message: text.slice(0, 240) };
+      if (!response.ok) return { ok: false, kind: 'projects', status: response.status, message: text.slice(0, 240) };
       const candidate = data?.resource?.gizmo || data?.gizmo?.gizmo || data?.gizmo || data?.project?.gizmo || data?.project || data;
       return {
         ok: true,
@@ -915,9 +978,9 @@ class ChatGPTView {
           name: candidate?.display?.name || candidate?.name || data?.name || ${JSON.stringify(projectName)},
         },
       };
-    })()`, true).catch((error) => ({ ok: false, status: 0, message: error.message }));
+    })()`, true).catch((error) => ({ ok: false, kind: 'projects', status: 0, message: error.message }));
     if (!result?.ok) {
-      if ([401, 403].includes(result?.status)) throw new Error('Sign in to ChatGPT before creating a project.');
+      if (result?.kind === 'auth') throw new Error('Sign in to ChatGPT before creating a project.');
       throw new Error(`Could not create the ChatGPT project${result?.status ? ` (${result.status})` : ''}.`);
     }
     let project = result.project;
@@ -1546,11 +1609,22 @@ class ChatGPTView {
   }
 
   copyPrompt(task) {
-    clipboard.writeText(task.handoffPrompt);
+    clipboard.writeText(task.taskText);
   }
 
   revealPackage(task) {
     shell.showItemInFolder(task.packagePath);
+  }
+
+  forgetTask(taskId) {
+    const key = String(taskId).toLowerCase();
+    this.knownTasks.delete(key);
+    this.processingTasks.delete(taskId);
+    this.resultAttempts.delete(taskId);
+    if (this.activeTask?.taskId === taskId) this.activeTask = null;
+    if (this.pendingDownload?.kind === 'task' && this.pendingDownload.taskId === taskId) {
+      this.pendingDownload = null;
+    }
   }
 
   async finishTaskResult(task, result, transport) {

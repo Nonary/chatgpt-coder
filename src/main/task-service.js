@@ -380,6 +380,12 @@ class TaskService {
     return next;
   }
 
+  async deleteTask(taskId) {
+    const task = await this.getTask(taskId);
+    await fs.rm(this.taskDirectory(task.taskId), { recursive: true, force: true });
+    return task;
+  }
+
   async listTasks() {
     await this.initialize();
     const entries = await fs.readdir(this.tasksRoot, { withFileTypes: true });

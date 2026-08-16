@@ -206,6 +206,25 @@ function registerIpc() {
 
   ipcMain.handle('task:list', async () => (await taskService.listTasks()).map(publicTask));
   ipcMain.handle('task:get', async (_event, taskId) => publicTask(await taskService.getTask(taskId)));
+  ipcMain.handle('task:delete', async (_event, taskId) => {
+    const task = await taskService.getTask(taskId);
+    const confirmation = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: 'Delete task history?',
+      message: `Remove “${taskTitle(task)}” from task history?`,
+      detail: task.state === 'submitted'
+        ? 'This only removes the saved task history. Patchwork will stop tracking the running task, but it will not cancel ChatGPT.'
+        : 'This removes the saved task history and task package. It does not change the coding tree.',
+      buttons: ['Cancel', 'Delete task'],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (confirmation.response !== 1) return false;
+    chatGPTView.forgetTask(task.taskId);
+    await taskService.deleteTask(task.taskId);
+    emit({ type: 'task-deleted', taskId: task.taskId });
+    return true;
+  });
   ipcMain.handle('task:open', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
     if (task.conversationUrl) await chatGPTView.openTaskConversation(task);

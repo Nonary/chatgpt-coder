@@ -13,6 +13,8 @@ const state = {
   chatgptProjects: [],
 };
 
+const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
+
 const elements = Object.fromEntries(
   [
     'new-task-button', 'chatgpt-session-button', 'task-list', 'page-title',
@@ -28,7 +30,7 @@ const elements = Object.fromEntries(
     'refresh-projects-button', 'project-list-status',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
-    'import-result-button', 'result-card', 'result-summary', 'patch-list',
+    'import-result-button', 'delete-task-button', 'result-card', 'result-summary', 'patch-list',
     'apply-button', 'resolve-conflict-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
     'chatgpt-surface', 'browser-back-button', 'browser-forward-button',
     'browser-reload-button', 'new-chat-button', 'browser-title', 'browser-status',
@@ -65,6 +67,26 @@ function showToast(message, error = false) {
   elements.toast.classList.remove('hidden');
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => elements.toast.classList.add('hidden'), 5000);
+}
+
+function restoreTaskModelSelection() {
+  const modelSelect = elements['task-model-select'];
+  try {
+    const savedModel = localStorage.getItem(TASK_MODEL_STORAGE_KEY);
+    if (savedModel && [...modelSelect.options].some((option) => option.value === savedModel)) {
+      modelSelect.value = savedModel;
+    }
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
+}
+
+function persistTaskModelSelection(event) {
+  try {
+    localStorage.setItem(TASK_MODEL_STORAGE_KEY, event.target.value);
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
 }
 
 function formatTime(value = new Date()) {
@@ -405,6 +427,7 @@ function renderTaskHistory() {
       <div class="task-history-actions">
         <button class="primary history-open-task" data-task-id="${escapeHtml(task.taskId)}">View task</button>
         ${task.packagePath ? `<button class="secondary history-reveal-package" data-task-id="${escapeHtml(task.taskId)}">Show package</button>` : ''}
+        <button class="danger history-delete-task" data-task-id="${escapeHtml(task.taskId)}">Delete</button>
       </div>
     </article>`;
   }).join('');
@@ -423,6 +446,27 @@ function renderTaskHistory() {
       window.patchwork.revealPackage(button.dataset.taskId).catch((error) => showToast(error.message, true));
     });
   });
+  elements['task-history-list'].querySelectorAll('.history-delete-task').forEach((button) => {
+    button.addEventListener('click', () => deleteTask(button.dataset.taskId));
+  });
+}
+
+async function deleteTask(taskId) {
+  try {
+    const deleted = await window.patchwork.deleteTask(taskId);
+    if (!deleted) return;
+    state.tasks = state.tasks.filter((task) => task.taskId !== taskId);
+    if (state.activeTask?.taskId === taskId) {
+      state.activeTask = null;
+      showTaskHistory();
+    } else {
+      renderTaskList();
+      renderTaskHistory();
+    }
+    showToast('Task removed from history.');
+  } catch (error) {
+    showToast(error.message, true);
+  }
 }
 
 const statusText = {
@@ -514,6 +558,7 @@ function showComposer() {
   elements['trees-button'].classList.remove('active');
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
+  restoreTaskModelSelection();
   renderTaskTreeOptions();
   renderChatGPTProjects();
   refreshChatGPTProjects().catch(() => {});
@@ -1004,6 +1049,7 @@ elements['trees-new-task'].addEventListener('click', () => {
   showComposer();
 });
 elements['task-tree-select'].addEventListener('change', renderTaskTreeOptions);
+elements['task-model-select'].addEventListener('change', persistTaskModelSelection);
 elements['chatgpt-project-select'].addEventListener('change', renderChatGPTProjects);
 elements['refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
@@ -1013,6 +1059,9 @@ elements['submit-task-button'].addEventListener('click', () => runTaskAction(win
 elements['copy-prompt-button'].addEventListener('click', () => runTaskAction(window.patchwork.copyPrompt, 'Instructions copied.'));
 elements['reveal-package-button'].addEventListener('click', () => runTaskAction(window.patchwork.revealPackage));
 elements['import-result-button'].addEventListener('click', () => runTaskAction(window.patchwork.importResult));
+elements['delete-task-button'].addEventListener('click', () => {
+  if (state.activeTask) deleteTask(state.activeTask.taskId);
+});
 elements['apply-button'].addEventListener('click', () => runTaskAction(window.patchwork.applyTask, 'Changes applied.'));
 elements['resolve-conflict-button'].addEventListener('click', async () => {
   if (!state.activeTask) return;
@@ -1093,6 +1142,17 @@ window.patchwork.onTaskEvent((event) => {
   }
   if (event.task && (!state.activeTask || state.activeTask.taskId === event.task.taskId)) showTask(event.task);
   if (event.message) addActivity(event.message);
+  if (event.type === 'task-deleted') {
+    state.tasks = state.tasks.filter((task) => task.taskId !== event.taskId);
+    if (state.activeTask?.taskId === event.taskId) {
+      state.activeTask = null;
+      showTaskHistory();
+    } else {
+      renderTaskList();
+      if (!elements['history-view'].classList.contains('hidden')) renderTaskHistory();
+    }
+    return;
+  }
   if (event.type === 'task-failed') showToast(event.message || 'Task failed.', true);
   if (event.type === 'task-applied') {
     showToast('ChatGPT changes were validated and committed to the coding tree.');
@@ -1137,6 +1197,7 @@ async function initialize() {
     state.trees = trees;
     state.workspaceRepositories = repositories;
     state.repositories = repositories.filter((repository) => !repository.unavailable).slice(0, 1);
+    restoreTaskModelSelection();
     renderTaskList();
     renderRepositories();
     renderTrees();

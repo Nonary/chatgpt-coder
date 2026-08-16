@@ -940,6 +940,27 @@ test('task packages contain instructions and Git bundles in one ZIP', async (con
   assert.equal(task.resultFilename, `chatgpt-ide-result-${task.taskId}.txt`);
 });
 
+test('task deletion removes history and task files', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-delete-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const dataRoot = path.join(root, 'data');
+  const tasks = new TaskService(dataRoot);
+  await tasks.initialize();
+  await tasks.saveTask({
+    taskId: 'stuck-task',
+    taskText: 'Stuck task',
+    state: 'submitted',
+    createdAt: '2026-08-16T12:00:00.000Z',
+    repositories: [],
+  });
+  await fs.writeFile(path.join(tasks.taskDirectory('stuck-task'), 'chatgpt-ide-task-stuck-task.zip'), 'package');
+
+  const deleted = await tasks.deleteTask('stuck-task');
+  assert.equal(deleted.taskId, 'stuck-task');
+  assert.deepEqual(await tasks.listTasks(), []);
+  await assert.rejects(fs.access(tasks.taskDirectory('stuck-task')));
+});
+
 test('task history persists across service instances and lists newest tasks first', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-history-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
