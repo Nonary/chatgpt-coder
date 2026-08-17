@@ -234,6 +234,44 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
 });
 
+test('tasks can package multiple repositories into one ZIP', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-task-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(root);
+  const secondRepositoryPath = path.join(root, 'second-repository');
+  await fs.mkdir(secondRepositoryPath, { recursive: true });
+  await runGit(secondRepositoryPath, ['init', '-b', 'main']);
+  await runGit(secondRepositoryPath, ['config', 'user.email', 'patchwork@example.invalid']);
+  await runGit(secondRepositoryPath, ['config', 'user.name', 'Patchwork Test']);
+  await fs.writeFile(path.join(secondRepositoryPath, 'other.txt'), 'other repository\n');
+  await runGit(secondRepositoryPath, ['add', 'other.txt']);
+  await runGit(secondRepositoryPath, ['commit', '-m', 'Initial commit']);
+
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repositories = await tasks.inspectRepositories([firstRepositoryPath, secondRepositoryPath]);
+  assert.equal(repositories.length, 2);
+
+  const task = await tasks.createTask({
+    taskText: 'Coordinate the change across both repositories.',
+    repositories,
+  });
+
+  assert.equal(task.repositories.length, 2);
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.deepEqual(
+    manifest.repositories.map((repository) => repository.bundleFile),
+    repositories.map((repository) => `repositories/${repository.id}.bundle`),
+  );
+  for (const repository of repositories) {
+    const entry = archive.getEntry(`repositories/${repository.id}.bundle`);
+    assert.ok(entry);
+    const stored = await fs.readFile(path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`));
+    assert.deepEqual(entry.getData(), stored);
+  }
+});
+
 test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-attachments-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

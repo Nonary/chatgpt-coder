@@ -114,8 +114,8 @@ async function attachChatGPTView() {
 function registerIpc() {
   ipcMain.handle('repositories:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
-      title: 'Choose a Git repository',
-      properties: ['openDirectory'],
+      title: 'Choose Git repositories',
+      properties: ['openDirectory', 'multiSelections'],
     });
     if (response.canceled) return [];
     return gitService.addRepositories(response.filePaths);
