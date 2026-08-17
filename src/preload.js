@@ -1,8 +1,23 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('patchwork', {
+  setAppearanceTheme: (theme) => ipcRenderer.invoke('appearance:set-theme', theme),
   chooseRepositories: () => ipcRenderer.invoke('repositories:choose'),
   chooseAttachments: () => ipcRenderer.invoke('attachments:choose'),
+  listChatConversations: () => ipcRenderer.invoke('chat:list'),
+  getChatConversation: (conversationId) => ipcRenderer.invoke('chat:get', conversationId),
+  sendChatMessage: (conversationIdOrRequest, message, model, reasoningMode) => (
+    ipcRenderer.invoke('chat:send', conversationIdOrRequest, message, model, reasoningMode)
+  ),
+  stopChatResponse: () => ipcRenderer.invoke('chat:stop'),
+  openChatInSession: (conversationId) => ipcRenderer.invoke('chat:open-in-session', conversationId),
+  openSession: (conversationId) => ipcRenderer.invoke('session:open', conversationId),
+  closeSession: () => ipcRenderer.invoke('session:close'),
+  getSessionStatus: () => ipcRenderer.invoke('session:status'),
+  reloadSession: () => ipcRenderer.invoke('session:reload'),
+  newSessionChat: () => ipcRenderer.invoke('session:new-chat'),
+  sessionBack: () => ipcRenderer.invoke('session:back'),
+  sessionForward: () => ipcRenderer.invoke('session:forward'),
   listChatGPTProjects: () => ipcRenderer.invoke('projects:list'),
   createChatGPTProject: (name) => ipcRenderer.invoke('projects:create', name),
   listSkills: (repositoryPaths) => ipcRenderer.invoke('skills:list', repositoryPaths),
@@ -37,12 +52,6 @@ contextBridge.exposeInMainWorld('patchwork', {
   retryApplyTask: (taskId) => ipcRenderer.invoke('task:retry-apply', taskId),
   rollbackTask: (taskId) => ipcRenderer.invoke('task:rollback', taskId),
   revealPath: (targetPath) => ipcRenderer.invoke('path:reveal', targetPath),
-  setBrowserBounds: (bounds) => ipcRenderer.invoke('browser:set-bounds', bounds),
-  setBrowserVisible: (visible) => ipcRenderer.invoke('browser:set-visible', visible),
-  newChat: () => ipcRenderer.invoke('browser:new-chat'),
-  reloadBrowser: () => ipcRenderer.invoke('browser:reload'),
-  browserBack: () => ipcRenderer.invoke('browser:back'),
-  browserForward: () => ipcRenderer.invoke('browser:forward'),
   onTaskEvent: (listener) => {
     const handler = (_event, payload) => listener(payload);
     ipcRenderer.on('task:event', handler);

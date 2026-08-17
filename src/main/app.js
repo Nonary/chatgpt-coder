@@ -1,6 +1,6 @@
 const path = require('node:path');
 const fs = require('node:fs/promises');
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } = require('electron');
 const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
 const { ResultService } = require('./result-service');
@@ -12,7 +12,10 @@ const HEADLESS = process.env.PATCHWORK_HEADLESS === '1';
 if (process.env.PATCHWORK_DEBUG_PORT) {
   app.commandLine.appendSwitch('remote-debugging-port', process.env.PATCHWORK_DEBUG_PORT);
 }
-if (process.env.PATCHWORK_USER_DATA) app.setPath('userData', process.env.PATCHWORK_USER_DATA);
+const stableUserDataPath = process.env.PATCHWORK_USER_DATA
+  || path.join(app.getPath('appData'), 'chatgpt-coding-ide');
+app.setPath('userData', stableUserDataPath);
+const hasSingleInstanceLock = HEADLESS || app.requestSingleInstanceLock();
 
 let mainWindow;
 let taskService;
@@ -21,9 +24,53 @@ let resultService;
 let skillService;
 let worktreeService;
 let chatGPTView;
+const chosenAttachmentPaths = new Map();
+const MAX_REMEMBERED_ATTACHMENTS = 256;
 
 function emit(payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('task:event', payload);
+}
+
+function assertMainWindowRenderer(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event?.sender !== mainWindow.webContents) {
+    throw new Error('This Patchwork operation can only be called by the local app window.');
+  }
+}
+
+function rememberChosenAttachments(attachments) {
+  for (const attachment of attachments) {
+    chosenAttachmentPaths.set(attachment.path, {
+      name: attachment.name,
+      chosenAt: Date.now(),
+    });
+  }
+  while (chosenAttachmentPaths.size > MAX_REMEMBERED_ATTACHMENTS) {
+    chosenAttachmentPaths.delete(chosenAttachmentPaths.keys().next().value);
+  }
+}
+
+async function validateChatAttachments(attachments) {
+  if (attachments == null) return [];
+  if (!Array.isArray(attachments)) throw new Error('Chat attachments must be an array.');
+  const validated = [];
+  for (const attachment of attachments) {
+    const requestedPath = typeof attachment === 'string' ? attachment : attachment?.path;
+    if (!requestedPath || typeof requestedPath !== 'string') {
+      throw new Error('Choose a valid ChatGPT attachment.');
+    }
+    const resolvedPath = await fs.realpath(requestedPath).catch(() => null);
+    const chosen = resolvedPath ? chosenAttachmentPaths.get(resolvedPath) : null;
+    if (!chosen) {
+      throw new Error('Choose ChatGPT attachments with the file chooser before sending them.');
+    }
+    const stat = await fs.stat(resolvedPath).catch(() => null);
+    if (!stat?.isFile()) throw new Error(`Chat attachment is not a file: ${requestedPath}`);
+    validated.push({
+      path: resolvedPath,
+      name: String(attachment?.name || chosen.name || path.basename(resolvedPath)),
+    });
+  }
+  return validated;
 }
 
 function publicTask(task) {
@@ -43,6 +90,43 @@ function buildConflictResolutionTaskText(task, conflict, additionalInstructions 
   const base = `Resolve the failed Patchwork result application described below. Inspect the current coding tree, including any conflict markers, and the original result patch in CONFLICTS.md. Preserve the intended changes from both the original task and the returned result, then complete the work and verify the final diff.\n\nOriginal task:\n${task.taskText}\n\nApply failure:\n${conflict.error || task.error || 'The result could not be applied cleanly.'}`;
   const extra = String(additionalInstructions || '').replaceAll('\r\n', '\n').trim().slice(0, 12_000);
   return extra ? `${base}\n\nAdditional instructions from the user:\n${extra}` : base;
+}
+
+function integratedTitlebarOptions() {
+  // Keep headless/test windows on Electron's default chrome. In interactive
+  // windows the overlay preserves native traffic-light/window controls while
+  // allowing the local renderer's top bar to occupy the titlebar region.
+  if (HEADLESS) return {};
+  if (process.platform === 'darwin') {
+    return {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: { x: 14, y: 14 },
+    };
+  }
+  const dark = nativeTheme.shouldUseDarkColors;
+  return {
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: dark ? '#171717' : '#f7f7f8',
+      symbolColor: dark ? '#f4f4f4' : '#202123',
+      height: 40,
+    },
+  };
+}
+
+function updateNativeAppearance(theme) {
+  const source = ['system', 'light', 'dark'].includes(theme) ? theme : 'system';
+  nativeTheme.themeSource = source;
+  if (process.platform !== 'darwin' && mainWindow && !mainWindow.isDestroyed()
+    && typeof mainWindow.setTitleBarOverlay === 'function') {
+    const dark = nativeTheme.shouldUseDarkColors;
+    mainWindow.setTitleBarOverlay({
+      color: dark ? '#171717' : '#f7f7f8',
+      symbolColor: dark ? '#f4f4f4' : '#202123',
+      height: 40,
+    });
+  }
+  return source;
 }
 
 async function retryTaskApplication(task) {
@@ -71,10 +155,11 @@ function createMainWindow() {
     show: false,
     width: 1320,
     height: 900,
-    minWidth: 960,
-    minHeight: 680,
+    minWidth: 800,
+    minHeight: 600,
     title: 'ChatGPT - Coder',
     backgroundColor: '#111310',
+    ...integratedTitlebarOptions(),
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload.js'),
       nodeIntegration: false,
@@ -89,7 +174,7 @@ function createMainWindow() {
 }
 
 async function loadMainWindow() {
-  await mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  await mainWindow.loadFile(path.join(__dirname, '..', 'renderer-dist', 'index.html'));
   if (!HEADLESS) mainWindow.show();
 }
 
@@ -109,6 +194,10 @@ async function attachChatGPTView() {
 }
 
 function registerIpc() {
+  ipcMain.handle('appearance:set-theme', async (event, theme) => {
+    assertMainWindowRenderer(event);
+    return updateNativeAppearance(theme);
+  });
   ipcMain.handle('repositories:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
       title: 'Choose a Git repository',
@@ -118,6 +207,53 @@ function registerIpc() {
     return gitService.addRepositories(response.filePaths);
   });
 
+  ipcMain.handle('chat:list', async () => chatGPTView.listChatConversations());
+  ipcMain.handle('chat:get', async (_event, conversationId) => chatGPTView.getChatConversation(conversationId));
+  ipcMain.handle('chat:send', async (event, conversationId, message, model, reasoningMode) => {
+    assertMainWindowRenderer(event);
+    if (conversationId && typeof conversationId === 'object' && !Array.isArray(conversationId)) {
+      const request = { ...conversationId };
+      request.attachments = await validateChatAttachments(request.attachments);
+      return chatGPTView.sendChatMessage(request);
+    }
+    return chatGPTView.sendChatMessage(conversationId, message, model, reasoningMode);
+  });
+  ipcMain.handle('chat:stop', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.stopChatResponse();
+  });
+  ipcMain.handle('chat:open-in-session', async (event, conversationId) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.openChatInSession(conversationId);
+  });
+  ipcMain.handle('session:open', async (event, conversationId = null) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.openChatInSession(conversationId);
+  });
+  ipcMain.handle('session:close', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.closeChatInSession();
+  });
+  ipcMain.handle('session:status', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.sessionStatus();
+  });
+  ipcMain.handle('session:reload', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.reloadChatSession();
+  });
+  ipcMain.handle('session:new-chat', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.openChatInSession();
+  });
+  ipcMain.handle('session:back', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.goBackInChatSession();
+  });
+  ipcMain.handle('session:forward', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.goForwardInChatSession();
+  });
   ipcMain.handle('projects:list', async () => chatGPTView.listProjects());
   ipcMain.handle('projects:create', async (_event, name) => chatGPTView.createProject(name));
   ipcMain.handle('skills:list', async (_event, repositoryPaths) => {
@@ -131,10 +267,16 @@ function registerIpc() {
       properties: ['openFile', 'multiSelections'],
     });
     if (response.canceled) return [];
-    return response.filePaths.map((filePath) => ({
+    const attachments = response.filePaths.map((filePath) => ({
       name: path.basename(filePath),
       path: filePath,
     }));
+    const resolved = await Promise.all(attachments.map(async (attachment) => ({
+      ...attachment,
+      path: await fs.realpath(attachment.path),
+    })));
+    rememberChosenAttachments(resolved);
+    return resolved;
   });
 
   ipcMain.handle('workspace:list', async () => gitService.listRepositories());
@@ -499,12 +641,6 @@ function registerIpc() {
     const task = await taskService.getTask(taskId);
     return publicTask(await chatGPTView.importResult(task));
   });
-  ipcMain.handle('browser:set-bounds', async (_event, bounds) => chatGPTView.setBounds(bounds));
-  ipcMain.handle('browser:set-visible', async (_event, visible) => chatGPTView.setVisible(visible));
-  ipcMain.handle('browser:new-chat', async () => chatGPTView.newChat());
-  ipcMain.handle('browser:reload', async () => chatGPTView.reload());
-  ipcMain.handle('browser:back', async () => chatGPTView.goBack());
-  ipcMain.handle('browser:forward', async () => chatGPTView.goForward());
   ipcMain.handle('task:apply', async (_event, taskId) => publicTask(await resultService.apply(taskId)));
   ipcMain.handle('task:rollback', async (_event, taskId) => publicTask(await resultService.rollback(taskId)));
   ipcMain.handle('path:reveal', async (_event, targetPath) => {
@@ -513,7 +649,17 @@ function registerIpc() {
   });
 }
 
-app.whenReady().then(async () => {
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  app.whenReady().then(async () => {
   const dataRoot = path.join(app.getPath('userData'), 'patchwork');
   skillService = new SkillService();
   taskService = new TaskService(dataRoot, skillService);
@@ -559,7 +705,8 @@ app.whenReady().then(async () => {
         .catch((error) => emit({ type: 'task-failed', message: error.message }));
     }
   });
-});
+  });
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

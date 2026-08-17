@@ -3,5 +3,6 @@ node_modules/
 dist/
 dist-*/
 release/
+src/renderer-dist/
 *.log
 .DS_Store

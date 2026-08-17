@@ -11,8 +11,71 @@ const {
 const { SkillService } = require('./skill-service');
 
 const SCHEMA_VERSION = 1;
+const TASK_SUBMISSION_SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
 const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high']);
+
+const TASK_SUBMISSION_FIELDS = [
+  'submittedAt',
+  'conversationUrl',
+  'conversationId',
+  'conversationTitle',
+  'chatStatus',
+  'chatStatusRaw',
+  'chatFinishedAt',
+];
+
+async function atomicWriteFile(targetPath, contents) {
+  const directory = path.dirname(targetPath);
+  const filename = path.basename(targetPath);
+  const temporaryPath = path.join(
+    directory,
+    `.${filename}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  );
+  let handle = null;
+  try {
+    handle = await fs.open(temporaryPath, 'w');
+    await handle.writeFile(contents);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(temporaryPath, targetPath);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function normalizeNullableString(value) {
+  if (value == null) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
+function normalizeSubmissionMetadata(task = {}, metadata = task.submission) {
+  const nested = metadata && typeof metadata === 'object' ? metadata : {};
+  const valueFor = (field) => Object.prototype.hasOwnProperty.call(nested, field)
+    ? nested[field]
+    : task[field];
+  return {
+    schemaVersion: TASK_SUBMISSION_SCHEMA_VERSION,
+    submittedAt: normalizeNullableString(valueFor('submittedAt')),
+    conversationUrl: normalizeNullableString(valueFor('conversationUrl')),
+    conversationId: normalizeNullableString(valueFor('conversationId')),
+    conversationTitle: normalizeNullableString(valueFor('conversationTitle')),
+    chatStatus: normalizeNullableString(valueFor('chatStatus')),
+    chatStatusRaw: normalizeNullableString(valueFor('chatStatusRaw')),
+    chatFinishedAt: normalizeNullableString(valueFor('chatFinishedAt')),
+  };
+}
+
+function normalizeTaskRecord(task = {}) {
+  const submission = normalizeSubmissionMetadata(task);
+  const normalized = { ...task, submission };
+  for (const field of TASK_SUBMISSION_FIELDS) normalized[field] = submission[field];
+  return normalized;
+}
 
 const DEFAULT_GIT_SUMMARY_PROMPT = `# Git Changes Review + Conventional Commit Prompt
 
@@ -258,6 +321,7 @@ class TaskService {
     const taskDir = this.taskDirectory(taskId);
     const bundlesDir = path.join(taskDir, 'repositories');
     await fs.mkdir(bundlesDir, { recursive: true });
+    try {
 
     const attachments = [];
     const requestedAttachments = Array.isArray(input.attachments) ? input.attachments : [];
@@ -456,26 +520,50 @@ class TaskService {
       state: 'prepared',
       result: null,
     };
-    await this.saveTask(record);
-    return record;
+      return this.saveTask(record);
+    } catch (error) {
+      await fs.rm(taskDir, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   async saveTask(task) {
     const taskDir = this.taskDirectory(task.taskId);
     await fs.mkdir(taskDir, { recursive: true });
-    await fs.writeFile(path.join(taskDir, 'task.json'), `${JSON.stringify(task, null, 2)}\n`);
+    const normalized = normalizeTaskRecord(task);
+    await atomicWriteFile(
+      path.join(taskDir, 'task.json'),
+      `${JSON.stringify(normalized, null, 2)}\n`,
+    );
+    return normalized;
   }
 
   async getTask(taskId) {
-    const raw = await fs.readFile(path.join(this.taskDirectory(taskId), 'task.json'), 'utf8');
-    return JSON.parse(raw);
+    const taskPath = path.join(this.taskDirectory(taskId), 'task.json');
+    const raw = await fs.readFile(taskPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeTaskRecord(parsed);
+    if (JSON.stringify(parsed) !== JSON.stringify(normalized)) await this.saveTask(normalized);
+    return normalized;
   }
 
   async updateTask(taskId, update) {
     const task = await this.getTask(taskId);
-    const next = { ...task, ...update, updatedAt: new Date().toISOString() };
-    await this.saveTask(next);
-    return next;
+    const incoming = update && typeof update === 'object' ? update : {};
+    const nestedSubmission = {
+      ...(task.submission || {}),
+      ...(incoming.submission && typeof incoming.submission === 'object' ? incoming.submission : {}),
+    };
+    for (const field of TASK_SUBMISSION_FIELDS) {
+      if (Object.prototype.hasOwnProperty.call(incoming, field)) nestedSubmission[field] = incoming[field];
+    }
+    const next = normalizeTaskRecord({
+      ...task,
+      ...incoming,
+      submission: nestedSubmission,
+      updatedAt: new Date().toISOString(),
+    });
+    return this.saveTask(next);
   }
 
   async setTarget(taskId, target = {}) {
@@ -534,9 +622,12 @@ class TaskService {
 
 module.exports = {
   SCHEMA_VERSION,
+  TASK_SUBMISSION_SCHEMA_VERSION,
   TaskService,
   buildAgentInstructions,
   buildHandoffPrompt,
   DEFAULT_GIT_SUMMARY_PROMPT,
+  normalizeSubmissionMetadata,
+  normalizeTaskRecord,
   resolveGitSummaryPrompt,
 };

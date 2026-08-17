@@ -15,10 +15,15 @@ const {
   buildPackageAttachmentStatusScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
+  conversationStreamStatusUrl,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  isRetryableChatStatus,
+  chatMessageText,
+  normalizeChatConversation,
+  normalizeChatConversationId,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,
@@ -58,6 +63,193 @@ async function ingestDownloadedText(results, tasks, task, text) {
   await fs.writeFile(downloadedPath, text);
   return results.ingestTextFile(task.taskId, downloadedPath);
 }
+
+test('native Chat normalizes the active ChatGPT conversation branch safely', () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const conversation = normalizeChatConversation({
+    id: conversationId,
+    title: '  Native   chat  ',
+    gizmo_id: 'g-p-project_123',
+    create_time: '2026-08-16T20:00:00Z',
+    update_time: '2026-08-16T20:01:00Z',
+    current_node: 'assistant-1',
+    mapping: {
+      root: { id: 'root', parent: null, message: { id: 'system', author: { role: 'system' }, content: { parts: ['hidden'] } } },
+      'user-1': {
+        id: 'user-1',
+        parent: 'root',
+        message: {
+          id: 'user-message',
+          author: { role: 'user' },
+          content: { parts: ['Hello'] },
+          create_time: 1,
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      },
+      'analysis-1': {
+        id: 'analysis-1',
+        parent: 'user-1',
+        message: {
+          id: 'analysis-message',
+          author: { role: 'assistant' },
+          channel: 'analysis',
+          content: { content_type: 'text', parts: ['Internal reasoning'] },
+          create_time: 1.5,
+        },
+      },
+      'reasoning-1': {
+        id: 'reasoning-1',
+        parent: 'analysis-1',
+        message: {
+          id: 'reasoning-message',
+          author: { role: 'assistant' },
+          content: { content_type: 'reasoning_recap', parts: ['Checked the visible context'] },
+          create_time: 1.75,
+        },
+      },
+      'assistant-1': {
+        id: 'assistant-1',
+        parent: 'reasoning-1',
+        message: {
+          id: 'assistant-message',
+          author: { role: 'assistant' },
+          content: { parts: ['Hi', { text: 'from ChatGPT' }] },
+          create_time: 2,
+          status: 'finished_successfully',
+          end_turn: true,
+        },
+      },
+      orphan: {
+        id: 'orphan',
+        parent: 'user-1',
+        message: {
+          id: 'orphan-message',
+          author: { role: 'assistant' },
+          content: { parts: ['Old branch'] },
+          create_time: 3,
+        },
+      },
+    },
+  });
+
+  assert.equal(normalizeChatConversationId(conversationId), conversationId);
+  assert.equal(normalizeChatConversationId('../bad'), null);
+  assert.equal(conversation.title, 'Native chat');
+  assert.equal(conversation.status, 'completed');
+  assert.equal(conversation.url, `https://chatgpt.com/g/g-p-project_123/c/${conversationId}`);
+  assert.deepEqual(conversation.messages.map((message) => [message.role, message.kind, message.text]), [
+    ['user', 'message', 'Hello'],
+    ['assistant', 'reasoning', 'Checked the visible context'],
+    ['assistant', 'message', 'Hi\nfrom ChatGPT'],
+  ]);
+  assert.equal(chatMessageText({ content: { parts: [{ content: 'Text object' }] } }), 'Text object');
+  assert.equal(chatMessageText({ content: { content_type: 'reasoning_recap', parts: ['Visible recap'] } }), 'Visible recap');
+  assert.equal(normalizeChatConversation({ ...conversation, mapping: {} }, 'IS_STREAMING').status, 'streaming');
+});
+
+test('native Chat is wired through the authenticated ChatGPT browser partition', async () => {
+  const mainSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  const chatViewSource = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8');
+  const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+
+  assert.match(mainSource, /ipcMain\.handle\('chat:list'/);
+  assert.match(mainSource, /ipcMain\.handle\('chat:get'/);
+  assert.match(mainSource, /ipcMain\.handle\('chat:send'/);
+  assert.match(mainSource, /ipcMain\.handle\('chat:open-in-session'/);
+  assert.match(preload, /listChatConversations:[\s\S]*getChatConversation:[\s\S]*sendChatMessage:[\s\S]*stopChatResponse:[\s\S]*openChatInSession:/);
+  assert.match(renderer, /function ChatWorkspace\(/);
+  assert.match(renderer, /className="chat-workspace"/);
+  assert.match(renderer, /className="chat-list"/);
+  assert.match(renderer, /className="chat-composer"/);
+  assert.match(renderer, /placeholder="Message ChatGPT"/);
+  assert.match(renderer, /sendChatMessage'.*conversationId: previous\?\.id/);
+  assert.match(renderer, /attachments: chatAttachments/);
+  assert.match(renderer, /reasoningMode,/);
+  assert.match(renderer, /<option value="sol">GPT-5\.6 Sol/);
+  assert.match(renderer, /<option value="luna">GPT-5\.6 Luna/);
+  assert.match(renderer, /className="model-thinking-picker"/);
+  assert.match(renderer, /aria-label="Model and thinking settings"/);
+  assert.match(renderer, /model-thinking-menu-label">Thinking/);
+  assert.match(renderer, /\['default', 'Model default'\], \['instant', 'Instant'\], \['low', 'Low'\], \['medium', 'Medium'\], \['high', 'High'\], \['extra-high', 'Extra High'\]/);
+  assert.doesNotMatch(renderer, /<span>Engine<\/span>|<span>Focus<\/span>/);
+  assert.match(renderer, /bridge\.onTaskEvent/);
+  assert.match(renderer, /window\.setInterval\(poll, 1800\)/);
+  assert.match(renderer, /Reasoning summary/);
+  assert.match(mainSource, /ipcMain\.handle\('chat:stop'/);
+  assert.match(chatViewSource, /async stopChatResponse\(\)/);
+
+  assert.match(mainSource, /ipcMain\.handle\('session:open'/);
+  assert.match(mainSource, /ipcMain\.handle\('session:status'/);
+  assert.match(preload, /openSession:[\s\S]*getSessionStatus:/);
+  assert.match(chatViewSource, /this\.chatView = new BrowserWindow\(transportWindowOptions/);
+  assert.match(chatViewSource, /this\.view = new BrowserWindow\(transportWindowOptions/);
+  assert.doesNotMatch(chatViewSource, /contentView\.addChildView/);
+  assert.match(chatViewSource, /this\.chatSessionWindow = new BrowserWindow/);
+  assert.match(chatViewSource, /function transportWindowOptions\(backgroundThrottling = false\)/);
+  assert.match(chatViewSource, /partition: PARTITION/);
+  assert.match(chatViewSource, /\/backend-api\/conversations/);
+  assert.match(chatViewSource, /\/backend-api\/pins/);
+  assert.match(chatViewSource, /\/backend-api\/conversation\//);
+  assert.match(chatViewSource, /\/stream_status/);
+  assert.match(chatViewSource, /getRenderedChatConversation[\s\S]*data-message-author-role/);
+  assert.match(chatViewSource, /isRetryableChatStatus\(result\?\.status\)[\s\S]*getRenderedChatConversation\(id\)/);
+  assert.match(chatViewSource, /waitForChatComposer[\s\S]*injectChatPrompt[\s\S]*clickChatSend[\s\S]*waitForChatPromptAcceptance/);
+  assert.match(chatViewSource, /CHAT_API_RETRY_ATTEMPTS = 4/);
+  assert.match(chatViewSource, /beginChatRequestEnforcement[\s\S]*Fetch.enable[\s\S]*requestStage: 'Response'/);
+  assert.match(chatViewSource, /status === 429/);
+  assert.match(chatViewSource, /retryAfterMilliseconds/);
+  assert.match(chatViewSource, /details\?\.webContentsId !== this\.view\.webContents\.id/);
+});
+
+test('every renderer element reference is registered and present in the markup', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  const styles = await fs.readFile(path.join(__dirname, '../src/renderer/styles.css'), 'utf8');
+
+  // React owns element references through JSX rather than an ID registry and
+  // innerHTML/template markup. Check that each primary workspace has a real
+  // component and matching style surface.
+  assert.doesNotMatch(renderer, /const elements = Object\.fromEntries/);
+  assert.doesNotMatch(renderer, /innerHTML/);
+  assert.match(renderer, /createRoot\(document\.getElementById\('root'\)!\)\.render/);
+  for (const component of [
+    'Home', 'ChatWorkspace', 'TaskDetail', 'SourceControl', 'Trees', 'History',
+    'PromptDialog', 'SkillsDialog', 'ConflictDialog',
+  ]) {
+    assert.match(renderer, new RegExp(`function ${component}\\(`));
+  }
+  for (const className of [
+    'composer-card', 'chat-workspace', 'task-grid', 'source-grid',
+    'tree-grid', 'history-list', 'modal',
+  ]) {
+    assert.match(renderer, new RegExp(`className[^\\n]*${className}`));
+    assert.match(styles, new RegExp(`\\.${className}(?:[,\\s{])`));
+  }
+});
+
+test('successful Chat replies do not surface background history refresh failures', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  const sendFlow = renderer.slice(
+    renderer.indexOf('const sendChat = async'),
+    renderer.indexOf('const openChat = async'),
+  );
+  assert.match(renderer, /refreshConversationList = useCallback\(async \(showError = true\)/);
+  assert.match(renderer, /if \(showError\) notify\(message, true\)/);
+  assert.match(renderer, /refreshConversationList\(false\)/);
+  assert.doesNotMatch(sendFlow, /refreshConversationList\(/);
+  assert.doesNotMatch(sendFlow, /getChatConversation/);
+  assert.match(sendFlow, /status: 'streaming'/);
+});
+
+test('Chat reloads persistent conversation metadata quietly at startup', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  assert.match(renderer, /call<Conversation\[]>\('listChatConversations'\)/);
+  assert.match(renderer, /call<Chat>\('getChatConversation', id\)/);
+  assert.match(renderer, /refreshConversationList\(false\)/);
+  assert.match(renderer, /const \[conversations, setConversations\] = useState<Conversation\[]>\(readCachedConversations\)/);
+  assert.match(renderer, /persistConversations\(items \|\| \[\]\)/);
+});
 
 test('Git Summary prompts use the saved prompt when present and the built-in prompt otherwise', () => {
   assert.equal(resolveGitSummaryPrompt('  Review these changes.  '), 'Review these changes.');
@@ -130,8 +322,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
 
 test('Source Control summaries run as persistent Luna Medium tasks with an explicit handoff', async () => {
   const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
-  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
   const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
   const summaryHandler = appSource.slice(
     appSource.indexOf("ipcMain.handle('git:summary'"),
@@ -144,13 +335,12 @@ test('Source Control summaries run as persistent Luna Medium tasks with an expli
   assert.match(summaryHandler, /type: 'git-summary-ready',[\s\S]*task: publicTask\(completed\)/);
   assert.match(summaryHandler, /ipcMain\.handle\('task:use-git-summary'/);
   assert.doesNotMatch(summaryHandler, /deleteTask\(task\.taskId\)/);
-  assert.doesNotMatch(renderer, /const hiddenTask = Boolean\(event\.task\?\.summaryOnly\)/);
-  assert.match(renderer, /task\.summaryOnly \|\| task\.state !== 'ready'/);
-  assert.match(renderer, /Generating Git Summary/);
-  assert.match(renderer, /useActiveGitSummary/);
-  assert.match(renderer, /source-commit-message'\]\.value = completed\.result\.commitMessage/);
-  assert.doesNotMatch(renderer, /source-commit-message'\]\.value = result\.commitMessage/);
-  assert.match(markup, /id="use-git-summary-button"[^>]*>Use in Source Control<\/button>/);
+  assert.match(renderer, /function SourceControl\(/);
+  assert.match(renderer, /AI summary/);
+  assert.match(renderer, /call<AnyRecord>\('gitSummary', selected, null\)/);
+  assert.match(renderer, /setMessage\(result\.commitMessage \|\| ''\)/);
+  assert.doesNotMatch(renderer, /Generating Git Summary/);
+  assert.match(renderer, /Commit staged changes/);
   assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
 });
 
@@ -1372,21 +1562,24 @@ test('task deletion removes history and task files', async (context) => {
 });
 
 test('resolved task status is presented separately from applied work', async () => {
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
-  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
-  assert.match(renderer, /resolved: 'Resolved'/);
-  assert.match(renderer, /resolved: \['Conflict resolved'/);
-  assert.match(markup, /<option value="resolved">Resolved<\/option>/);
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  assert.match(renderer, /const statusLabel = \(task: AnyRecord\)/);
+  assert.match(renderer, /applied: 'Applied'/);
+  assert.match(renderer, /completed: 'Completed'/);
+  assert.match(renderer, /status-badge \$\{task\.state\}/);
+  // Unknown persisted states, including `resolved`, remain distinct from
+  // `applied`/`completed` through the fallback label and state class.
+  assert.match(renderer, /text\(task\.state, 'Prepared'\)/);
+  assert.doesNotMatch(renderer, /resolved:\s*'Applied'/);
 });
 
 test('conflicted results expose a separate retry action and ChatGPT resolution action', async () => {
   const service = await fs.readFile(path.join(__dirname, '../src/main/result-service.js'), 'utf8');
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
   assert.match(service, /\['ready', 'failed', 'conflicted'\]\.includes\(task\.state\)/);
-  assert.match(renderer, /elements\['apply-button'\]\.classList\.toggle\('hidden', task\.summaryOnly \|\| task\.state !== 'ready'\)/);
-  assert.match(renderer, /elements\['retry-apply-button'\]\.classList\.toggle\('hidden', task\.state !== 'conflicted'\)/);
-  assert.match(renderer, /retryApplyTask\(state\.activeTask\.taskId\)/);
-  assert.match(renderer, /elements\['resolve-conflict-button'\]\.classList\.toggle\('hidden', task\.state !== 'conflicted'\)/);
+  assert.match(renderer, /task\.state === 'ready' && !task\.summaryOnly/);
+  assert.match(renderer, /task\.state === 'conflicted'.*onAction\('retryApplyTask'\)/);
+  assert.match(renderer, /<Button onClick=\{onConflict\}>Resolve with ChatGPT<\/Button>/);
 });
 
 test('conflict retry refreshes the ChatGPT result before applying and before creating a resolution task', async () => {
@@ -1402,24 +1595,39 @@ test('conflict retry refreshes the ChatGPT result before applying and before cre
   assert.match(preload, /retryApplyTask: \(taskId\) => ipcRenderer\.invoke\('task:retry-apply', taskId\)/);
 });
 
-test('conflict resolution modal hides the native ChatGPT view and restores its bounds', async () => {
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
-  const openModal = renderer.slice(renderer.indexOf('function openConflictResolutionModal'), renderer.indexOf('function closeConflictResolutionModal'));
-  const closeModal = renderer.slice(renderer.indexOf('function closeConflictResolutionModal'), renderer.indexOf('async function submitConflictResolution'));
-  const submitModal = renderer.slice(renderer.indexOf('async function submitConflictResolution'), renderer.indexOf('function renderChatGPTProjects'));
-  assert.match(openModal, /window\.patchwork\.setBrowserVisible\(false\)/);
-  assert.match(closeModal, /window\.patchwork\.setBrowserVisible\(true\)/);
-  assert.match(closeModal, /requestAnimationFrame\(\(\) => requestAnimationFrame\(syncBrowserBounds\)\)/);
-  assert.match(submitModal, /catch \(error\) \{[\s\S]*closeConflictResolutionModal\(\);[\s\S]*showToast\(error\.message, true\)/);
+test('conflict resolution is an accessible native modal independent of ChatGPT transport', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  assert.match(renderer, /function ConflictDialog\(/);
+  assert.match(renderer, /role="dialog" aria-modal="true"/);
+  assert.match(renderer, /event\.key === 'Escape'/);
+  assert.match(renderer, /resolveTaskConflict'.*additionalInstructions/);
+  assert.doesNotMatch(renderer, /setBrowserBounds|setBrowserVisible|WebContentsView/);
+});
+
+test('separate ChatGPT session window can be closed without disrupting hidden transports', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  const mainSource = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8');
+  const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
+  assert.match(renderer, /onAction\('openChatInSession'\)/);
+  assert.doesNotMatch(renderer, /embeddedBrowser|setBrowserBounds|setBrowserVisible|WebContentsView/);
+  assert.match(mainSource, /this\.view = new BrowserWindow\(transportWindowOptions/);
+  assert.match(mainSource, /this\.chatView = new BrowserWindow\(transportWindowOptions/);
+  assert.match(mainSource, /async closeChatInSession\(\)/);
+  assert.match(mainSource, /this\.chatSessionWindow\.close\(\)/);
+  assert.match(preload, /openSession:/);
+  assert.match(preload, /closeSession:/);
+  assert.match(preload, /getSessionStatus:/);
 });
 
 test('conflict resolution preserves the original configuration by default and submits a reasoning override', async () => {
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
-  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
   const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
-  assert.match(markup, /id="conflict-resolution-reasoning-select"/);
-  assert.match(renderer, /conflict-resolution-reasoning-select/);
-  assert.match(renderer, /reasoningMode: elements\['conflict-resolution-reasoning-select'\]\.value/);
+  assert.match(renderer, /function ConflictDialog\(/);
+  assert.match(renderer, /Additional instructions/);
+  assert.match(renderer, /call\('resolveTaskConflict', activeTask\.taskId/);
+  assert.match(renderer, /model: activeTask\.model \|\| 'default'/);
+  assert.match(renderer, /reasoningMode: activeTask\.reasoningMode \|\| 'default'/);
+  assert.doesNotMatch(renderer, /conflict-resolution-reasoning-select/);
   assert.match(appSource, /Object\.prototype\.hasOwnProperty\.call\(resolutionOptions, 'reasoningMode'\)/);
   assert.match(appSource, /resolve-conflict[\s\S]*reasoningMode: Object\.prototype\.hasOwnProperty\.call\(resolutionOptions, 'reasoningMode'\)/);
 });
@@ -1452,16 +1660,17 @@ test('conflict resolution can recover a coding tree from the original task assoc
 
 test('task target and conflict fallback wiring is exposed through the task UI', async () => {
   const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
-  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
   const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
   assert.match(appSource, /ipcMain\.handle\('task:set-target'/);
   assert.match(appSource, /tree = await worktreeService\.inspect\(candidate\)/);
   assert.match(appSource, /task\.sourceRepositoryPath/);
-  assert.match(renderer, /\['prepared', 'submitted', 'ready', 'failed', 'conflicted'\]/);
-  assert.match(renderer, /setTaskTarget\(task\.taskId/);
-  assert.match(markup, /id="task-target-card"/);
-  assert.match(markup, /Use original repository/);
+  assert.match(renderer, /function Home\(/);
+  assert.match(renderer, /<label>Target<select/);
+  assert.match(renderer, /setCreateTree\(e\.target\.value === '__new__'\)/);
+  assert.match(renderer, /treeId: treeId \|\| null/);
+  assert.match(renderer, /createTree/);
+  assert.match(renderer, /treeName/);
   assert.match(preload, /setTaskTarget: \(taskId, input\)/);
 });
 
@@ -1635,16 +1844,24 @@ test('ChatGPT task submission only accepts real conversation URLs', () => {
 });
 
 test('task composer persists all sticky task selections in local storage', async () => {
-  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
   assert.match(renderer, /patchwork\.task-model/);
   assert.match(renderer, /patchwork\.task-reasoning/);
   assert.match(renderer, /patchwork\.task-tree/);
   assert.match(renderer, /patchwork\.task-project/);
-  assert.match(renderer, /restoreTaskReasoningSelection\(\)/);
-  assert.match(renderer, /persistTaskReasoningSelection\(event\)/);
-  assert.match(renderer, /restoreTaskProjectSelection\(\)/);
-  assert.match(renderer, /persistTaskProjectSelection\(event\)/);
-  assert.match(renderer, /persistTaskTreeSelectionValue\(button\.dataset\.treeId\)/);
+  assert.match(renderer, /localStorage\.getItem\('patchwork\.task-model'\)/);
+  assert.match(renderer, /localStorage\.setItem\('patchwork\.task-reasoning', reasoning\)/);
+  assert.match(renderer, /localStorage\.setItem\('patchwork\.task-project', projectId\)/);
+  assert.match(renderer, /localStorage\.setItem\('patchwork\.task-tree', treeId\)/);
+});
+
+test('app restarts use one stable settings directory and reject duplicate instances', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(appSource, /path\.join\(app\.getPath\('appData'\), 'chatgpt-coding-ide'\)/);
+  assert.match(appSource, /app\.setPath\('userData', stableUserDataPath\)/);
+  assert.match(appSource, /app\.requestSingleInstanceLock\(\)/);
+  assert.match(appSource, /app\.on\('second-instance'/);
+  assert.match(appSource, /if \(!hasSingleInstanceLock\) \{\s*app\.quit\(\)/);
 });
 
 test('task configuration installs an owned Luna picker outside React and suppresses native controls', () => {
@@ -1792,8 +2009,85 @@ test('task request enforcement observes and rewrites ChatGPT’s actual conversa
   assert.equal(attached, false);
 });
 
+test('native Chat retries transient conversation API responses before surfacing an error', async () => {
+  let calls = 0;
+  const view = {
+    chatView: {
+      webContents: {
+        executeJavaScript: async () => {
+          calls += 1;
+          return calls === 1
+            ? { ok: false, status: 429, retryAfterMilliseconds: 0 }
+            : { ok: true, items: [] };
+        },
+      },
+    },
+  };
+  const result = await ChatGPTView.prototype.executeChatApiWithRetry.call(view, 'ignored');
+  assert.deepEqual(result, { ok: true, items: [] });
+  assert.equal(calls, 2);
+  assert.equal(isRetryableChatStatus(429), true);
+  assert.equal(isRetryableChatStatus(503), true);
+  assert.equal(isRetryableChatStatus(400), false);
+});
+
+test('native Chat request enforcement rewrites the selected model and observes rate-limit responses', async () => {
+  const commands = [];
+  let attached = false;
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => attached;
+  debuggerApi.attach = () => { attached = true; };
+  debuggerApi.detach = () => { attached = false; };
+  debuggerApi.sendCommand = async (command, params) => {
+    commands.push({ command, params });
+    return {};
+  };
+  const view = {
+    chatView: {
+      webContents: {
+        debugger: debuggerApi,
+      },
+    },
+  };
+  const enforcement = await ChatGPTView.prototype.beginChatRequestEnforcement.call(view, 'luna');
+  debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
+    requestId: 'chat-request-1',
+    request: {
+      method: 'POST',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+      postData: JSON.stringify({ action: 'next', model: 'gpt-5-6' }),
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
+    requestId: 'chat-request-1',
+    responseStatusCode: 429,
+    responseHeaders: [{ name: 'Retry-After', value: '0' }],
+    request: {
+      method: 'POST',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+    },
+  });
+  const result = await enforcement.wait(500);
+  await enforcement.dispose();
+  const continued = commands.find((item) => item.command === 'Fetch.continueRequest');
+  const payload = JSON.parse(Buffer.from(continued.params.postData, 'base64').toString('utf8'));
+  assert.equal(result.rateLimited, true);
+  assert.equal(result.httpStatus, 429);
+  assert.equal(payload.model, 'gpt-5-6-t-mini');
+  assert.equal(commands.some((item) => item.command === 'Fetch.continueResponse'), true);
+  assert.equal(commands[0].command, 'Fetch.enable');
+  assert.equal(commands.at(-1).command, 'Fetch.disable');
+  assert.equal(attached, false);
+});
+
 test('ChatGPT stream status helpers follow the status endpoint captured in the HAR', () => {
   const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  assert.equal(
+    conversationStreamStatusUrl(conversationId),
+    `https://chatgpt.com/backend-api/conversation/${conversationId}/stream_status`,
+  );
+  assert.equal(conversationStreamStatusUrl('not-a-conversation-id'), null);
   assert.equal(
     conversationIdFromStreamStatusUrl(`https://chatgpt.com/backend-api/conversation/${conversationId}/stream_status`),
     conversationId,
@@ -1815,6 +2109,112 @@ test('ChatGPT stream status helpers follow the status endpoint captured in the H
   assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
   assert.match(buildConversationStatusScript(conversationId), /backend-api\/conversation.*stream_status/);
   assert.match(buildConversationStatusScript(conversationId), /cache: 'no-store'/);
+});
+
+test('ChatGPT stream status uses the persistent browser session for background polling', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  let request = null;
+  const view = {
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        session: {
+          fetch: async (url, options) => {
+            request = { url, options };
+            return {
+              ok: true,
+              status: 200,
+              text: async () => '{"status":"IS_STREAMING"}',
+            };
+          },
+        },
+        executeJavaScript: async () => {
+          throw new Error('page fallback should not be needed');
+        },
+      },
+    },
+  };
+
+  const result = await ChatGPTView.prototype.fetchConversationStatus.call(view, conversationId);
+  assert.deepEqual(result, { ok: true, httpStatus: 200, status: 'IS_STREAMING' });
+  assert.equal(request.url, `https://chatgpt.com/backend-api/conversation/${conversationId}/stream_status`);
+  assert.equal(request.options.method, 'GET');
+  assert.equal(request.options.credentials, 'include');
+  assert.equal(request.options.cache, 'no-store');
+});
+
+test('background ChatGPT status polling checks every submitted task instead of only the active one', async () => {
+  const activeTask = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    chatStatus: 'streaming',
+  };
+  const backgroundTask = {
+    taskId: '1f56d3a2-e53d-4e24-8a1b-a7b6941b75de',
+    state: 'submitted',
+    chatStatus: 'streaming',
+  };
+  const calls = [];
+  const view = {
+    activeTask,
+    knownTasks: new Map([
+      [activeTask.taskId, activeTask],
+      [backgroundTask.taskId, backgroundTask],
+    ]),
+    conversationStatusPollBusy: false,
+    checkConversationStatus: async (task) => {
+      calls.push(task.taskId);
+      return task.taskId;
+    },
+  };
+
+  const result = await ChatGPTView.prototype.pollConversationStatuses.call(view);
+  assert.deepEqual(calls, [activeTask.taskId, backgroundTask.taskId]);
+  assert.deepEqual(result, [activeTask.taskId, backgroundTask.taskId]);
+  assert.equal(view.conversationStatusPollBusy, false);
+});
+
+test('a non-active submitted task persists ChatGPT completion without replacing the active task', async () => {
+  const activeTask = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    conversationId: '6a80f4cf-1650-83ea-8609-adb411b3e4bc',
+    chatStatus: 'streaming',
+  };
+  const backgroundTask = {
+    taskId: '1f56d3a2-e53d-4e24-8a1b-a7b6941b75de',
+    state: 'submitted',
+    conversationId: '7b91f4cf-1650-83ea-8609-adb411b3e4bc',
+    chatStatus: 'streaming',
+    chatStatusRaw: 'IS_STREAMING',
+    chatFinishedAt: null,
+  };
+  const events = [];
+  let currentBackgroundTask = backgroundTask;
+  const view = {
+    activeTask,
+    knownTasks: new Map([
+      [activeTask.taskId, activeTask],
+      [backgroundTask.taskId, backgroundTask],
+    ]),
+    conversationStatusBusy: new Set(),
+    discoverConversationId: async (task) => task.conversationId,
+    fetchConversationStatus: async () => ({ ok: true, httpStatus: 200, status: 'COMPLETE' }),
+    taskService: {
+      updateTask: async (_taskId, update) => {
+        currentBackgroundTask = { ...currentBackgroundTask, ...update };
+        return currentBackgroundTask;
+      },
+    },
+    onEvent: async (event) => events.push(event),
+    view: { webContents: { isDestroyed: () => false } },
+  };
+
+  await ChatGPTView.prototype.checkConversationStatus.call(view, backgroundTask);
+  assert.equal(view.activeTask, activeTask);
+  assert.equal(view.knownTasks.get(backgroundTask.taskId).chatStatus, 'completed');
+  assert.equal(events.at(-1).taskId, backgroundTask.taskId);
+  assert.equal(events.at(-1).chatStatus, 'completed');
 });
 
 test('completed ChatGPT stream status stops the task timer and persists the chat completion state', async () => {
@@ -1858,6 +2258,14 @@ test('completed ChatGPT stream status stops the task timer and persists the chat
   assert.equal(view.activeTask.chatStatus, 'completed');
   assert.equal(events.at(-1).type, 'task-chat-status');
   assert.equal(events.at(-1).chatStatus, 'completed');
+});
+
+test('background task status events refresh task lists without forcing the task screen open', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  const eventFlow = renderer.slice(renderer.indexOf('const unsubscribe = bridge.onTaskEvent'), renderer.indexOf('const updateTask'));
+  assert.match(eventFlow, /setTasks\(\(items\) =>/);
+  assert.match(eventFlow, /setActiveTask\(\(current\) => current\?\.taskId === event\.task\.taskId \? event\.task : current\)/);
+  assert.doesNotMatch(eventFlow, /setRoute\(/);
 });
 
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {
@@ -2065,8 +2473,8 @@ test('task attachment confirmation finds uploaded packages in a hidden view and 
   const attachment = {
     textContent: filename,
     getAttribute: () => null,
-    // Source Control collapses the hidden ChatGPT WebContentsView to zero
-    // bounds while its summary automation continues in the page DOM.
+    // Source Control keeps its ChatGPT transport window hidden while summary
+    // automation continues in the page DOM.
     getBoundingClientRect: () => ({ width: 0, height: 0 }),
     closest: () => card,
     parentElement: card,

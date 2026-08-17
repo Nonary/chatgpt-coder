@@ -1,11 +1,17 @@
 const fsSync = require('node:fs');
 const path = require('node:path');
-const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('electron');
+const { BrowserWindow, clipboard, dialog, shell } = require('electron');
 const { mergeResultFilename } = require('./worktree-service');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
 const CHATGPT_PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9_-]+$/;
 const PARTITION = 'persist:patchwork-chatgpt';
+const CHATGPT_ALLOWED_HOSTS = new Set([
+  'chatgpt.com',
+  'auth.openai.com',
+  'auth0.openai.com',
+  'accounts.openai.com',
+]);
 const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 const RESULT_RETRY_MILLISECONDS = 6_000;
 const TASK_MONITOR_INTERVAL_MILLISECONDS = 1_500;
@@ -13,10 +19,48 @@ const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
+const CHAT_MESSAGE_MAX_LENGTH = 32_000;
+const CHAT_CONVERSATION_PAGE_SIZE = 50;
+const CHAT_API_RETRY_ATTEMPTS = 4;
+const CHAT_API_RETRY_BASE_DELAY_MILLISECONDS = 750;
+const CHAT_API_RETRY_MAX_DELAY_MILLISECONDS = 5_000;
+const CHAT_REQUEST_RESPONSE_TIMEOUT_MILLISECONDS = 20_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
 const CHATGPT_CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isAllowedChatGPTUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:') return false;
+    const hostname = url.hostname.toLowerCase();
+    return CHATGPT_ALLOWED_HOSTS.has(hostname)
+      || hostname.endsWith('.chatgpt.com');
+  } catch {
+    return false;
+  }
+}
+
+function transportWindowOptions(backgroundThrottling = false) {
+  return {
+    show: false,
+    width: 1,
+    height: 1,
+    useContentSize: true,
+    skipTaskbar: true,
+    autoHideMenuBar: true,
+    backgroundColor: '#11130f',
+    webPreferences: {
+      partition: PARTITION,
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      spellcheck: true,
+      backgroundThrottling,
+    },
+  };
+}
 
 const TASK_MODEL_PICKER_OPTIONS = {
   sol: {
@@ -83,6 +127,38 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function parseRetryAfterMilliseconds(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const seconds = Number(text);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(15_000, Math.round(seconds * 1_000));
+  }
+  const timestamp = Date.parse(text);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.min(15_000, Math.max(0, timestamp - Date.now()));
+}
+
+function retryAfterMillisecondsFromHeaders(headers) {
+  const retryAfter = Array.isArray(headers)
+    ? headers.find((header) => String(header?.name || '').toLowerCase() === 'retry-after')?.value
+    : headers?.['retry-after'] || headers?.['Retry-After'];
+  return parseRetryAfterMilliseconds(retryAfter);
+}
+
+function isRetryableChatStatus(status) {
+  return [408, 429, 500, 502, 503, 504].includes(Number(status));
+}
+
+function chatRetryDelayMilliseconds(result, attempt) {
+  const retryAfter = Number(result?.retryAfterMilliseconds);
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) return retryAfter;
+  return Math.min(
+    CHAT_API_RETRY_MAX_DELAY_MILLISECONDS,
+    CHAT_API_RETRY_BASE_DELAY_MILLISECONDS * (2 ** Math.max(0, attempt)),
+  );
+}
+
 function resultTaskId(filename) {
   const basename = path.basename(String(filename || ''));
   return RESULT_NAME_PATTERN.exec(basename)?.[1]?.toLowerCase() || null;
@@ -119,6 +195,172 @@ function normalizeConversationStreamStatus(value) {
   if (status === 'IS_STREAMING') return 'streaming';
   if (status === 'FAILURE') return 'failed';
   return 'completed';
+}
+
+function conversationStreamStatusUrl(conversationId) {
+  const id = String(conversationId || '').trim();
+  if (!CHATGPT_CONVERSATION_ID_PATTERN.test(id)) return null;
+  return `https://chatgpt.com/backend-api/conversation/${encodeURIComponent(id)}/stream_status`;
+}
+
+function normalizeChatConversationId(value) {
+  const id = String(value || '').trim();
+  return CHATGPT_CONVERSATION_ID_PATTERN.test(id) ? id : null;
+}
+
+function normalizeChatSendRequest(conversationIdOrRequest, message, model, reasoningMode) {
+  if (conversationIdOrRequest && typeof conversationIdOrRequest === 'object'
+    && !Array.isArray(conversationIdOrRequest)) {
+    const request = conversationIdOrRequest;
+    return {
+      conversationId: request.conversationId || null,
+      message: request.message ?? request.text,
+      model: request.model || 'default',
+      reasoningMode: request.reasoningMode || request.reasoning || 'default',
+      attachments: Array.isArray(request.attachments) ? request.attachments : [],
+    };
+  }
+  return {
+    conversationId: conversationIdOrRequest,
+    message,
+    model: model || 'default',
+    reasoningMode: reasoningMode || 'default',
+    attachments: [],
+  };
+}
+
+function chatMessageText(message) {
+  const content = message?.content || {};
+  const contentType = String(content.content_type || '').toLowerCase();
+  const visibleTypes = ['text', 'multimodal_text', 'reasoning_recap', 'reasoning_summary'];
+  if (contentType && !visibleTypes.includes(contentType)) return '';
+  const parts = Array.isArray(content.parts) ? content.parts : [];
+  const text = [];
+  for (const part of parts) {
+    if (typeof part === 'string') {
+      text.push(part);
+      continue;
+    }
+    if (!part || typeof part !== 'object') continue;
+    if (typeof part.text === 'string') text.push(part.text);
+    else if (typeof part.content === 'string') text.push(part.content);
+  }
+  if (text.length === 0 && typeof content.text === 'string') text.push(content.text);
+  if (text.length === 0 && typeof content.content === 'string') text.push(content.content);
+  return text.join('\n').trim();
+}
+
+function normalizeChatConversation(payload, streamStatus = null) {
+  const conversation = payload && typeof payload === 'object' ? payload : {};
+  const mapping = conversation.mapping && typeof conversation.mapping === 'object'
+    ? conversation.mapping
+    : {};
+  const orderedNodes = [];
+  const seen = new Set();
+  let nodeId = conversation.current_node;
+  while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {
+    seen.add(nodeId);
+    orderedNodes.push(mapping[nodeId]);
+    nodeId = mapping[nodeId].parent || null;
+  }
+  if (orderedNodes.length > 0) {
+    orderedNodes.reverse();
+  } else {
+    orderedNodes.push(...Object.values(mapping).sort((left, right) => {
+      const leftTime = Number(left?.message?.create_time || 0);
+      const rightTime = Number(right?.message?.create_time || 0);
+      return leftTime - rightTime;
+    }));
+  }
+
+  const messages = [];
+  for (const node of orderedNodes) {
+    const message = node?.message;
+    const role = message?.author?.role;
+    if (!['user', 'assistant'].includes(role)) continue;
+    if (message?.metadata?.is_visually_hidden_from_conversation || message?.metadata?.is_user_system_message) continue;
+    const channel = String(message?.channel || message?.metadata?.channel || '').toLowerCase();
+    if (channel === 'analysis') continue;
+    const text = chatMessageText(message);
+    if (!text) continue;
+    const contentType = String(message?.content?.content_type || '').toLowerCase();
+    messages.push({
+      id: String(message.id || node?.id || ''),
+      role,
+      text,
+      kind: ['reasoning_recap', 'reasoning_summary'].includes(contentType)
+        ? 'reasoning'
+        : 'message',
+      createdAt: Number.isFinite(Number(message.create_time)) ? Number(message.create_time) : null,
+      status: String(message.status || ''),
+      endTurn: Boolean(message.end_turn),
+    });
+  }
+
+  const id = normalizeChatConversationId(conversation.id || conversation.conversation_id);
+  const projectId = CHATGPT_PROJECT_ID_PATTERN.test(String(conversation.gizmo_id || ''))
+    ? String(conversation.gizmo_id)
+    : null;
+  const rawStatus = String(streamStatus || '').trim() || null;
+  const lastMessage = messages.at(-1) || null;
+  let status = rawStatus ? normalizeConversationStreamStatus(rawStatus) : 'unknown';
+  if (!rawStatus && lastMessage?.role === 'assistant') {
+    const messageStatus = String(lastMessage.status || '').toLowerCase();
+    if (lastMessage.endTurn || /finished|complete|success/.test(messageStatus)) status = 'completed';
+    else if (/progress|stream|pending/.test(messageStatus)) status = 'streaming';
+  }
+  return {
+    id,
+    title: String(conversation.title || 'New chat').replace(/\s+/g, ' ').trim() || 'New chat',
+    createTime: conversation.create_time || null,
+    updateTime: conversation.update_time || null,
+    currentNode: conversation.current_node || null,
+    projectId,
+    url: id ? (projectId ? `https://chatgpt.com/g/${projectId}/c/${id}` : `https://chatgpt.com/c/${id}`) : null,
+    statusRaw: rawStatus,
+    status,
+    messages,
+  };
+}
+
+function buildChatAuthPrelude() {
+  return `
+      const sessionResponse = await fetch('/api/auth/session', {
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
+      if (!sessionResponse.ok) return {
+        ok: false,
+        kind: 'auth',
+        status: sessionResponse.status,
+        retryAfterMilliseconds: (() => {
+          const value = sessionResponse.headers.get('retry-after');
+          const seconds = Number(value);
+          if (Number.isFinite(seconds) && seconds >= 0) return Math.min(15000, Math.round(seconds * 1000));
+          const timestamp = Date.parse(value || '');
+          return Number.isFinite(timestamp) ? Math.min(15000, Math.max(0, timestamp - Date.now())) : null;
+        })(),
+      };
+      let session = null;
+      try { session = await sessionResponse.json(); } catch {}
+      const accessToken = session?.accessToken || session?.access_token;
+      if (!accessToken) return { ok: false, kind: 'auth', status: 401 };
+      const readStorage = (key) => {
+        try { return localStorage.getItem(key); } catch { return null; }
+      };
+      const deviceId = readStorage('oai-device-id')
+        || readStorage('oai/apps/uuid')
+        || document.cookie.match(/(?:^|;\s*)oai-did=([^;]+)/)?.[1]
+        || null;
+      const headers = {
+        Accept: 'application/json',
+        Authorization: 'Bearer ' + accessToken,
+      };
+      if (deviceId) headers['oai-device-id'] = deviceId;
+      const accountId = session?.account?.id || session?.accountId || null;
+      if (accountId) headers['ChatGPT-Account-Id'] = accountId;
+  `;
 }
 
 function buildConversationStatusScript(conversationId) {
@@ -573,9 +815,9 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
       duplicateNotice: Boolean(duplicateNotice),
       dismissedDuplicate,
     };
-    // Source Control intentionally keeps the embedded ChatGPT view hidden at
-    // zero bounds while a summary runs. Attachment chips still exist in the
-    // page DOM in that state, but their client rectangles are empty. The task
+    // Source Control intentionally keeps the ChatGPT transport window hidden
+    // while a summary runs. Attachment chips still exist in the page DOM in
+    // that state, but their client rectangles are empty. The task
     // package filename contains a unique task ID, so DOM presence is the
     // reliable confirmation signal here; rendered geometry is not.
     const attachment = candidates.find((element) => [
@@ -749,25 +991,25 @@ class ChatGPTView {
     this.pendingDownload = null;
     this.processingTasks = new Set();
     this.monitorBusy = false;
-    this.conversationStatusBusy = false;
+    this.conversationStatusBusy = new Set();
+    this.conversationStatusPollBusy = false;
     this.conversationStatusUrls = new Map();
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
     this.configurationPickerTimer = null;
-    this.visible = false;
-    this.view = new WebContentsView({
-      webPreferences: {
-        partition: PARTITION,
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        spellcheck: true,
-      },
-    });
-    this.mainWindow.contentView.addChildView(this.view);
-    this.view.setBackgroundColor('#11130f');
-    this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    this.chatSendBusy = false;
+    this.chatSessionWindow = null;
+    this.chatConversationListCache = [];
+    this.chatConversationCache = new Map();
+    // Keep ChatGPT transport pages out of the local Patchwork window. They still
+    // use the persistent authenticated partition, but cannot cover or navigate
+    // the native renderer. Task and Chat automation use separate webContents so
+    // their navigation and request lifecycles remain isolated.
+    this.view = new BrowserWindow(transportWindowOptions(false));
+    this.chatView = new BrowserWindow(transportWindowOptions(false));
+    this.transportWindows = [this.view, this.chatView];
     this.installNavigationHandlers();
+    this.installChatTransportHandlers();
     this.installConversationStatusListener();
     this.installDownloadListener();
     this.installMergeDownloadListener();
@@ -776,30 +1018,36 @@ class ChatGPTView {
     this.mainWindow.once('closed', () => {
       clearInterval(this.resultMonitor);
       clearTimeout(this.configurationPickerTimer);
+      if (this.chatSessionWindow && !this.chatSessionWindow.isDestroyed()) this.chatSessionWindow.close();
+      this.chatSessionWindow = null;
+      for (const transportWindow of this.transportWindows) {
+        if (!transportWindow.isDestroyed()) transportWindow.close();
+      }
+      this.transportWindows = [];
     });
     this.view.webContents.loadURL(
       this.activeMerge?.mergeConversationUrl || this.activeTask?.conversationUrl || CHATGPT_URL,
     );
+    this.chatView.webContents.loadURL(CHATGPT_URL).catch(() => {});
+  }
+
+  installChatTransportHandlers() {
+    const contents = this.chatView.webContents;
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    contents.on('render-process-gone', (_event, details) => {
+      this.onEvent({ type: 'chat-error', message: `The background ChatGPT chat transport stopped: ${details.reason}` });
+    });
   }
 
   installNavigationHandlers() {
     const contents = this.view.webContents;
     contents.setWindowOpenHandler(({ url }) => {
-      if (!url.startsWith('https://')) return { action: 'deny' };
-      return {
-        action: 'allow',
-        overrideBrowserWindowOptions: {
-          parent: this.mainWindow,
-          width: 520,
-          height: 720,
-          webPreferences: {
-            partition: PARTITION,
-            nodeIntegration: false,
-            contextIsolation: true,
-            sandbox: true,
-          },
-        },
-      };
+      // Transport pages do not get child windows. Manual navigation belongs in
+      // the explicit app-owned ChatGPT session window below.
+      if (!isAllowedChatGPTUrl(url) && String(url || '').startsWith('https://')) {
+        shell.openExternal(url).catch(() => {});
+      }
+      return { action: 'deny' };
     });
     contents.on('did-start-loading', () => this.onEvent({ type: 'browser-loading', loading: true }));
     contents.on('did-stop-loading', () => {
@@ -823,7 +1071,7 @@ class ChatGPTView {
       this.handlePageTitleUpdated(title).catch(() => {});
     });
     contents.on('render-process-gone', (_event, details) => {
-      this.onEvent({ type: 'task-failed', message: `The embedded ChatGPT renderer stopped: ${details.reason}` });
+      this.onEvent({ type: 'task-failed', message: `The ChatGPT transport stopped: ${details.reason}` });
     });
   }
 
@@ -858,6 +1106,10 @@ class ChatGPTView {
 
   installConversationStatusListener() {
     this.conversationStatusRequestListener = (details, callback) => {
+      if (details?.webContentsId !== this.view.webContents.id) {
+        callback({});
+        return;
+      }
       const conversationId = conversationIdFromStreamStatusUrl(details?.url);
       if (conversationId) {
         this.conversationStatusUrls.set(conversationId, details.url);
@@ -884,13 +1136,25 @@ class ChatGPTView {
       const currentRouteId = conversationIdFromRouteUrl(this.view.webContents.getURL?.() || '');
       if (currentRouteId && currentRouteId !== conversationId) return task;
     }
-    const next = { ...task, conversationId };
-    this.activeTask = next;
-    this.knownTasks.set(task.taskId.toLowerCase(), next);
+    return this.rememberTaskConversationId(task, conversationId);
+  }
+
+  async rememberTaskConversationId(task, conversationId) {
+    const id = String(conversationId || '').trim();
+    if (!task?.taskId || task.state !== 'submitted' || !CHATGPT_CONVERSATION_ID_PATTERN.test(id)) return task;
+    const key = task.taskId.toLowerCase();
+    const currentTask = this.knownTasks.get(key) || task;
+    if (currentTask.state !== 'submitted' || currentTask.conversationId === id) return currentTask;
+    const taskRouteId = conversationIdFromRouteUrl(currentTask.conversationUrl);
+    if (taskRouteId && taskRouteId !== id) return currentTask;
+
+    const next = { ...currentTask, conversationId: id };
+    if (this.activeTask?.taskId === task.taskId) this.activeTask = next;
+    this.knownTasks.set(key, next);
     try {
-      const saved = await this.taskService.updateTask(task.taskId, { conversationId });
+      const saved = await this.taskService.updateTask(task.taskId, { conversationId: id });
       if (this.activeTask?.taskId === task.taskId) this.activeTask = saved;
-      this.knownTasks.set(task.taskId.toLowerCase(), saved);
+      this.knownTasks.set(key, saved);
       return saved;
     } catch {
       return next;
@@ -1034,22 +1298,6 @@ class ChatGPTView {
     }).catch(() => {});
   }
 
-  setBounds(bounds) {
-    const next = {
-      x: Math.max(0, Math.round(bounds.x || 0)),
-      y: Math.max(0, Math.round(bounds.y || 0)),
-      width: Math.max(0, Math.round(bounds.width || 0)),
-      height: Math.max(0, Math.round(bounds.height || 0)),
-    };
-    this.view.setBounds(this.visible ? next : { x: 0, y: 0, width: 0, height: 0 });
-  }
-
-  setVisible(visible) {
-    this.visible = Boolean(visible);
-    this.view.setVisible(this.visible);
-    if (!this.visible) this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
-  }
-
   async prepare(task) {
     this.activeMerge = null;
     this.activeTask = task;
@@ -1062,7 +1310,7 @@ class ChatGPTView {
       taskId: task.taskId,
       message: task.chatgptProject?.name
         ? `A fresh chat in ChatGPT project “${task.chatgptProject.name}” is ready for automated submission.`
-        : 'A fresh embedded ChatGPT chat is ready for automated submission.',
+        : 'A fresh ChatGPT chat is ready for automated submission.',
     });
   }
 
@@ -1117,6 +1365,801 @@ class ChatGPTView {
     } else {
       await this.view.webContents.reload();
     }
+    return true;
+  }
+
+  async waitForChatTransport(timeoutMilliseconds = 12_000) {
+    const contents = this.chatView?.webContents;
+    if (!contents || contents.isDestroyed()) throw new Error('The background ChatGPT chat transport is unavailable.');
+    if (!String(contents.getURL() || '').startsWith('https://chatgpt.com/')) {
+      await contents.loadURL(CHATGPT_URL);
+    }
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const ready = await contents.executeJavaScript(
+        `location.origin === 'https://chatgpt.com' && document.readyState !== 'loading'`,
+        true,
+      ).catch(() => false);
+      if (ready) return true;
+      await delay(250);
+    }
+    return false;
+  }
+
+  async executeChatApiWithRetry(script) {
+    let result = null;
+    for (let attempt = 0; attempt < CHAT_API_RETRY_ATTEMPTS; attempt += 1) {
+      result = await this.chatView.webContents.executeJavaScript(script, true)
+        .catch((error) => ({ ok: false, status: 0, message: error.message }));
+      if (result?.ok || !isRetryableChatStatus(result?.status) || attempt >= CHAT_API_RETRY_ATTEMPTS - 1) {
+        return result;
+      }
+      await delay(chatRetryDelayMilliseconds(result, attempt));
+    }
+    return result;
+  }
+
+  async listChatConversations() {
+    const ready = await this.waitForChatTransport();
+    if (!ready) throw new Error('ChatGPT is still loading. Open the ChatGPT session, sign in, and retry.');
+    const result = await this.executeChatApiWithRetry(`(async () => {
+      ${buildChatAuthPrelude()}
+      const url = new URL('/backend-api/conversations', location.origin);
+      url.searchParams.set('offset', '0');
+      url.searchParams.set('limit', ${CHAT_CONVERSATION_PAGE_SIZE});
+      url.searchParams.set('order', 'updated');
+      url.searchParams.set('is_archived', 'false');
+      url.searchParams.set('is_starred', 'false');
+      const response = await fetch(url.toString(), {
+        credentials: 'include',
+        cache: 'no-store',
+        headers,
+      });
+      const text = await response.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch {}
+      if (!response.ok) {
+        return {
+          ok: false,
+          kind: 'conversations',
+          status: response.status,
+          message: text.slice(0, 240),
+          retryAfterMilliseconds: (() => {
+            const value = response.headers.get('retry-after');
+            const seconds = Number(value);
+            if (Number.isFinite(seconds) && seconds >= 0) return Math.min(15000, Math.round(seconds * 1000));
+            const timestamp = Date.parse(value || '');
+            return Number.isFinite(timestamp) ? Math.min(15000, Math.max(0, timestamp - Date.now())) : null;
+          })(),
+        };
+      }
+      let pinned = [];
+      try {
+        const pinsResponse = await fetch('/backend-api/pins', {
+          credentials: 'include',
+          cache: 'no-store',
+          headers,
+        });
+        if (pinsResponse.ok) {
+          const pinsText = await pinsResponse.text();
+          let pinsData = [];
+          try { pinsData = pinsText ? JSON.parse(pinsText) : []; } catch {}
+          pinned = (Array.isArray(pinsData) ? pinsData : [])
+            .filter((entry) => entry?.item_type === 'conversation' && entry?.item)
+            .map((entry) => ({ ...entry.item, isPinned: true }));
+        }
+      } catch {}
+      const recent = (Array.isArray(data.items) ? data.items : []).map((item) => ({
+        ...item,
+        isPinned: false,
+      }));
+      return {
+        ok: true,
+        items: [...pinned, ...recent].map((item) => ({
+          id: item?.id || null,
+          title: item?.title || 'New chat',
+          createTime: item?.create_time || null,
+          updateTime: item?.update_time || null,
+          projectId: typeof item?.gizmo_id === 'string' ? item.gizmo_id : null,
+          isTemporary: Boolean(item?.is_temporary_chat),
+          isPinned: Boolean(item?.isPinned),
+        })),
+      };
+    })()`, true).catch((error) => ({ ok: false, kind: 'conversations', status: 0, message: error.message }));
+    if (!result?.ok) {
+      if ([401, 403].includes(result?.status)) {
+        throw new Error('Sign in to ChatGPT in the ChatGPT session before using Chat.');
+      }
+      if (isRetryableChatStatus(result?.status) && this.chatConversationListCache.length > 0) {
+        return this.chatConversationListCache;
+      }
+      if (result?.status === 429) {
+        throw new Error('ChatGPT is still rate-limiting conversation history after automatic retries. Try again shortly.');
+      }
+      throw new Error(`Could not load ChatGPT conversations${result?.status ? ` (${result.status})` : ''}.`);
+    }
+    const seen = new Set();
+    const conversations = (result.items || [])
+      .map((item) => {
+        const id = normalizeChatConversationId(item.id);
+        if (!id || seen.has(id)) return null;
+        seen.add(id);
+        const projectId = CHATGPT_PROJECT_ID_PATTERN.test(String(item.projectId || '')) ? item.projectId : null;
+        return {
+          id,
+          title: String(item.title || 'New chat').replace(/\s+/g, ' ').trim() || 'New chat',
+          createTime: item.createTime || null,
+          updateTime: item.updateTime || null,
+          projectId,
+          isTemporary: Boolean(item.isTemporary),
+          isPinned: Boolean(item.isPinned),
+          url: projectId ? `https://chatgpt.com/g/${projectId}/c/${id}` : `https://chatgpt.com/c/${id}`,
+        };
+      })
+      .filter(Boolean);
+    this.chatConversationListCache = conversations;
+    return conversations;
+  }
+
+  async getRenderedChatConversation(conversationId) {
+    const id = normalizeChatConversationId(conversationId);
+    if (!id) return null;
+    const sourceWindow = [this.chatView, this.view].find((window) => (
+      window && !window.webContents.isDestroyed()
+      && conversationIdFromRouteUrl(window.webContents.getURL?.() || '') === id
+    ));
+    if (!sourceWindow) return null;
+    const rendered = await sourceWindow.webContents.executeJavaScript(`(() => {
+      const rows = [...document.querySelectorAll('[data-message-author-role]')]
+        .map((element, index) => {
+          const role = String(element.getAttribute('data-message-author-role') || '').toLowerCase();
+          if (role !== 'user' && role !== 'assistant') return null;
+          const text = String(element.innerText || element.textContent || '').trim();
+          if (!text) return null;
+          return {
+            id: element.getAttribute('data-message-id') || 'rendered-' + index,
+            role,
+            text,
+            kind: 'message',
+            createdAt: null,
+            status: '',
+            endTurn: false,
+          };
+        })
+        .filter(Boolean);
+      const stopButton = document.querySelector('[data-testid="stop-button"]');
+      const generating = Boolean(stopButton && !stopButton.disabled && stopButton.getAttribute('aria-disabled') !== 'true');
+      const title = String(document.title || 'New chat').replace(/\\s*[|·-]\\s*ChatGPT\\s*$/i, '').trim() || 'New chat';
+      return { rows, generating, title };
+    })()`, true).catch(() => null);
+    if (!rendered?.rows?.length) return null;
+
+    const cached = this.chatConversationCache.get(id);
+    const cachedTurns = [];
+    for (const message of cached?.messages || []) {
+      if (message.role === 'user' || cachedTurns.length === 0) cachedTurns.push([]);
+      cachedTurns.at(-1).push(message);
+    }
+    const messages = [];
+    let turnIndex = -1;
+    let insertedReasoning = false;
+    for (const message of rendered.rows) {
+      if (message.role === 'user') {
+        turnIndex += 1;
+        insertedReasoning = false;
+      } else if (!insertedReasoning) {
+        const summaries = (cachedTurns[turnIndex] || []).filter((item) => item.kind === 'reasoning');
+        messages.push(...summaries);
+        insertedReasoning = true;
+      }
+      messages.push(message);
+    }
+    const lastMessage = messages.at(-1);
+    const conversation = {
+      id,
+      title: rendered.title || cached?.title || 'New chat',
+      createTime: cached?.createTime || null,
+      updateTime: Date.now(),
+      currentNode: cached?.currentNode || null,
+      projectId: cached?.projectId || null,
+      url: sourceWindow.webContents.getURL(),
+      statusRaw: null,
+      status: rendered.generating || lastMessage?.role === 'user' ? 'streaming' : 'completed',
+      messages,
+      renderedFallback: true,
+    };
+    this.chatConversationCache.set(id, conversation);
+    return conversation;
+  }
+
+  async getChatConversation(conversationId) {
+    const id = normalizeChatConversationId(conversationId);
+    if (!id) throw new Error('Choose a valid ChatGPT conversation.');
+    const ready = await this.waitForChatTransport();
+    if (!ready) throw new Error('ChatGPT is still loading. Open the ChatGPT session, sign in, and retry.');
+    const result = await this.executeChatApiWithRetry(`(async () => {
+      ${buildChatAuthPrelude()}
+      const response = await fetch('/backend-api/conversation/' + encodeURIComponent(${JSON.stringify(id)}), {
+        credentials: 'include',
+        cache: 'no-store',
+        headers,
+      });
+      const text = await response.text();
+      let conversation = {};
+      try { conversation = text ? JSON.parse(text) : {}; } catch {}
+      if (!response.ok) {
+        return {
+          ok: false,
+          kind: 'conversation',
+          status: response.status,
+          message: text.slice(0, 240),
+          retryAfterMilliseconds: (() => {
+            const value = response.headers.get('retry-after');
+            const seconds = Number(value);
+            if (Number.isFinite(seconds) && seconds >= 0) return Math.min(15000, Math.round(seconds * 1000));
+            const timestamp = Date.parse(value || '');
+            return Number.isFinite(timestamp) ? Math.min(15000, Math.max(0, timestamp - Date.now())) : null;
+          })(),
+        };
+      }
+      let streamStatus = null;
+      try {
+        const statusResponse = await fetch('/backend-api/conversation/' + encodeURIComponent(${JSON.stringify(id)}) + '/stream_status', {
+          credentials: 'include',
+          cache: 'no-store',
+          headers,
+        });
+        const statusText = await statusResponse.text();
+        let statusData = {};
+        try { statusData = statusText ? JSON.parse(statusText) : {}; } catch {}
+        if (statusResponse.ok && typeof statusData?.status === 'string') streamStatus = statusData.status;
+      } catch {}
+      return { ok: true, conversation, streamStatus };
+    })()`, true).catch((error) => ({ ok: false, kind: 'conversation', status: 0, message: error.message }));
+    if (!result?.ok) {
+      if ([401, 403].includes(result?.status)) {
+        throw new Error('Sign in to ChatGPT in the ChatGPT session before using Chat.');
+      }
+      if (result?.status === 404) throw new Error('That ChatGPT conversation is no longer available.');
+      if (isRetryableChatStatus(result?.status)) {
+        const rendered = await this.getRenderedChatConversation(id);
+        if (rendered) return rendered;
+        if (this.chatConversationCache.has(id)) {
+          return { ...this.chatConversationCache.get(id), stale: true };
+        }
+      }
+      if (result?.status === 429) {
+        throw new Error('ChatGPT is still rate-limiting this conversation after automatic retries. Try again shortly.');
+      }
+      throw new Error(`Could not load the ChatGPT conversation${result?.status ? ` (${result.status})` : ''}.`);
+    }
+    const conversation = normalizeChatConversation(result.conversation, result.streamStatus);
+    // The page can be ahead of the conversation endpoint while an answer is streaming. Prefer
+    // that user-visible transcript whenever it contains additional turns or live status, rather
+    // than leaving the native thread frozen behind the browser transport.
+    const rendered = await this.getRenderedChatConversation(id).catch(() => null);
+    if (rendered && (
+      rendered.messages.length > conversation.messages.length
+      || (rendered.status === 'streaming' && conversation.status !== 'streaming')
+    )) {
+      return rendered;
+    }
+    this.chatConversationCache.set(id, conversation);
+    return conversation;
+  }
+
+  async waitForChatComposer(timeoutMilliseconds = 12_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const found = await this.chatView.webContents.executeJavaScript(`Boolean(
+        document.querySelector('#prompt-textarea') ||
+        document.querySelector('[data-testid="prompt-textarea"]') ||
+        document.querySelector('textarea[placeholder]') ||
+        document.querySelector('[contenteditable="true"][role="textbox"]')
+      )`).catch(() => false);
+      if (found) return true;
+      await delay(300);
+    }
+    return false;
+  }
+
+  async injectChatPrompt(prompt) {
+    const script = `(() => {
+      const composer =
+        document.querySelector('#prompt-textarea') ||
+        document.querySelector('[data-testid="prompt-textarea"]') ||
+        document.querySelector('textarea[placeholder]') ||
+        document.querySelector('[contenteditable="true"][role="textbox"]');
+      if (!composer) return { ok: false, reason: 'composer-not-found' };
+      const prompt = ${JSON.stringify(prompt)};
+      composer.focus();
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        const prototype = composer instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(prototype, 'value').set;
+        setter.call(composer, prompt);
+        composer.dispatchEvent(new Event('input', { bubbles: true }));
+        composer.dispatchEvent(new Event('change', { bubbles: true }));
+      } else {
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(composer);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.execCommand('insertText', false, prompt);
+        composer.dispatchEvent(new InputEvent('input', {
+          bubbles: true,
+          inputType: 'insertText',
+          data: prompt,
+        }));
+      }
+      return { ok: true };
+    })()`;
+    const result = await this.chatView.webContents.executeJavaScript(script, true);
+    if (!result?.ok) throw new Error('Could not find ChatGPT’s message composer in the background session.');
+  }
+
+  async clickChatSend(timeoutMilliseconds = 60_000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const result = await this.chatView.webContents.executeJavaScript(`(() => {
+        const candidates = [...document.querySelectorAll('button')];
+        const button =
+          document.querySelector('[data-testid="send-button"]') ||
+          candidates.find((item) => /send prompt|send message|^send$/i.test([
+            item.getAttribute('aria-label'), item.getAttribute('title'), item.textContent,
+          ].filter(Boolean).join(' ').trim()));
+        if (!button) return { found: false, enabled: false };
+        if (button.disabled || button.getAttribute('aria-disabled') === 'true') {
+          return { found: true, enabled: false };
+        }
+        button.click();
+        return { found: true, enabled: true };
+      })()`, true).catch(() => ({ found: false, enabled: false }));
+      if (result.enabled) return true;
+      await delay(350);
+    }
+    throw new Error('ChatGPT did not enable Send for this message.');
+  }
+
+  async waitForChatPromptAcceptance(prompt, timeoutMilliseconds = 12_000) {
+    const expected = String(prompt || '').replaceAll('\r\n', '\n').trim();
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const accepted = await this.chatView.webContents.executeJavaScript(`(() => {
+        const expected = ${JSON.stringify(expected)};
+        const composer = document.querySelector('#prompt-textarea')
+          || document.querySelector('[data-testid="prompt-textarea"]')
+          || document.querySelector('textarea[placeholder]')
+          || document.querySelector('[contenteditable="true"][role="textbox"]');
+        const composerText = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+          ? composer.value
+          : String(composer?.innerText || composer?.textContent || '');
+        if (!String(composerText || '').trim()) return true;
+        const visibleMessages = [...document.querySelectorAll('[data-message-author-role="user"]')]
+          .map((element) => String(element.innerText || element.textContent || '').replace(/\\r\\n/g, '\\n').trim());
+        return visibleMessages.at(-1) === expected;
+      })()`, true).catch(() => false);
+      if (accepted) return true;
+      await delay(250);
+    }
+    return false;
+  }
+
+  async stopChatResponse() {
+    const ready = await this.waitForChatTransport();
+    if (!ready) throw new Error('ChatGPT is still loading.');
+    const stopped = await this.chatView.webContents.executeJavaScript(`(() => {
+      const button = document.querySelector('[data-testid="stop-button"]');
+      if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
+      button.click();
+      return true;
+    })()`, true).catch(() => false);
+    if (!stopped) throw new Error('ChatGPT is not currently generating a reply.');
+    return true;
+  }
+
+  async waitForChatConversationUrl(expectedConversationId = null, timeoutMilliseconds = SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS) {
+    const expectedId = normalizeChatConversationId(expectedConversationId);
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const url = this.chatView.webContents.getURL();
+      const id = conversationIdFromRouteUrl(url);
+      if (id && (!expectedId || id === expectedId)) return { id, url };
+      await delay(200);
+    }
+    return null;
+  }
+
+  // The HAR-captured /backend-api/f/conversation transport guards POSTs with short-lived Sentinel,
+  // proof, and conduit values. Let the real ChatGPT frontend create those values instead of
+  // replaying private anti-abuse payloads, then read conversation state with same-origin calls.
+  async beginChatRequestEnforcement(model, reasoningMode = 'default') {
+    const debuggerApi = this.chatView.webContents.debugger;
+    const configuration = taskRequestConfiguration(model, reasoningMode);
+    let attachedHere = false;
+    let fetchEnabled = false;
+    let disposed = false;
+    let completed = false;
+    let resolveResult;
+    const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
+    const complete = (result) => {
+      if (completed) return;
+      completed = true;
+      resolveResult(result);
+    };
+    const continueRequest = async (requestId) => {
+      await debuggerApi.sendCommand('Fetch.continueRequest', { requestId }).catch(() => {});
+    };
+    const continueResponse = async (requestId) => {
+      if (typeof debuggerApi.sendCommand !== 'function') return;
+      await debuggerApi.sendCommand('Fetch.continueResponse', { requestId }).catch(async () => {
+        await continueRequest(requestId);
+      });
+    };
+    const readPostData = async (params) => {
+      let postData = params?.request?.postData;
+      if (typeof postData !== 'string' && params?.request?.postDataEntries?.length === 1) {
+        postData = Buffer.from(params.request.postDataEntries[0].bytes, 'base64').toString('utf8');
+      }
+      if (typeof postData !== 'string' && params?.networkId) {
+        const body = await debuggerApi.sendCommand('Network.getRequestPostData', {
+          requestId: params.networkId,
+        });
+        postData = body?.postData;
+      }
+      return postData;
+    };
+    const onDebuggerMessage = (_event, method, params) => {
+      if (method !== 'Fetch.requestPaused') return;
+      (async () => {
+        const requestId = params?.requestId;
+        const request = params?.request || {};
+        if (!requestId) return;
+        let pathname = '';
+        try {
+          pathname = new URL(request.url).pathname;
+        } catch {
+          await continueRequest(requestId);
+          return;
+        }
+        const isConversation = request.method === 'POST'
+          && pathname === '/backend-api/f/conversation';
+        const isPrepare = request.method === 'POST'
+          && pathname === '/backend-api/f/conversation/prepare';
+        const responseStage = Number.isInteger(params?.responseStatusCode);
+        if (responseStage) {
+          if (!isConversation) {
+            await continueResponse(requestId);
+            return;
+          }
+          const status = Number(params.responseStatusCode);
+          complete({
+            ok: status >= 200 && status < 300,
+            httpStatus: status,
+            rateLimited: status === 429,
+            retryAfterMilliseconds: retryAfterMillisecondsFromHeaders(params.responseHeaders),
+            model: configuration.modelSlug,
+            selectedModel: configuration.model,
+          });
+          await continueResponse(requestId);
+          return;
+        }
+        if (!isConversation && !isPrepare) {
+          await continueRequest(requestId);
+          return;
+        }
+        if (!isConversation) {
+          await continueRequest(requestId);
+          return;
+        }
+        try {
+          const postData = await readPostData(params);
+          const rewritten = rewriteConversationRequestBody(postData, configuration);
+          await debuggerApi.sendCommand('Fetch.continueRequest', {
+            requestId,
+            postData: Buffer.from(rewritten.text, 'utf8').toString('base64'),
+          });
+        } catch (error) {
+          await continueRequest(requestId);
+          complete({ ok: false, error: error.message });
+        }
+      })().catch((error) => complete({ ok: false, error: error.message }));
+    };
+
+    try {
+      if (!debuggerApi.isAttached()) {
+        debuggerApi.attach('1.3');
+        attachedHere = true;
+      }
+      debuggerApi.on('message', onDebuggerMessage);
+      await debuggerApi.sendCommand('Fetch.enable', {
+        patterns: [
+          {
+            urlPattern: 'https://chatgpt.com/backend-api/f/conversation*',
+            requestStage: 'Request',
+          },
+          {
+            urlPattern: 'https://chatgpt.com/backend-api/f/conversation*',
+            requestStage: 'Response',
+          },
+        ],
+      });
+      fetchEnabled = true;
+    } catch (error) {
+      debuggerApi.removeListener?.('message', onDebuggerMessage);
+      if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
+      throw new Error(`Could not verify ChatGPT’s outgoing model request: ${error.message}`);
+    }
+
+    return {
+      wait: async (timeoutMilliseconds = CHAT_REQUEST_RESPONSE_TIMEOUT_MILLISECONDS) => {
+        const result = await Promise.race([
+          resultPromise,
+          delay(timeoutMilliseconds).then(() => ({
+            ok: false,
+            error: 'ChatGPT did not return a conversation response after Send.',
+          })),
+        ]);
+        if (isRetryableChatStatus(result.httpStatus)) return result;
+        if (!result.ok) throw new Error(result.error || `ChatGPT rejected the conversation request (${result.httpStatus || 'unknown'}).`);
+        return result;
+      },
+      dispose: async () => {
+        if (disposed) return;
+        disposed = true;
+        debuggerApi.removeListener?.('message', onDebuggerMessage);
+        if (fetchEnabled && debuggerApi.isAttached()) {
+          await debuggerApi.sendCommand('Fetch.disable').catch(() => {});
+        }
+        if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
+      },
+    };
+  }
+
+  async sendChatMessage(conversationIdOrRequest, message, model = 'default', reasoningMode = 'default') {
+    const request = normalizeChatSendRequest(conversationIdOrRequest, message, model, reasoningMode);
+    const text = String(request.message || '').replaceAll('\r\n', '\n').trim();
+    if (!text) throw new Error('Enter a message to send to ChatGPT.');
+    if (text.length > CHAT_MESSAGE_MAX_LENGTH) {
+      throw new Error(`Chat messages are limited to ${CHAT_MESSAGE_MAX_LENGTH.toLocaleString()} characters.`);
+    }
+    const id = request.conversationId ? normalizeChatConversationId(request.conversationId) : null;
+    if (request.conversationId && !id) throw new Error('Choose a valid ChatGPT conversation.');
+    const attachments = request.attachments.map((attachment) => {
+      const attachmentPath = typeof attachment === 'string' ? attachment : attachment?.path;
+      let isFile = false;
+      try {
+        isFile = Boolean(attachmentPath && fsSync.statSync(attachmentPath).isFile());
+      } catch {
+        isFile = false;
+      }
+      if (!isFile) {
+        throw new Error(`Chat attachment is not a file: ${attachmentPath || 'unknown path'}`);
+      }
+      return {
+        path: attachmentPath,
+        name: String(attachment?.name || path.basename(attachmentPath)),
+      };
+    });
+    const configuration = taskRequestConfiguration(request.model, request.reasoningMode);
+    if (this.chatSendBusy) throw new Error('A ChatGPT message is already being submitted.');
+
+    this.chatSendBusy = true;
+    try {
+      let targetUrl = CHATGPT_URL;
+      if (id) {
+        const details = await this.getChatConversation(id).catch(() => null);
+        if (details?.status === 'streaming') {
+          throw new Error('ChatGPT is still replying in this conversation. Wait for it to finish before sending another message.');
+        }
+        targetUrl = details?.url || `https://chatgpt.com/c/${id}`;
+      }
+
+      let lastRetryableResponse = null;
+      for (let attempt = 0; attempt < CHAT_API_RETRY_ATTEMPTS; attempt += 1) {
+        if (attempt > 0) {
+          await delay(chatRetryDelayMilliseconds(lastRetryableResponse, attempt - 1));
+        }
+        if (this.chatView.webContents.getURL() !== targetUrl) {
+          await this.chatView.webContents.loadURL(targetUrl);
+        } else if (attempt > 0 || !id) {
+          await this.chatView.webContents.reload();
+        }
+
+        const composerReady = await this.waitForChatComposer();
+        if (!composerReady) {
+          throw new Error('ChatGPT is not ready. Open the ChatGPT session, sign in, then return to Chat.');
+        }
+
+        let enforcement = null;
+        try {
+          // Model enforcement improves parity with the selected native controls, but Chromium can
+          // temporarily deny debugger attachment (for example while DevTools is connected). A
+          // failed observer must never block a normal, authenticated ChatGPT submission.
+          enforcement = await this.beginChatRequestEnforcement(
+            configuration.model,
+            configuration.reasoningMode,
+          ).catch(() => null);
+          await this.injectChatPrompt(text);
+          if (attachments.length > 0) {
+            await this.uploadAttachments(attachments, this.chatView.webContents);
+          }
+          await this.clickChatSend();
+          const accepted = await this.waitForChatPromptAcceptance(text);
+          if (!accepted) {
+            throw new Error('ChatGPT did not accept the message after Send. Open the ChatGPT session to check the composer.');
+          }
+          // If the debugger is unavailable, the page still owns the authenticated send. Do not
+          // retry it automatically: repeating a successful click could duplicate the message.
+          const response = enforcement ? await enforcement.wait() : { ok: true, httpStatus: null };
+          if (isRetryableChatStatus(response.httpStatus)) {
+            lastRetryableResponse = response;
+            continue;
+          }
+        } finally {
+          await enforcement?.dispose();
+        }
+
+        const conversation = await this.waitForChatConversationUrl(id);
+        if (!conversation) {
+          throw new Error('ChatGPT did not confirm the conversation after Send. Open the ChatGPT session to check the message.');
+        }
+        this.chatConversationCache.delete(conversation.id);
+        return {
+          conversationId: conversation.id,
+          conversationUrl: conversation.url,
+          submittedAt: new Date().toISOString(),
+          model: configuration.model,
+        };
+      }
+
+      if (lastRetryableResponse?.httpStatus === 429) {
+        throw new Error('ChatGPT is still rate-limiting this message after several automatic retries. Try again shortly.');
+      }
+      if (lastRetryableResponse) {
+        throw new Error(`ChatGPT could not accept this message after several automatic retries (${lastRetryableResponse.httpStatus}). Try again shortly.`);
+      }
+      throw new Error('ChatGPT could not accept this message after automatic retries. Try again shortly.');
+    } finally {
+      this.chatSendBusy = false;
+    }
+  }
+
+  async openChatInSession(conversationId = null) {
+    const id = conversationId ? normalizeChatConversationId(conversationId) : null;
+    if (conversationId && !id) throw new Error('Choose a valid ChatGPT conversation.');
+    let targetUrl = CHATGPT_URL;
+    if (id) {
+      const details = await this.getChatConversation(id).catch(() => null);
+      targetUrl = details?.url || `https://chatgpt.com/c/${id}`;
+    }
+
+    if (!this.chatSessionWindow || this.chatSessionWindow.isDestroyed()) {
+      this.chatSessionWindow = new BrowserWindow({
+        parent: this.mainWindow,
+        width: 1100,
+        height: 800,
+        minWidth: 720,
+        minHeight: 560,
+        show: false,
+        autoHideMenuBar: true,
+        backgroundColor: '#11130f',
+        title: 'ChatGPT',
+        webPreferences: {
+          partition: PARTITION,
+          nodeIntegration: false,
+          contextIsolation: true,
+          sandbox: true,
+          spellcheck: true,
+        },
+      });
+      this.chatSessionWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (!isAllowedChatGPTUrl(url)) {
+          if (String(url || '').startsWith('https://')) shell.openExternal(url).catch(() => {});
+          return { action: 'deny' };
+        }
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: {
+            parent: this.chatSessionWindow,
+            webPreferences: {
+              partition: PARTITION,
+              nodeIntegration: false,
+              contextIsolation: true,
+              sandbox: true,
+            },
+          },
+        };
+      });
+      this.chatSessionWindow.webContents.on('did-start-loading', () => {
+        this.onEvent({ type: 'session-loading', loading: true });
+      });
+      this.chatSessionWindow.webContents.on('did-stop-loading', () => {
+        this.onEvent({
+          type: 'session-loading',
+          loading: false,
+          url: this.chatSessionWindow?.webContents.getURL?.() || null,
+        });
+      });
+      this.chatSessionWindow.webContents.on('did-navigate', (_event, url) => {
+        this.onEvent({ type: 'session-navigated', url });
+      });
+      this.chatSessionWindow.webContents.on('did-navigate-in-page', (_event, url) => {
+        this.onEvent({ type: 'session-navigated', url });
+      });
+      this.chatSessionWindow.once('closed', () => {
+        this.onEvent({ type: 'session-closed' });
+        this.chatSessionWindow = null;
+      });
+    }
+
+    if (!isAllowedChatGPTUrl(targetUrl)) {
+      throw new Error('The requested ChatGPT session destination is not allowed.');
+    }
+    const popup = this.chatSessionWindow;
+    if (popup.webContents.getURL() !== targetUrl) await popup.loadURL(targetUrl);
+    popup.show();
+    popup.focus();
+    return true;
+  }
+
+  async closeChatInSession() {
+    if (this.chatSessionWindow && !this.chatSessionWindow.isDestroyed()) {
+      this.chatSessionWindow.close();
+    }
+    this.chatSessionWindow = null;
+    return true;
+  }
+
+  async sessionStatus() {
+    const popup = this.chatSessionWindow && !this.chatSessionWindow.isDestroyed()
+      ? this.chatSessionWindow
+      : null;
+    let authenticated = false;
+    if (this.chatView && !this.chatView.isDestroyed()) {
+      authenticated = await this.chatView.webContents.executeJavaScript(`(async () => {
+        try {
+          const response = await fetch('/api/auth/session', {
+            credentials: 'include',
+            cache: 'no-store',
+            headers: { Accept: 'application/json' },
+          });
+          if (!response.ok) return false;
+          const session = await response.json();
+          return Boolean(session?.accessToken || session?.access_token);
+        } catch {
+          return false;
+        }
+      })()`, true).catch(() => false);
+    }
+    return {
+      open: Boolean(popup),
+      visible: Boolean(popup?.isVisible()),
+      url: popup?.webContents.getURL?.() || null,
+      authenticated: Boolean(authenticated),
+      transportUrl: this.chatView?.webContents.getURL?.() || null,
+    };
+  }
+
+  async reloadChatSession() {
+    if (!this.chatSessionWindow || this.chatSessionWindow.isDestroyed()) {
+      return this.openChatInSession();
+    }
+    await this.chatSessionWindow.webContents.reload();
+    return true;
+  }
+
+  async goBackInChatSession() {
+    const contents = this.chatSessionWindow?.webContents;
+    if (contents && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+    return true;
+  }
+
+  async goForwardInChatSession() {
+    const contents = this.chatSessionWindow?.webContents;
+    if (contents && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
     return true;
   }
 
@@ -1267,25 +2310,6 @@ class ChatGPTView {
       name: String(project.name || projectName).trim(),
       url: chatGPTProjectUrl(project.id, shortUrl),
     };
-  }
-
-  async reload() {
-    this.view.webContents.reload();
-    return true;
-  }
-
-  async goBack() {
-    if (this.view.webContents.navigationHistory.canGoBack()) {
-      this.view.webContents.navigationHistory.goBack();
-    }
-    return true;
-  }
-
-  async goForward() {
-    if (this.view.webContents.navigationHistory.canGoForward()) {
-      this.view.webContents.navigationHistory.goForward();
-    }
-    return true;
   }
 
   async waitForComposer(timeoutMilliseconds = 12_000) {
@@ -1510,11 +2534,11 @@ class ChatGPTView {
       return { ok: true };
     })()`;
     const result = await this.view.webContents.executeJavaScript(script, true);
-    if (!result?.ok) throw new Error('Could not find ChatGPT’s prompt composer. Reload the embedded browser and try again.');
+    if (!result?.ok) throw new Error('Could not find ChatGPT’s prompt composer. Open ChatGPT to verify sign-in, then retry.');
   }
 
-  async findFileInputNodeId() {
-    const debuggerApi = this.view.webContents.debugger;
+  async findFileInputNodeId(webContents = this.view.webContents) {
+    const debuggerApi = webContents.debugger;
     const documentResult = await debuggerApi.sendCommand('DOM.getDocument', { depth: -1, pierce: true });
     for (const selector of [
       '#upload-files',
@@ -1530,20 +2554,20 @@ class ChatGPTView {
     return 0;
   }
 
-  async uploadPackage(packagePath) {
+  async uploadPackage(packagePath, webContents = this.view.webContents) {
     const filename = path.basename(packagePath);
-    const existingAttachment = await this.packageAttachmentStatus(filename, true);
+    const existingAttachment = await this.packageAttachmentStatus(filename, true, webContents);
     if (existingAttachment.attached && !existingAttachment.busy) return true;
-    const debuggerApi = this.view.webContents.debugger;
+    const debuggerApi = webContents.debugger;
     let attachedHere = false;
     try {
       if (!debuggerApi.isAttached()) {
         debuggerApi.attach('1.3');
         attachedHere = true;
       }
-      let nodeId = await this.findFileInputNodeId();
+      let nodeId = await this.findFileInputNodeId(webContents);
       if (!nodeId) {
-        await this.view.webContents.executeJavaScript(`(() => {
+        await webContents.executeJavaScript(`(() => {
           const candidates = [...document.querySelectorAll('button')];
           const button =
             document.querySelector('[data-testid="composer-plus-btn"]') ||
@@ -1555,7 +2579,7 @@ class ChatGPTView {
           return Boolean(button);
         })()`, true);
         await delay(500);
-        nodeId = await this.findFileInputNodeId();
+        nodeId = await this.findFileInputNodeId(webContents);
       }
       if (!nodeId) {
         throw new Error('Could not locate ChatGPT’s attachment input. Attach the package manually or reload and retry.');
@@ -1564,7 +2588,7 @@ class ChatGPTView {
         files: [packagePath],
         nodeId,
       });
-      const eventDispatched = await this.view.webContents.executeJavaScript(`(() => {
+      const eventDispatched = await webContents.executeJavaScript(`(() => {
         const filename = ${JSON.stringify(filename)};
         const input = [...document.querySelectorAll('input[type="file"]')]
           .find((element) => [...element.files].some((file) => file.name === filename));
@@ -1577,20 +2601,25 @@ class ChatGPTView {
     } finally {
       if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
     }
-    await this.waitForPackageAttachment(path.basename(packagePath));
+    await this.waitForPackageAttachment(path.basename(packagePath), 60_000, webContents);
   }
 
-  async uploadAttachments(attachments = []) {
+  async uploadAttachments(attachments = [], webContents = null) {
     for (const attachment of attachments) {
       const attachmentPath = typeof attachment === 'string' ? attachment : attachment?.path;
       if (!attachmentPath) continue;
-      await this.uploadPackage(attachmentPath);
+      if (webContents) await this.uploadPackage(attachmentPath, webContents);
+      else await this.uploadPackage(attachmentPath);
     }
     return true;
   }
 
-  async packageAttachmentStatus(filename, dismissDuplicateNotice = false) {
-    return this.view.webContents.executeJavaScript(
+  async packageAttachmentStatus(
+    filename,
+    dismissDuplicateNotice = false,
+    webContents = this.view.webContents,
+  ) {
+    return webContents.executeJavaScript(
       buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice),
       true,
     ).catch(() => ({
@@ -1601,16 +2630,20 @@ class ChatGPTView {
     }));
   }
 
-  async waitForPackageAttachment(filename, timeoutMilliseconds = 60_000) {
+  async waitForPackageAttachment(
+    filename,
+    timeoutMilliseconds = 60_000,
+    webContents = this.view.webContents,
+  ) {
     const startedAt = Date.now();
     let consecutiveReadyChecks = 0;
     while (Date.now() - startedAt < timeoutMilliseconds) {
-      const status = await this.packageAttachmentStatus(filename, true);
+      const status = await this.packageAttachmentStatus(filename, true, webContents);
       consecutiveReadyChecks = status.attached && !status.busy ? consecutiveReadyChecks + 1 : 0;
       if (consecutiveReadyChecks >= 2) return true;
       await delay(500);
     }
-    throw new Error(`ChatGPT did not confirm the attachment ${filename}. Nothing was submitted; reload the embedded browser and try again.`);
+    throw new Error(`ChatGPT did not confirm the attachment ${filename}. Nothing was submitted; open ChatGPT to verify sign-in, then retry.`);
   }
 
   async waitForConversationUrl(timeoutMilliseconds = SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS) {
@@ -1655,17 +2688,17 @@ class ChatGPTView {
       type: 'automation-started',
       taskId: task.taskId,
       message: summaryOnly
-        ? 'Injecting the Git Summary request into the embedded ChatGPT composer…'
-        : 'Injecting the task into the embedded ChatGPT composer…',
+        ? 'Sending the Git Summary request through the authenticated ChatGPT transport…'
+        : 'Sending the task through the authenticated ChatGPT transport…',
     });
     const composerReady = await this.waitForComposer();
     if (!composerReady) {
       await this.onEvent({
         type: 'browser-login-required',
         taskId: task.taskId,
-        message: 'Sign in to ChatGPT in the embedded browser, then choose Submit automatically.',
+        message: 'Open ChatGPT, sign in, then return here and submit the task again.',
       });
-      throw new Error('ChatGPT is not ready. Sign in inside the embedded browser and retry.');
+      throw new Error('ChatGPT is not ready. Open ChatGPT, sign in, then retry.');
     }
     await this.configureTaskModel(task);
     const requestEnforcement = await this.beginTaskRequestEnforcement(task);
@@ -1691,7 +2724,7 @@ class ChatGPTView {
         taskId: task.taskId,
         message: 'ChatGPT did not create a conversation after Send, so the task was not marked submitted.',
       });
-      throw new Error('Patchwork could not confirm a ChatGPT conversation after Send. Check the embedded browser before retrying.');
+      throw new Error('Patchwork could not confirm a ChatGPT conversation after Send. Open ChatGPT to check the message before retrying.');
     }
     this.conversationStatusUrls?.clear();
     const currentConversationTitle = normalizeConversationTitle(this.view?.webContents?.getTitle?.());
@@ -1769,7 +2802,7 @@ class ChatGPTView {
     });
     await this.newChat(request.chatgptProject?.id, request.chatgptProject?.shortUrl);
     const composerReady = await this.waitForComposer();
-    if (!composerReady) throw new Error('ChatGPT is not ready. Sign in inside the embedded browser and retry.');
+    if (!composerReady) throw new Error('ChatGPT is not ready. Open ChatGPT, sign in, then retry.');
     await this.injectPrompt(request.prompt);
     await this.clickSend();
     this.activeMerge = await this.worktreeService.markMergeSubmitted(request.treeId);
@@ -1788,7 +2821,7 @@ class ChatGPTView {
 
   async monitorPage() {
     await this.dismissBlockingLimitNotice();
-    await this.checkConversationStatus();
+    await this.pollConversationStatuses();
     return this.checkForResult();
   }
 
@@ -1796,9 +2829,10 @@ class ChatGPTView {
     if (task.conversationId) return task.conversationId;
     const taskRouteId = conversationIdFromRouteUrl(task.conversationUrl);
     if (taskRouteId) {
-      const remembered = await this.rememberConversationId(taskRouteId);
+      const remembered = await this.rememberTaskConversationId(task, taskRouteId);
       return remembered?.conversationId === taskRouteId ? taskRouteId : null;
     }
+    if (this.activeTask?.taskId !== task.taskId) return null;
     const currentUrl = this.view.webContents.getURL?.() || '';
     const currentRouteId = conversationIdFromRouteUrl(currentUrl);
     if (currentRouteId && currentUrl === task.conversationUrl) {
@@ -1824,27 +2858,85 @@ class ChatGPTView {
     return remembered?.conversationId === discovered ? discovered : null;
   }
 
-  async checkConversationStatus() {
-    const task = this.activeTask;
-    if (this.conversationStatusBusy || !task || task.state !== 'submitted'
+  async fetchConversationStatus(conversationId) {
+    const statusUrl = conversationStreamStatusUrl(conversationId);
+    if (!statusUrl || this.view.webContents.isDestroyed()) return null;
+    const browserSession = this.view.webContents.session;
+    if (typeof browserSession?.fetch === 'function') {
+      try {
+        const response = await browserSession.fetch(statusUrl, {
+          method: 'GET',
+          credentials: 'include',
+          cache: 'no-store',
+          headers: { Accept: 'application/json' },
+        });
+        const text = await response.text();
+        let data = {};
+        try { data = text ? JSON.parse(text) : {}; } catch {}
+        const result = {
+          ok: response.ok,
+          httpStatus: response.status,
+          status: typeof data?.status === 'string' ? data.status : null,
+        };
+        if (result.ok || ![401, 403].includes(result.httpStatus)) return result;
+      } catch {
+        // Fall back to same-origin page fetch below when the main-process request cannot be made.
+      }
+    }
+    return this.view.webContents.executeJavaScript(
+      buildConversationStatusScript(conversationId),
+      true,
+    ).catch(() => ({ ok: false }));
+  }
+
+  async pollConversationStatuses() {
+    if (this.conversationStatusPollBusy) return [];
+    this.conversationStatusPollBusy = true;
+    try {
+      const tasks = [...this.knownTasks.values()].filter((task) => (
+        task?.state === 'submitted'
+        && task.chatStatus !== 'completed'
+        && task.chatStatus !== 'failed'
+      ));
+      const activeTask = this.activeTask;
+      if (activeTask?.state === 'submitted'
+        && activeTask.chatStatus !== 'completed'
+        && activeTask.chatStatus !== 'failed'
+        && !tasks.some((task) => task.taskId === activeTask.taskId)) {
+        tasks.push(activeTask);
+      }
+      return await Promise.all(tasks.map((task) => this.checkConversationStatus(task)));
+    } finally {
+      this.conversationStatusPollBusy = false;
+    }
+  }
+
+  async checkConversationStatus(task = this.activeTask) {
+    if (!(this.conversationStatusBusy instanceof Set)) this.conversationStatusBusy = new Set();
+    const taskKey = task?.taskId?.toLowerCase?.() || null;
+    if (!taskKey || this.conversationStatusBusy.has(taskKey) || !task || task.state !== 'submitted'
       || task.chatStatus === 'completed' || task.chatStatus === 'failed'
       || this.view.webContents.isDestroyed()) {
       return null;
     }
-    this.conversationStatusBusy = true;
+    this.conversationStatusBusy.add(taskKey);
     try {
       const conversationId = this.discoverConversationId
         ? await this.discoverConversationId(task)
         : task.conversationId || conversationIdFromRouteUrl(this.view.webContents.getURL?.() || '');
       if (!conversationId) return null;
-      const result = await this.view.webContents.executeJavaScript(
-        buildConversationStatusScript(conversationId),
-        true,
-      ).catch(() => ({ ok: false }));
+      const result = this.fetchConversationStatus
+        ? await this.fetchConversationStatus(conversationId)
+        : await this.view.webContents.executeJavaScript(
+          buildConversationStatusScript(conversationId),
+          true,
+        ).catch(() => ({ ok: false }));
       if (!result?.ok || !result.status) return result;
 
       const nextChatStatus = normalizeConversationStreamStatus(result.status);
-      const currentTask = this.activeTask?.taskId === task.taskId ? this.activeTask : task;
+      const currentTask = this.knownTasks.get(taskKey)
+        || (this.activeTask?.taskId === task.taskId ? this.activeTask : task);
+      if (currentTask.state !== 'submitted') return result;
       const changed = currentTask.chatStatus !== nextChatStatus || currentTask.chatStatusRaw !== result.status;
       if (!changed) return result;
 
@@ -1858,7 +2950,7 @@ class ChatGPTView {
       };
       const saved = await this.taskService.updateTask(task.taskId, update);
       if (this.activeTask?.taskId === task.taskId) this.activeTask = saved;
-      this.knownTasks.set(task.taskId.toLowerCase(), saved);
+      this.knownTasks.set(taskKey, saved);
       await this.onEvent({
         type: 'task-chat-status',
         task: saved,
@@ -1873,7 +2965,7 @@ class ChatGPTView {
       });
       return result;
     } finally {
-      this.conversationStatusBusy = false;
+      this.conversationStatusBusy.delete(taskKey);
     }
   }
 
@@ -2074,6 +3166,7 @@ class ChatGPTView {
 
 module.exports = {
   CHATGPT_URL,
+  CHATGPT_ALLOWED_HOSTS,
   ChatGPTView,
   buildTaskConfigurationScript,
   chatGPTProjectUrl,
@@ -2082,12 +3175,19 @@ module.exports = {
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   buildConversationStatusScript,
+  conversationStreamStatusUrl,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
+  isAllowedChatGPTUrl,
   isDismissibleLimitNotice,
+  chatMessageText,
+  normalizeChatSendRequest,
+  normalizeChatConversation,
+  normalizeChatConversationId,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
+  isRetryableChatStatus,
   rewriteConversationRequestBody,
   taskRequestConfiguration,
   mergeTreeId,

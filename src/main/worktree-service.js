@@ -6,6 +6,55 @@ const { fingerprintRepository, inspectRepository, runGit, slugify } = require('.
 const MERGE_RESULT_START = 'PATCHWORK_MERGE_V1';
 const MERGE_RESULT_END = 'PATCHWORK_MERGE_END';
 const CHATGPT_PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9_-]+$/;
+const WORKTREE_STORE_SCHEMA_VERSION = 1;
+
+async function atomicWriteFile(targetPath, contents) {
+  const directory = path.dirname(targetPath);
+  const filename = path.basename(targetPath);
+  const temporaryPath = path.join(
+    directory,
+    `.${filename}.${process.pid}.${crypto.randomUUID()}.tmp`,
+  );
+  let handle = null;
+  try {
+    handle = await fs.open(temporaryPath, 'w');
+    await handle.writeFile(contents);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(temporaryPath, targetPath);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+function normalizeWorktreeRecord(record = {}) {
+  const taskIds = Array.isArray(record.taskIds)
+    ? [...new Set(record.taskIds.map((id) => String(id || '').trim()).filter(Boolean))]
+    : [];
+  return {
+    ...record,
+    id: String(record.id || '').trim(),
+    name: String(record.name || '').trim(),
+    taskIds,
+    chatgptProject: record.chatgptProject ?? null,
+    mergeState: record.mergeState ?? null,
+    mergeConversationUrl: record.mergeConversationUrl ?? null,
+    managed: record.managed !== false,
+    discovered: record.discovered === true,
+  };
+}
+
+function normalizeWorktreeStore(value = {}) {
+  const records = Array.isArray(value) ? value : value?.worktrees;
+  return {
+    ...(value && typeof value === 'object' && !Array.isArray(value) ? value : {}),
+    schemaVersion: WORKTREE_STORE_SCHEMA_VERSION,
+    worktrees: (Array.isArray(records) ? records : []).map(normalizeWorktreeRecord),
+  };
+}
 
 function mergeResultFilename(treeId) {
   return `chatgpt-ide-merge-result-${treeId}.txt`;
@@ -111,18 +160,23 @@ class WorktreeService {
     try {
       await fs.access(this.recordsFile);
     } catch {
-      await fs.writeFile(this.recordsFile, '{"worktrees":[]}\n');
+      await this.writeRecords([]);
     }
   }
 
   async readRecords() {
     await this.initialize();
-    const value = JSON.parse(await fs.readFile(this.recordsFile, 'utf8'));
-    return Array.isArray(value.worktrees) ? value.worktrees : [];
+    const raw = await fs.readFile(this.recordsFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    const normalized = normalizeWorktreeStore(parsed);
+    if (JSON.stringify(parsed) !== JSON.stringify(normalized)) await this.writeRecords(normalized);
+    return normalized.worktrees;
   }
 
   async writeRecords(records) {
-    await fs.writeFile(this.recordsFile, `${JSON.stringify({ worktrees: records }, null, 2)}\n`);
+    const normalized = normalizeWorktreeStore(Array.isArray(records) ? { worktrees: records } : records);
+    await atomicWriteFile(this.recordsFile, `${JSON.stringify(normalized, null, 2)}\n`);
+    return normalized.worktrees;
   }
 
   async get(treeId) {
@@ -572,6 +626,7 @@ class WorktreeService {
 }
 
 module.exports = {
+  WORKTREE_STORE_SCHEMA_VERSION,
   WorktreeService,
   mergeResultFilename,
   parseMergeResult,
