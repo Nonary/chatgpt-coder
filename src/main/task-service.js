@@ -188,6 +188,21 @@ function addStoredLocalFile(zip, localPath, archiveDirectory) {
   if (entry) entry.header.method = 0;
 }
 
+async function resolveTreeTaskRepositories(tree, selectedRepositories = []) {
+  const treePath = await fs.realpath(tree.path);
+  const sourcePath = await fs.realpath(tree.repositoryPath);
+  const repositories = [{ path: treePath }];
+  const seen = new Set([treePath, sourcePath]);
+  for (const repository of selectedRepositories) {
+    if (!repository?.path) continue;
+    const repositoryPath = await fs.realpath(repository.path);
+    if (seen.has(repositoryPath)) continue;
+    seen.add(repositoryPath);
+    repositories.push({ path: repositoryPath, readOnly: true });
+  }
+  return repositories;
+}
+
 function conflictMarkdown(context, patchFiles) {
   const files = context.files?.length
     ? context.files.map((file) => `- \`${file}\``).join('\n')
@@ -539,4 +554,5 @@ module.exports = {
   buildHandoffPrompt,
   DEFAULT_GIT_SUMMARY_PROMPT,
   resolveGitSummaryPrompt,
+  resolveTreeTaskRepositories,
 };

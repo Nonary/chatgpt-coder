@@ -5,7 +5,7 @@ const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view')
 const { GitService } = require('./git-service');
 const { ResultService } = require('./result-service');
 const { SkillService } = require('./skill-service');
-const { resolveGitSummaryPrompt, TaskService } = require('./task-service');
+const { resolveGitSummaryPrompt, resolveTreeTaskRepositories, TaskService } = require('./task-service');
 const { validateCommitMessage, WorktreeService } = require('./worktree-service');
 
 const HEADLESS = process.env.PATCHWORK_HEADLESS === '1';
@@ -307,6 +307,8 @@ function registerIpc() {
       throw new Error('Describe the software task before creating a task package.');
     }
     let tree = null;
+    let taskRepositories = input.repositories;
+    let skillsResolved = false;
     let skillRepositoryPaths = Array.isArray(input.repositories)
       ? input.repositories.map((item) => item.path)
       : [];
@@ -315,20 +317,24 @@ function registerIpc() {
       const inspected = await worktreeService.inspect(tree);
       if (!inspected.available) throw new Error(inspected.error);
       if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
-      skillRepositoryPaths = [tree.path];
     } else if (input.createTree) {
-      if (!Array.isArray(input.repositories) || input.repositories.length !== 1) {
-        throw new Error('Choose exactly one repository when creating a coding tree.');
+      if (!Array.isArray(input.repositories) || input.repositories.length === 0) {
+        throw new Error('Choose at least one repository when creating a coding tree.');
       }
       await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
+      skillsResolved = true;
       const suggestedName = String(input.treeName || input.taskText || '').split('\n')[0].trim();
       tree = await worktreeService.create(input.repositories[0].path, suggestedName);
     }
-    if (!input.createTree) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
+    if (tree) {
+      taskRepositories = await resolveTreeTaskRepositories(tree, input.repositories);
+      skillRepositoryPaths = taskRepositories.map((item) => item.path);
+    }
+    if (!skillsResolved) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
     const task = await taskService.createTask({
       ...input,
       skillRepositoryPaths,
-      repositories: tree ? [{ path: tree.path }] : input.repositories,
+      repositories: taskRepositories,
       tree,
       autoApply: true,
     });

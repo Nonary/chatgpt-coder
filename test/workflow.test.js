@@ -32,7 +32,12 @@ const { fingerprintRepository, runGit } = require('../src/main/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/main/git-service');
 const { ResultService, parsePlainTextResult } = require('../src/main/result-service');
 const { SkillService } = require('../src/main/skill-service');
-const { DEFAULT_GIT_SUMMARY_PROMPT, resolveGitSummaryPrompt, TaskService } = require('../src/main/task-service');
+const {
+  DEFAULT_GIT_SUMMARY_PROMPT,
+  resolveGitSummaryPrompt,
+  resolveTreeTaskRepositories,
+  TaskService,
+} = require('../src/main/task-service');
 const {
   WorktreeService,
   mergeResultFilename,
@@ -246,6 +251,8 @@ test('tasks can package multiple repositories into one ZIP', async (context) => 
   await fs.writeFile(path.join(secondRepositoryPath, 'other.txt'), 'other repository\n');
   await runGit(secondRepositoryPath, ['add', 'other.txt']);
   await runGit(secondRepositoryPath, ['commit', '-m', 'Initial commit']);
+  await fs.writeFile(path.join(secondRepositoryPath, 'other.txt'), 'updated other repository\n');
+  await fs.writeFile(path.join(secondRepositoryPath, 'untracked.txt'), 'untracked context\n');
 
   const tasks = new TaskService(path.join(root, 'data'));
   await tasks.initialize();
@@ -270,6 +277,57 @@ test('tasks can package multiple repositories into one ZIP', async (context) => 
     const stored = await fs.readFile(path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`));
     assert.deepEqual(entry.getData(), stored);
   }
+
+  for (const repository of manifest.repositories) {
+    const clonePath = path.join(root, `clone-${repository.id}`);
+    await runGit(root, [
+      'clone', '--no-checkout',
+      path.join(tasks.taskDirectory(task.taskId), repository.bundleFile),
+      clonePath,
+    ]);
+    await runGit(clonePath, ['checkout', '-b', `patchwork/${task.taskId}`, repository.baseCommit]);
+    const { stdout: clonedHead } = await runGit(clonePath, ['rev-parse', 'HEAD']);
+    assert.equal(clonedHead.trim(), repository.baseCommit);
+  }
+  assert.equal(await fs.readFile(path.join(root, `clone-${repositories[1].id}`, 'other.txt'), 'utf8'), 'updated other repository\n');
+  assert.equal(await fs.readFile(path.join(root, `clone-${repositories[1].id}`, 'untracked.txt'), 'utf8'), 'untracked context\n');
+});
+
+test('coding-tree tasks keep additional selected repositories as read-only context', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-context-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourcePath = await createRepository(root);
+  const contextPath = await createRepository(path.join(root, 'context-root'));
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+  const tree = await trees.create(sourcePath, 'Multi-repository task');
+
+  const repositories = await resolveTreeTaskRepositories(tree, [
+    { path: sourcePath },
+    { path: contextPath },
+    { path: contextPath },
+  ]);
+
+  assert.deepEqual(repositories, [
+    { path: await fs.realpath(tree.path) },
+    { path: await fs.realpath(contextPath), readOnly: true },
+  ]);
+  const task = await tasks.createTask({
+    taskText: 'Update the tree while referencing the context repository.',
+    repositories,
+    tree,
+  });
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.repositories.length, 2);
+  assert.equal(manifest.repositories[0].readOnly, false);
+  assert.equal(manifest.repositories[1].readOnly, true);
+  for (const repository of manifest.repositories) assert.ok(archive.getEntry(repository.bundleFile));
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(appSource, /resolveTreeTaskRepositories\(tree, input\.repositories\)/);
+  assert.doesNotMatch(appSource, /repositories: tree \? \[\{ path: tree\.path \}\]/);
 });
 
 test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {

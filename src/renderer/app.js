@@ -535,15 +535,31 @@ function addActivity(message, timestamp = new Date()) {
 function renderRepositories() {
   const container = elements['repository-list'];
   const selectedTree = state.trees.find((tree) => tree.id === elements['task-tree-select'].value);
-  elements['add-repository-button'].disabled = Boolean(selectedTree);
   if (selectedTree) {
+    const contextRepositories = state.repositories.filter((repository) => (
+      repository.path !== selectedTree.path && repository.path !== selectedTree.repositoryPath
+    ));
     container.className = 'repository-list';
     container.innerHTML = `<div class="repository-row">
       <div class="repo-icon">${escapeHtml(selectedTree.repositoryName[0]?.toUpperCase() || 'G')}</div>
       <div class="repo-info"><strong>${escapeHtml(selectedTree.repositoryName)}</strong><span>${escapeHtml(selectedTree.path)}</span></div>
       <div class="repo-meta">${escapeHtml(selectedTree.branch)}</div>
-      <div class="repo-state">Attached tree</div>
-    </div>`;
+      <div class="repo-state">Writable tree</div>
+    </div>${contextRepositories.map((repository) => `
+      <div class="repository-row">
+        <div class="repo-icon">${escapeHtml(repository.name[0]?.toUpperCase() || 'G')}</div>
+        <div class="repo-info"><strong>${escapeHtml(repository.name)}</strong><span>${escapeHtml(repository.path)}</span></div>
+        <div class="repo-meta">${escapeHtml(repository.branch)} · ${repository.hasHead ? escapeHtml(shortCommit(repository.baseCommit)) : 'No commits'}</div>
+        <div class="repo-state">Read-only context</div>
+        <button class="remove-repo" data-repository-id="${escapeHtml(repository.id)}" aria-label="Remove ${escapeHtml(repository.name)}">×</button>
+      </div>`).join('')}`;
+    container.querySelectorAll('.remove-repo').forEach((button) => {
+      button.addEventListener('click', () => {
+        state.repositories = state.repositories.filter((item) => item.id !== button.dataset.repositoryId);
+        resetTaskSkills();
+        renderRepositories();
+      });
+    });
     return;
   }
   if (state.repositories.length === 0) {
@@ -602,7 +618,14 @@ function taskSkillRepositoryPaths() {
   const selectedTarget = elements['task-tree-select'].value;
   if (selectedTarget && selectedTarget !== TASK_NEW_TREE_VALUE) {
     const tree = state.trees.find((item) => item.id === selectedTarget);
-    if (tree?.path) return [tree.path];
+    if (tree?.path) {
+      return [
+        tree.path,
+        ...state.repositories
+          .filter((repository) => repository.path !== tree.path && repository.path !== tree.repositoryPath)
+          .map((repository) => repository.path),
+      ];
+    }
   }
   return state.repositories.map((repository) => repository.path).filter(Boolean);
 }
