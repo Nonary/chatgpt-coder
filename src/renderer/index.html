@@ -329,6 +329,17 @@
                 <button id="configure-skills-button" class="secondary" type="button"><span id="skill-selection-label">Choose skills</span></button>
               </div>
               <div id="skill-selection-summary" class="skill-selection-summary hidden" aria-live="polite"></div>
+              <div class="task-option-picker">
+                <div>
+                  <strong>Infrastructure context</strong>
+                  <small>Optionally include configured IaC repositories as read-only context for ChatGPT.</small>
+                </div>
+                <label class="toggle-row task-option-toggle" title="Include configured IaC repositories">
+                  <input id="include-iac" type="checkbox" />
+                  <span class="toggle"><span></span></span>
+                </label>
+              </div>
+              <p id="iac-selection-summary" class="field-help" aria-live="polite"></p>
               <div class="attachment-picker">
                 <div>
                   <strong>Task attachments</strong>

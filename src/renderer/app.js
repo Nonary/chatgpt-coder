@@ -5,6 +5,8 @@ const state = {
   trees: [],
   activeTask: null,
   activity: [],
+  iacConfig: null,
+  includeIac: false,
   gitStatus: null,
   selectedGitPath: null,
   selectedDiffKey: null,
@@ -27,6 +29,7 @@ const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
 const TASK_REASONING_STORAGE_KEY = 'patchwork.task-reasoning';
 const TASK_TREE_STORAGE_KEY = 'patchwork.task-tree';
 const TASK_PROJECT_STORAGE_KEY = 'patchwork.task-project';
+const TASK_IAC_STORAGE_KEY = 'patchwork.task-iac';
 const PROMPT_LIBRARY_STORAGE_KEY = 'patchwork.prompt-library';
 const TASK_NEW_TREE_VALUE = '__new__';
 const MAX_PROMPTS = 100;
@@ -41,6 +44,7 @@ const elements = Object.fromEntries(
     'task-history-search', 'task-history-state',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
     'add-attachment-button', 'attachment-list', 'configure-skills-button', 'skill-selection-label', 'skill-selection-summary',
+    'include-iac', 'iac-selection-summary',
     'skills-modal', 'skills-close-button', 'skills-refresh-button', 'skills-search', 'skills-list', 'skills-selection-status', 'skills-done-button',
     'prompt-library-trigger', 'prompt-library-trigger-label', 'prompt-selection-summary', 'prompt-library-menu',
     'prompt-library-manage-button', 'prompt-library-new-button', 'prompt-library-search', 'prompt-library-list', 'prompt-library-menu-status',
@@ -132,6 +136,70 @@ function restoreTaskReasoningSelection() {
 
 function persistTaskReasoningSelection(event) {
   persistTaskSelectSelection(event.target, TASK_REASONING_STORAGE_KEY);
+}
+
+function readTaskIacPreference() {
+  try {
+    return localStorage.getItem(TASK_IAC_STORAGE_KEY) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function persistTaskIacSelection() {
+  try {
+    localStorage.setItem(TASK_IAC_STORAGE_KEY, String(state.includeIac));
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
+}
+
+function renderIacSelection() {
+  const toggle = elements['include-iac'];
+  const summary = elements['iac-selection-summary'];
+  if (!toggle || !summary) return;
+  const config = state.iacConfig;
+  const selectors = Array.isArray(config?.selectors) ? config.selectors.filter((item) => String(item).trim()) : [];
+  const available = Boolean(config?.exists && config?.valid && selectors.length > 0);
+  toggle.disabled = !available;
+  toggle.checked = Boolean(state.includeIac && available);
+  summary.classList.remove('error');
+  if (!config) {
+    summary.textContent = 'Checking IaC settings…';
+    return;
+  }
+  if (!config.valid) {
+    summary.classList.add('error');
+    summary.textContent = `IaC settings error: ${config.error || 'Invalid settings.json'}`;
+    return;
+  }
+  if (!config.exists) {
+    summary.textContent = `No settings.json found at ${config.settingsPath}. Copy settings.example.json to create it.`;
+    return;
+  }
+  if (!selectors.length) {
+    summary.textContent = `No iac_urls are configured in ${config.settingsPath}.`;
+    return;
+  }
+  summary.textContent = `${selectors.length} IaC repository${selectors.length === 1 ? '' : 'ies'} configured in ${config.settingsPath}. Included repositories are packaged as read-only context.`;
+}
+
+async function refreshIacConfig() {
+  try {
+    state.iacConfig = await window.patchwork.getIacConfig();
+  } catch (error) {
+    state.iacConfig = {
+      settingsPath: 'settings.json',
+      exists: false,
+      valid: false,
+      selectors: [],
+      error: error.message,
+    };
+  }
+  const config = state.iacConfig;
+  const selectors = Array.isArray(config?.selectors) ? config.selectors.filter((item) => String(item).trim()) : [];
+  state.includeIac = Boolean(readTaskIacPreference() && config?.exists && config?.valid && selectors.length);
+  renderIacSelection();
 }
 
 function createPromptId() {
@@ -1303,7 +1371,11 @@ function taskConfigurationLabel(task) {
   };
   const skillCount = Array.isArray(task.skills) ? task.skills.length : 0;
   const skills = skillCount ? ` · ${skillCount} skill${skillCount === 1 ? '' : 's'}` : '';
-  return `${models[task.model || 'default'] || task.model} · ${reasoning[task.reasoningMode || 'default'] || task.reasoningMode}${skills}`;
+  const iacCount = Array.isArray(task.iac_repos)
+    ? task.iac_repos.filter((repository) => repository.status === 'bundled').length
+    : 0;
+  const iac = iacCount ? ` · ${iacCount} IaC` : '';
+  return `${models[task.model || 'default'] || task.model} · ${reasoning[task.reasoningMode || 'default'] || task.reasoningMode}${skills}${iac}`;
 }
 
 function renderResult(task) {
@@ -1355,6 +1427,12 @@ function showTask(task) {
   if (task.skills?.length) {
     addActivity(`${task.skills.length} selected skill${task.skills.length === 1 ? '' : 's'} included`, task.createdAt);
   }
+  const iacCount = Array.isArray(task.iac_repos)
+    ? task.iac_repos.filter((repository) => repository.status === 'bundled').length
+    : 0;
+  if (iacCount) {
+    addActivity(`${iacCount} IaC reference repositor${iacCount === 1 ? 'y' : 'ies'} included as read-only context`, task.createdAt);
+  }
   if (task.chatgptProject?.name) {
     addActivity(`ChatGPT project: ${task.chatgptProject.name}`, task.createdAt);
   }
@@ -1392,6 +1470,7 @@ function showComposer() {
   restoreTaskReasoningSelection();
   restoreTaskProjectSelection();
   restoreTaskTreeSelection();
+  refreshIacConfig().catch((error) => showToast(error.message, true));
   renderTaskTargetOptions(null);
   renderChatGPTProjects();
   refreshChatGPTProjects().catch(() => {});
@@ -1979,6 +2058,7 @@ async function createTask() {
       model: elements['task-model-select'].value,
       reasoningMode: elements['task-reasoning-select'].value,
       skillIds: [...state.selectedSkillIds],
+      includeIac: state.includeIac,
       autoApply: true,
       treeId: elements['task-tree-select'].value && elements['task-tree-select'].value !== TASK_NEW_TREE_VALUE
         ? elements['task-tree-select'].value
@@ -2091,6 +2171,11 @@ elements['trees-refresh-projects-button'].addEventListener('click', () => refres
 elements['add-repository-button'].addEventListener('click', chooseRepositories);
 elements['add-attachment-button'].addEventListener('click', chooseAttachments);
 elements['configure-skills-button'].addEventListener('click', openSkillDrawer);
+elements['include-iac'].addEventListener('change', (event) => {
+  state.includeIac = Boolean(event.target.checked);
+  persistTaskIacSelection();
+  renderIacSelection();
+});
 elements['skills-close-button'].addEventListener('click', closeSkillDrawer);
 elements['skills-done-button'].addEventListener('click', closeSkillDrawer);
 elements['skills-refresh-button'].addEventListener('click', () => refreshSkillCatalog(true));
@@ -2288,15 +2373,20 @@ window.patchwork.onTaskEvent((event) => {
 
 async function initialize() {
   try {
-    const [tasks, repositories, trees] = await Promise.all([
+    const [tasks, repositories, trees, iacConfig] = await Promise.all([
       window.patchwork.listTasks(),
       window.patchwork.listWorkspaceRepositories(),
       window.patchwork.listTrees(),
+      window.patchwork.getIacConfig(),
     ]);
     state.tasks = tasks;
     state.trees = trees;
     state.workspaceRepositories = repositories;
     state.repositories = repositories.filter((repository) => !repository.unavailable).slice(0, 1);
+    state.iacConfig = iacConfig;
+    state.includeIac = Boolean(readTaskIacPreference() && iacConfig?.exists && iacConfig?.valid
+      && Array.isArray(iacConfig?.selectors) && iacConfig.selectors.some((item) => String(item).trim()));
+    renderIacSelection();
     restoreTaskModelSelection();
     restoreTaskReasoningSelection();
     restoreTaskProjectSelection();

@@ -30,6 +30,7 @@ const {
 } = require('../src/main/chatgpt-view');
 const { fingerprintRepository, runGit } = require('../src/main/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/main/git-service');
+const { IacService } = require('../src/main/iac-service');
 const { ResultService, parsePlainTextResult } = require('../src/main/result-service');
 const { SkillService } = require('../src/main/skill-service');
 const {
@@ -328,6 +329,130 @@ test('coding-tree tasks keep additional selected repositories as read-only conte
   const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
   assert.match(appSource, /resolveTreeTaskRepositories\(tree, input\.repositories\)/);
   assert.doesNotMatch(appSource, /repositories: tree \? \[\{ path: tree\.path \}\]/);
+});
+
+test('tasks can include configured IaC repositories as read-only bundle context', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-context-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const iacRepositoryPath = await createRepository(path.join(root, 'iac-root'));
+  const settingsPath = path.join(root, 'settings.json');
+  await fs.writeFile(settingsPath, `${JSON.stringify({ iac_urls: [iacRepositoryPath] }, null, 2)}\n`);
+
+  const tasks = new TaskService(
+    path.join(root, 'data'),
+    undefined,
+    new IacService({ settingsPath }),
+  );
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Use the infrastructure repository as read-only deployment context.',
+    repositories: [repository],
+    includeIac: true,
+  });
+
+  assert.equal(task.includeIac, true);
+  assert.equal(task.includes_iac_repos, true);
+  assert.equal(task.iac_repos.length, 1);
+  assert.equal(task.repositories.length, 1);
+  assert.equal(task.iac_repos[0].readOnly, true);
+  assert.equal(task.iac_repos[0].status, 'bundled');
+  assert.equal(task.iac_repos[0].source, 'local_path');
+  assert.equal(task.iac_repos[0].source_path, iacRepositoryPath);
+  assert.match(task.iac_repos[0].bundle, /^iac\/sample-repository(?:-2)?\.bundle$/);
+
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.iac_settings_path, settingsPath);
+  assert.equal(manifest.iac_repos[0].bundle, task.iac_repos[0].bundle);
+  assert.ok(archive.getEntry(task.iac_repos[0].bundle));
+
+  const clonePath = path.join(root, 'iac-clone');
+  await runGit(root, ['clone', '--no-checkout', path.join(tasks.taskDirectory(task.taskId), task.iac_repos[0].bundle), clonePath]);
+  await runGit(clonePath, ['checkout', '-b', `patchwork/${task.taskId}`, task.iac_repos[0].baseCommit]);
+  const { stdout: clonedHead } = await runGit(clonePath, ['rev-parse', 'HEAD']);
+  assert.equal(clonedHead.trim(), task.iac_repos[0].baseCommit);
+  assert.equal(await fs.readFile(path.join(clonePath, 'hello.txt'), 'utf8'), 'hello\n');
+});
+
+test('IaC bundles preserve local working changes without making the IaC repository patchable', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-dirty-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const iacRepositoryPath = await createRepository(path.join(root, 'iac-root'));
+  await fs.writeFile(path.join(iacRepositoryPath, 'hello.txt'), 'iac working change\n');
+  await fs.writeFile(path.join(iacRepositoryPath, 'untracked.tf'), 'resource "demo" {}\n');
+  const settingsPath = path.join(root, 'settings.json');
+  await fs.writeFile(settingsPath, `${JSON.stringify({ iac_urls: [iacRepositoryPath] }, null, 2)}\n`);
+
+  const tasks = new TaskService(
+    path.join(root, 'data'),
+    undefined,
+    new IacService({ settingsPath }),
+  );
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Reference the current infrastructure working tree.',
+    repositories: [repository],
+    includeIac: true,
+  });
+
+  const iac = task.iac_repos[0];
+  assert.equal(iac.workingChanges, true);
+  assert.equal(iac.snapshot, true);
+  assert.match(iac.workingStatus, /hello\.txt|untracked\.tf/);
+
+  const clonePath = path.join(root, 'iac-dirty-clone');
+  await runGit(root, ['clone', '--no-checkout', path.join(tasks.taskDirectory(task.taskId), iac.bundle), clonePath]);
+  await runGit(clonePath, ['checkout', '-b', `patchwork/${task.taskId}`, iac.baseCommit]);
+  assert.equal(await fs.readFile(path.join(clonePath, 'hello.txt'), 'utf8'), 'iac working change\n');
+  assert.equal(await fs.readFile(path.join(clonePath, 'untracked.tf'), 'utf8'), 'resource "demo" {}\n');
+});
+
+test('IaC configuration stays opt-in and malformed settings are rejected', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-settings-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const settingsPath = path.join(root, 'settings.json');
+  const service = new IacService({ settingsPath });
+
+  assert.deepEqual(await service.getConfig(), {
+    settingsPath,
+    exists: false,
+    valid: true,
+    selectors: [],
+    error: null,
+  });
+
+  await fs.writeFile(settingsPath, JSON.stringify({ gitops_urls: ['~/ignored'] }));
+  const ignored = await service.getConfig();
+  assert.deepEqual(ignored.selectors, []);
+
+  await fs.writeFile(settingsPath, JSON.stringify({ iac_urls: ['path-a'] }));
+  const configured = await service.getConfig();
+  assert.deepEqual(configured.selectors, ['path-a']);
+
+  await fs.writeFile(settingsPath, JSON.stringify({ iac_urls: 'not-a-list' }));
+  await assert.rejects(service.resolveRepositories(path.join(root, 'clones')), /settings\.iac_urls must be a list of strings/);
+});
+
+test('IaC settings are exposed to the task composer and task handoff', async () => {
+  const [mainSource, preloadSource, rendererSource, markup, taskServiceSource] = await Promise.all([
+    fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/task-service.js'), 'utf8'),
+  ]);
+  assert.match(mainSource, /new IacService\(/);
+  assert.match(mainSource, /iac:config/);
+  assert.match(preloadSource, /getIacConfig/);
+  assert.match(rendererSource, /include-iac/);
+  assert.match(rendererSource, /includeIac: state\.includeIac/);
+  assert.match(markup, /id="include-iac"/);
+  assert.match(taskServiceSource, /manifest\.json\.iac_repos/);
+  assert.match(taskServiceSource, /read-only infrastructure context/);
 });
 
 test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {

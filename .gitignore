@@ -5,3 +5,5 @@ dist-*/
 release/
 *.log
 .DS_Store
+
+settings.json

@@ -3,6 +3,7 @@ const fs = require('node:fs/promises');
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
+const { IacService } = require('./iac-service');
 const { ResultService } = require('./result-service');
 const { SkillService } = require('./skill-service');
 const { resolveGitSummaryPrompt, resolveTreeTaskRepositories, TaskService } = require('./task-service');
@@ -22,6 +23,7 @@ let taskService;
 let gitService;
 let resultService;
 let skillService;
+let iacService;
 let worktreeService;
 let chatGPTView;
 
@@ -127,6 +129,7 @@ function registerIpc() {
     const skills = await skillService.discover(Array.isArray(repositoryPaths) ? repositoryPaths : []);
     return skills.map(({ sourcePath, skillFile, ...skill }) => skill);
   });
+  ipcMain.handle('iac:config', async () => iacService.getConfig());
 
   ipcMain.handle('attachments:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
@@ -526,7 +529,10 @@ function registerIpc() {
 app.whenReady().then(async () => {
   const dataRoot = path.join(app.getPath('userData'), 'patchwork');
   skillService = new SkillService();
-  taskService = new TaskService(dataRoot, skillService);
+  iacService = new IacService({
+    settingsPath: process.env.PATCHWORK_IAC_SETTINGS || path.join(app.getAppPath(), 'settings.json'),
+  });
+  taskService = new TaskService(dataRoot, skillService, iacService);
   await taskService.initialize();
   gitService = new GitService(dataRoot);
   await gitService.initialize();

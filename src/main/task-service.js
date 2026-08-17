@@ -1,5 +1,6 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const AdmZip = require('adm-zip');
 const {
@@ -7,7 +8,9 @@ const {
   createSnapshotBundle,
   createWorkingSnapshotBundle,
   inspectRepository,
+  runGit,
 } = require('./git');
+const { IacService } = require('./iac-service');
 const { SkillService } = require('./skill-service');
 
 const SCHEMA_VERSION = 1;
@@ -65,6 +68,7 @@ function normalizeReasoningMode(value) {
 function buildAgentInstructions(taskId, skills = [], options = {}) {
   const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
   const summaryOnly = Boolean(options.summaryOnly);
+  const includeIac = Boolean(options.includeIac);
   const skillInstructions = skills.length
     ? `## Optional task skills
 
@@ -88,7 +92,8 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Extrac
 3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`. Some repositories are read-only context: you may inspect them, but never edit them.
 4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
-6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.
+6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.${includeIac ? `
+7. If \`manifest.json.iac_repos\` is present, treat every entry with a \`bundleFile\` as read-only infrastructure context. Clone each IaC bundle from \`iac/<...>\` into \`workspace/iac/<id>\`, check out its supplied \`baseCommit\`, and verify \`git rev-parse HEAD\`. Do not edit IaC repositories and never include IaC paths in returned result patches; entries without a bundle were skipped during packaging.` : ''}
 
 ## Inspect supplied working changes
 
@@ -157,16 +162,20 @@ ${summaryOnly ? 'For this read-only Git summary task, set `commitMessage` to the
 
 function buildHandoffPrompt(taskId, taskText, attachments = [], skills = [], options = {}) {
   const summaryOnly = Boolean(options.summaryOnly);
+  const includeIac = Boolean(options.includeIac);
   const attachmentNote = attachments.length
     ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
     : '';
   const skillNote = skills.length
     ? `\n\nThe task ZIP also includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under \`skills/\`. Use or invoke a selected skill only when it is relevant to the task, and do not load unrelated skills.`
     : '\n\nThe task ZIP may include selected local skills under \`skills/\`. Use or invoke them only when they are relevant to the task.';
+  const iacNote = includeIac
+    ? '\n\nThe task package may also contain read-only infrastructure-as-code Git bundles under `iac/`. Use those repositories for deployment and platform context, but do not edit them or include them in result patches.'
+    : '';
   if (summaryOnly) {
-    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the generated Conventional Commit message in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}\n\nGit Summary instructions:\n${taskText}`;
+    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the generated Conventional Commit message in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nGit Summary instructions:\n${taskText}`;
   }
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}\n\nTask summary:\n${taskText}\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nTask summary:\n${taskText}\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
 }
 
 function uniqueAttachmentName(filename, usedNames) {
@@ -231,10 +240,11 @@ The bundled repository base captures the selected repository exactly as it exist
 }
 
 class TaskService {
-  constructor(dataRoot, skillService = new SkillService()) {
+  constructor(dataRoot, skillService = new SkillService(), iacService = new IacService()) {
     this.dataRoot = dataRoot;
     this.tasksRoot = path.join(dataRoot, 'tasks');
     this.skillService = skillService;
+    this.iacService = iacService;
   }
 
   async initialize() {
@@ -249,6 +259,150 @@ class TaskService {
     const repositories = await Promise.all(selectedPaths.map(inspectRepository));
     const unique = new Map(repositories.map((repository) => [repository.path, repository]));
     return [...unique.values()];
+  }
+
+  async packageIacRepositories(taskDir, includeIac) {
+    if (!includeIac) {
+      return {
+        includesIacRepositories: false,
+        settingsPath: this.iacService.settingsPath,
+        repositories: [],
+      };
+    }
+
+    const scratchRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-'));
+    try {
+      const resolved = await this.iacService.resolveRepositories(path.join(scratchRoot, 'clones'));
+      if (!resolved.exists) {
+        return {
+          includesIacRepositories: false,
+          settingsPath: resolved.settingsPath,
+          repositories: [],
+        };
+      }
+
+      const bundleDirectory = path.join(taskDir, 'iac');
+      await fs.mkdir(bundleDirectory, { recursive: true });
+      const usedBundleNames = new Set();
+      const publicRepositories = [];
+
+      for (const entry of resolved.repositories) {
+        if (entry.status !== 'ready') {
+          publicRepositories.push({
+            name: null,
+            selector: entry.selector,
+            source_path: entry.source_path || null,
+            sourcePath: entry.source_path || null,
+            source: entry.source || 'settings',
+            bundle: null,
+            bundleFile: null,
+            head: null,
+            baseCommit: null,
+            sourceHead: null,
+            branch: null,
+            snapshot: false,
+            workingChanges: false,
+            workingStatus: '',
+            readOnly: true,
+            status: entry.status,
+          });
+          continue;
+        }
+
+        const repository = await inspectRepository(entry.source_path);
+        const baseName = repository.name
+          .normalize('NFKD')
+          .replace(/[^a-zA-Z0-9._-]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .toLowerCase() || 'iac-repo';
+        let bundleName = `${baseName}.bundle`;
+        let suffix = 2;
+        while (usedBundleNames.has(bundleName)) {
+          bundleName = `${baseName}-${suffix}.bundle`;
+          suffix += 1;
+        }
+        usedBundleNames.add(bundleName);
+
+        const bundleFile = `iac/${bundleName}`;
+        const bundlePath = path.join(taskDir, bundleFile);
+        let taskRepository;
+        if (repository.hasHead && repository.isClean) {
+          await createBundle(repository, bundlePath);
+          taskRepository = {
+            ...repository,
+            sourceHead: repository.baseCommit,
+            isSnapshot: false,
+            snapshotFingerprint: null,
+            workingChanges: false,
+            workingStatus: '',
+          };
+        } else if (repository.hasHead) {
+          const snapshotPath = path.join(scratchRoot, 'snapshots', repository.id);
+          try {
+            const snapshot = await createWorkingSnapshotBundle(repository, snapshotPath, bundlePath);
+            taskRepository = {
+              ...repository,
+              sourceHead: repository.baseCommit,
+              baseCommit: snapshot.baseCommit,
+              isSnapshot: true,
+              snapshotFingerprint: snapshot.snapshotFingerprint,
+              workingChanges: true,
+              workingStatus: repository.statusSummary,
+            };
+          } finally {
+            await fs.rm(snapshotPath, { recursive: true, force: true });
+          }
+        } else {
+          const snapshotPath = path.join(scratchRoot, 'snapshots', repository.id);
+          try {
+            const snapshot = await createSnapshotBundle(repository, snapshotPath, bundlePath);
+            taskRepository = {
+              ...repository,
+              sourceHead: repository.baseCommit,
+              baseCommit: snapshot.baseCommit,
+              isSnapshot: true,
+              snapshotFingerprint: snapshot.snapshotFingerprint,
+              workingChanges: true,
+              workingStatus: repository.statusSummary,
+            };
+          } finally {
+            await fs.rm(snapshotPath, { recursive: true, force: true });
+          }
+        }
+
+        const origin = await runGit(repository.path, ['remote', 'get-url', 'origin'])
+          .then(({ stdout }) => stdout.trim() || null)
+          .catch(() => null);
+        publicRepositories.push({
+          id: repository.id,
+          name: repository.name,
+          selector: entry.selector,
+          source_path: entry.source === 'local_path' ? entry.source_path : null,
+          sourcePath: entry.source === 'local_path' ? entry.source_path : null,
+          source: entry.source,
+          origin,
+          branch: taskRepository.branch,
+          head: taskRepository.baseCommit,
+          baseCommit: taskRepository.baseCommit,
+          sourceHead: taskRepository.sourceHead,
+          snapshot: taskRepository.isSnapshot,
+          workingChanges: taskRepository.workingChanges,
+          workingStatus: taskRepository.workingStatus,
+          bundle: bundleFile,
+          bundleFile,
+          readOnly: true,
+          status: 'bundled',
+        });
+      }
+
+      return {
+        includesIacRepositories: true,
+        settingsPath: resolved.settingsPath,
+        repositories: publicRepositories,
+      };
+    } finally {
+      await fs.rm(scratchRoot, { recursive: true, force: true });
+    }
   }
 
   async createTask(input) {
@@ -397,6 +551,8 @@ class TaskService {
       });
     }
 
+    const iacPackage = await this.packageIacRepositories(taskDir, Boolean(input.includeIac));
+
     const summaryOnly = Boolean(input.summaryOnly);
     const createdAt = new Date().toISOString();
     const packageAttachments = attachments.map(({ name, size }) => ({
@@ -410,11 +566,18 @@ class TaskService {
       taskId,
       createdAt,
       repositories: publicRepositories,
+      includesIacRepositories: iacPackage.includesIacRepositories,
+      iacSettingsPath: iacPackage.includesIacRepositories ? iacPackage.settingsPath : null,
+      includes_iac_repos: iacPackage.includesIacRepositories,
+      iac_repos: iacPackage.repositories,
       attachments: packageAttachments,
       skills: packageSkills,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
-    const agentInstructions = buildAgentInstructions(taskId, packageSkills, { summaryOnly });
+    const agentInstructions = buildAgentInstructions(taskId, packageSkills, {
+      summaryOnly,
+      includeIac: Boolean(input.includeIac),
+    });
 
     await Promise.all([
       fs.writeFile(path.join(taskDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`),
@@ -431,6 +594,9 @@ class TaskService {
     for (const repository of publicRepositories) {
       addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'repositories');
     }
+    for (const repository of iacPackage.repositories) {
+      if (repository.bundleFile) addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'iac');
+    }
     for (const attachment of attachments) zip.addLocalFile(attachment.path, 'attachments');
     for (const skill of taskSkills) zip.addLocalFolder(skill.path, skill.directory);
     for (const patch of conflictPatchFiles) zip.addLocalFile(path.join(taskDir, patch.file), 'conflicts');
@@ -443,6 +609,7 @@ class TaskService {
       model,
       reasoningMode,
       skills: taskSkills,
+      includeIac: Boolean(input.includeIac),
       autoApply: input.autoApply !== false,
       summaryOnly,
       transport: 'zip-git-bundle',
@@ -466,7 +633,10 @@ class TaskService {
       } : null,
       packagePath,
       attachments,
-      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments, packageSkills, { summaryOnly }),
+      handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments, packageSkills, {
+        summaryOnly,
+        includeIac: Boolean(input.includeIac),
+      }),
       repositories: taskRepositories,
       state: 'prepared',
       result: null,

@@ -1,0 +1,7 @@
+{
+  "iac_urls": [
+    "~/sources/platform-infra",
+    "https://github.com/your-org/terraform-prod.git",
+    "git@github.com:your-org/kubernetes-config.git"
+  ]
+}

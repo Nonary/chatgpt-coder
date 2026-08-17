@@ -42,6 +42,28 @@ The task composer keeps skills out of the main form. **Choose skills** opens a c
 
 The generated task instructions tell ChatGPT that skills may be present and to read or invoke a selected skill only when it is relevant to the task. Unrelated skills remain available in the package but should not be loaded just because they were selected.
 
+## Infrastructure context (IaC)
+
+Tasks can optionally include infrastructure-as-code repositories as read-only context, similar to the IaC support in the companion bundle tool. This is useful for Terraform, Pulumi, Kubernetes, Helm, GitOps, deployment configuration, and other platform repositories that explain how the application is operated.
+
+IaC repositories are opt-in. Copy `settings.example.json` to `settings.json` in the Patchwork checkout and list repository locations under `iac_urls`:
+
+```json
+{
+  "iac_urls": [
+    "~/sources/platform-infra",
+    "https://github.com/your-org/terraform-prod.git",
+    "git@github.com:your-org/kubernetes-config.git"
+  ]
+}
+```
+
+`iac_urls` accepts local paths, `file://` URLs, HTTPS Git URLs, and SSH-style Git URLs. Relative local paths resolve from `settings.json`, and environment variables plus `~` are expanded. Remote repositories are cloned to a temporary directory while the task ZIP is prepared, then included under `iac/` as Git bundles.
+
+Enable **Infrastructure context** in the task composer when the configured IaC repositories should be included. The generated `manifest.json` records them in `iac_repos` and marks the included repositories as read-only. They are provided for context only and are never part of result patches or Patchwork's apply target.
+
+For packaged installs where the bundled application directory does not contain `settings.json`, set `PATCHWORK_IAC_SETTINGS` to an explicit settings file path.
+
 ## Prompt library
 
 The task composer includes a local **Prompt library** dropdown directly below model selection. Saved prompts have a name, short description, and reusable instruction text. Multiple prompts can be selected for a task, removed from the selection as chips, and managed from the prompt library drawer. The instruction text is appended to the task only when selected, and the saved library stays local to the Patchwork installation. A saved prompt named **Git Summary** is also used by Source control's AI summary action.
@@ -50,8 +72,8 @@ The task composer includes a local **Prompt library** dropdown directly below mo
 
 1. Patchwork opens directly to the embedded ChatGPT session. Sign in there before creating a task; the persistent session is reused afterward.
 2. Choose **New task**, then use the current working changes from one or more Git repositories, create a coding tree from one clean, committed Git repository, or attach the task to an existing tree. The task target, model, reasoning mode, and ChatGPT project selection stay sticky between task selections and are restored after application restarts.
-3. Describe the software task, optionally select saved prompt instructions, local reference files, or skills, and choose where ChatGPT should launch it. A task can use a normal new chat, an existing ChatGPT project, or a newly created project. Patchwork copies attachments into the task record and embeds them in the task package under `attachments/`.
-4. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, and one Git bundle for each selected repository or coding tree under `repositories/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
+3. Describe the software task, optionally select saved prompt instructions, local reference files, skills, or configured IaC context, and choose where ChatGPT should launch it. A task can use a normal new chat, an existing ChatGPT project, or a newly created project. Patchwork copies attachments into the task record and embeds them in the task package under `attachments/`.
+4. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, one Git bundle for each selected repository or coding tree under `repositories/`, and any opted-in IaC bundles under `iac/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
 5. Patchwork opens the selected ChatGPT destination in the same embedded browser, injects the instructions, attaches the ZIP package plus any user-selected reference files, waits for the attachments to finish processing, and clicks ChatGPT's Send button.
 6. ChatGPT follows the embedded protocol and attaches `chatgpt-ide-result-<task-id>.txt`, containing a marked `PATCHWORK_RESULT_V1` JSON envelope with base64-encoded `git diff --binary` patches. The envelope is not printed in the chat.
 7. Patchwork's application-level monitor activates that exact download, reads the text file locally, verifies the task ID, repository set, base commits, size limits, and base64 integrity, then applies the patch to the task target. Coding-tree tasks also verify the Conventional Commit message and commit the patch. If the target's `HEAD` advanced, Patchwork first tries a clean contextual apply and then Git's three-way merge.
@@ -91,6 +113,7 @@ pnpm dist
 - Each result must name the original task and exact base commit.
 - Plain-text envelopes have strict markers, schemas, size limits, repository IDs, and base64-integrity checks. Legacy ZIP paths are treated as untrusted input and are never extracted wholesale.
 - All patches are checked before the first repository is modified.
+- IaC bundles are read-only context and are never accepted as result patch targets.
 - A multi-repository failure triggers a best-effort reversal of patches already applied.
 - Applied task changes are committed only on Patchwork worktree branches. Patchwork never pushes or rewrites published history.
 - Squash merging runs in a temporary worktree first and updates the original branch only by fast-forwarding the verified integration commit.

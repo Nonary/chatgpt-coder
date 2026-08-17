@@ -130,6 +130,8 @@ textarea::placeholder { color: #606659; }
 .task-option-picker strong { font-size: 11px; }
 .task-option-picker small { margin-top: 4px; color: #757c6f; font-size: 10px; line-height: 1.45; }
 .task-option-picker button { flex: 0 0 auto; }
+.task-option-picker .task-option-toggle { flex: 0 0 auto; margin-top: 0; align-items: center; }
+.task-option-picker .task-option-toggle .toggle { margin: 0; }
 .skill-selection-summary { display: flex; flex-wrap: wrap; gap: 5px; margin: -2px 0 4px; }
 .skill-selection-chip { max-width: 100%; padding: 5px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid #3a4133; border-radius: 999px; background: #20251c; color: #bfc6b7; font-size: 9px; }
 .skill-selection-chip.more { color: var(--accent); }
