@@ -17,6 +17,8 @@ const {
   buildTaskResultDetectionScript,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
+  isChatGPTAuthenticationCallbackUrl,
+  isChatGPTAuthenticationUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
   normalizeConversationStreamStatus,
@@ -64,6 +66,45 @@ test('Git Summary prompts use the saved prompt when present and the built-in pro
   assert.equal(resolveGitSummaryPrompt('\r\n'), DEFAULT_GIT_SUMMARY_PROMPT);
   assert.match(DEFAULT_GIT_SUMMARY_PROMPT, /Review all \*\*uncommitted Git changes\*\*/);
   assert.ok(DEFAULT_GIT_SUMMARY_PROMPT.includes('<type>(<optional-scope>): <concise summary>'));
+});
+
+test('ChatGPT authentication URLs and callbacks are identified safely', () => {
+  assert.equal(isChatGPTAuthenticationUrl('https://auth.openai.com/log-in'), true);
+  assert.equal(isChatGPTAuthenticationUrl('https://tenant.auth.openai.com/authorize'), true);
+  assert.equal(isChatGPTAuthenticationUrl('https://chatgpt.com/auth/login'), true);
+  assert.equal(isChatGPTAuthenticationUrl('https://chatgpt.com/c/1234'), false);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://chatgpt.com/api/auth/callback/openai?code=secret'), true);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://chatgpt.com/auth/callback?code=secret'), true);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://auth.openai.com/callback'), false);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://chatgpt.com/'), false);
+});
+
+test('Electron startup enables integrated authentication for the configured SSO host', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '..', 'src', 'main', 'app.js'), 'utf8');
+  assert.match(appSource, /PATCHWORK_AUTH_SERVER_ALLOWLIST/);
+  assert.match(appSource, /appendSwitch\('auth-server-allowlist'/);
+  assert.match(appSource, /appendSwitch\('auth-server-whitelist'/);
+});
+
+test('ChatGPT sign-in reset clears only the embedded browser partition and exposes a confirmed UI action', async () => {
+  const [viewSource, mainSource, preloadSource, rendererSource, htmlSource] = await Promise.all([
+    fs.readFile(path.join(__dirname, '..', 'src', 'main', 'chatgpt-view.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'main', 'app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'renderer', 'app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'renderer', 'index.html'), 'utf8'),
+  ]);
+  assert.match(viewSource, /async resetAuthentication\(\)/);
+  assert.match(viewSource, /clearAuthCache\(\)/);
+  assert.match(viewSource, /clearStorageData\(\)/);
+  assert.match(viewSource, /clearCache\(\)/);
+  assert.match(viewSource, /closeAllConnections\(\)/);
+  assert.match(viewSource, /navigationHistory\.clear\(\)/);
+  assert.match(viewSource, /loadURL\(CHATGPT_LOGIN_URL\)/);
+  assert.match(mainSource, /browser:reset-authentication/);
+  assert.match(preloadSource, /resetBrowserAuthentication/);
+  assert.match(rendererSource, /window\.confirm\('Reset the embedded ChatGPT sign-in/);
+  assert.match(htmlSource, /id="session-reset-login-button"/);
 });
 
 function plainTextResult(task, patch, commitMessage = 'fix(task): apply generated changes') {
@@ -1920,6 +1961,127 @@ test('task submit does not report success until a ChatGPT conversation exists', 
   );
   assert.equal(updateCount, 0);
   assert.equal(events.at(-1).type, 'task-submit-unconfirmed');
+});
+
+test('new chat prefers in-page navigation without hard loading the browser document', async () => {
+  let targetUrl = null;
+  let hardLoads = 0;
+  const view = {
+    navigateWithinChatGPT: async (url, options) => {
+      targetUrl = { url, options };
+      return true;
+    },
+    view: {
+      webContents: {
+        getURL: () => 'https://chatgpt.com/c/current-conversation',
+        loadURL: async () => { hardLoads += 1; },
+      },
+    },
+  };
+
+  await ChatGPTView.prototype.newChat.call(view);
+  assert.deepEqual(targetUrl, { url: 'https://chatgpt.com/', options: { preferNewChat: true } });
+  assert.equal(hardLoads, 0);
+});
+
+test('task submit reopens a composer in the existing page when loading stalls before Send', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
+  const events = [];
+  let attempts = 0;
+  let softNavigations = 0;
+  let loading = true;
+  const view = {
+    pageLoadStartedAt: Date.now() - 7_000,
+    pageLoadFailure: null,
+    recentConsoleErrors: [],
+    view: {
+      webContents: {
+        isLoading: () => loading,
+        executeJavaScript: async () => {
+          softNavigations += 1;
+          loading = false;
+          return { navigated: true, method: 'in-page-control' };
+        },
+      },
+    },
+    onEvent: async (event) => events.push(event),
+    submitOnce: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('Composer unavailable');
+      return { ...task, state: 'submitted' };
+    },
+  };
+
+  const submitted = await ChatGPTView.prototype.submit.call(view, task);
+  assert.equal(submitted.state, 'submitted');
+  assert.equal(attempts, 2);
+  assert.equal(softNavigations, 1);
+  assert.equal(events.at(-1).type, 'browser-load-recovery');
+  assert.match(events.at(-1).message, /existing ChatGPT page \(1\/3\)/);
+});
+
+test('task submit keeps soft navigating the same page after an initial confirmed load failure', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
+  let attempts = 0;
+  let softNavigations = 0;
+  const webContents = {
+    isLoading: () => false,
+    executeJavaScript: async () => {
+      softNavigations += 1;
+      return { navigated: true, method: 'in-page-control' };
+    },
+  };
+  const events = [];
+  const view = {
+    pageLoadStartedAt: Date.now(),
+    pageLoadFailure: { errorDescription: 'ERR_FAILED' },
+    recentConsoleErrors: [],
+    view: { webContents },
+    onEvent: async (event) => events.push(event),
+    submitOnce: async () => {
+      attempts += 1;
+      throw new Error('Composer unavailable');
+    },
+  };
+
+  await assert.rejects(ChatGPTView.prototype.submit.call(view, task), /composer unavailable/i);
+  assert.equal(view.view.webContents, webContents);
+  assert.equal(attempts, 4);
+  assert.equal(softNavigations, 3);
+  assert.deepEqual(
+    events.map((event) => event.message.match(/\((\d)\/3\)/)?.[1]),
+    ['1', '2', '3'],
+  );
+});
+
+test('page load recovery detects a burst of console errors on the current load', () => {
+  const reason = ChatGPTView.prototype.pageLoadFailureReason.call({
+    pageLoadStartedAt: Date.now(),
+    pageLoadFailure: null,
+    recentConsoleErrors: Array.from({ length: 8 }, () => ({ at: Date.now(), message: 'load failed' })),
+    view: { webContents: { isLoading: () => false } },
+  });
+
+  assert.match(reason, /8 console errors/i);
+});
+
+test('task submit never retries after the Send action starts', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
+  let attempts = 0;
+  const view = {
+    pageLoadStartedAt: Date.now() - 7_000,
+    pageLoadFailure: null,
+    recentConsoleErrors: [],
+    view: { webContents: { isLoading: () => true } },
+    submitOnce: async () => {
+      attempts += 1;
+      view.submissionSendStarted = true;
+      throw new Error('Request confirmation timed out');
+    },
+  };
+
+  await assert.rejects(ChatGPTView.prototype.submit.call(view, task), /confirmation timed out/i);
+  assert.equal(attempts, 1);
 });
 
 test('task submit persists the confirmed ChatGPT conversation with submitted state', async () => {

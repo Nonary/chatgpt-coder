@@ -4,6 +4,7 @@ const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('el
 const { mergeResultFilename } = require('./worktree-service');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
+const CHATGPT_LOGIN_URL = 'https://chatgpt.com/auth/login';
 const CHATGPT_PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9_-]+$/;
 const PARTITION = 'persist:patchwork-chatgpt';
 const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
@@ -13,10 +14,34 @@ const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
+const PAGE_LOAD_RECOVERY_THRESHOLD_MILLISECONDS = 6_000;
+const PAGE_LOAD_CONSOLE_ERROR_THRESHOLD = 8;
+const MAX_SUBMISSION_PAGE_RECOVERIES = 3;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
 const CHATGPT_CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isChatGPTAuthenticationUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return false;
+    if (url.hostname === 'auth.openai.com' || url.hostname.endsWith('.auth.openai.com')) return true;
+    return url.hostname === 'chatgpt.com' && /^\/auth(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isChatGPTAuthenticationCallbackUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com') return false;
+    return /^\/(?:api\/)?auth\/callback(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
 
 const TASK_MODEL_PICKER_OPTIONS = {
   sol: {
@@ -754,6 +779,10 @@ class ChatGPTView {
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
     this.configurationPickerTimer = null;
+    this.pageLoadStartedAt = Date.now();
+    this.pageLoadStoppedAt = 0;
+    this.pageLoadFailure = null;
+    this.recentConsoleErrors = [];
     this.visible = false;
     this.view = new WebContentsView({
       webPreferences: {
@@ -801,11 +830,35 @@ class ChatGPTView {
         },
       };
     });
-    contents.on('did-start-loading', () => this.onEvent({ type: 'browser-loading', loading: true }));
+    contents.on('did-create-window', (popup, details) => {
+      if (isChatGPTAuthenticationUrl(details.url)) this.installAuthenticationPopupHandlers(popup);
+    });
+    contents.on('did-start-loading', () => {
+      this.pageLoadStartedAt = Date.now();
+      this.pageLoadStoppedAt = 0;
+      this.pageLoadFailure = null;
+      this.recentConsoleErrors = [];
+      this.onEvent({ type: 'browser-loading', loading: true });
+    });
     contents.on('did-stop-loading', () => {
+      this.pageLoadStoppedAt = Date.now();
       this.onEvent({ type: 'browser-loading', loading: false, url: contents.getURL() });
       this.installResultWatcher();
       this.scheduleTaskConfigurationPicker();
+    });
+    contents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame || errorCode === -3) return;
+      this.pageLoadFailure = {
+        at: Date.now(),
+        errorCode,
+        errorDescription,
+        url: validatedURL,
+      };
+    });
+    contents.on('console-message', (_event, level, message) => {
+      if (Number(level) < 3) return;
+      this.recentConsoleErrors.push({ at: Date.now(), message: String(message || '') });
+      if (this.recentConsoleErrors.length > 50) this.recentConsoleErrors.shift();
     });
     contents.on('dom-ready', () => {
       this.installResultWatcher();
@@ -824,6 +877,38 @@ class ChatGPTView {
     });
     contents.on('render-process-gone', (_event, details) => {
       this.onEvent({ type: 'task-failed', message: `The embedded ChatGPT renderer stopped: ${details.reason}` });
+    });
+  }
+
+  installAuthenticationPopupHandlers(popup) {
+    const popupContents = popup.webContents;
+    const transferCallback = (event, url) => {
+      if (!isChatGPTAuthenticationCallbackUrl(url)) return;
+      event.preventDefault();
+      this.view.webContents.loadURL(url).catch(() => {});
+      if (!popup.isDestroyed()) popup.close();
+    };
+    popupContents.on('will-navigate', transferCallback);
+    popupContents.on('will-redirect', transferCallback);
+    popupContents.setWindowOpenHandler(({ url }) => {
+      if (!url.startsWith('https://')) return { action: 'deny' };
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          parent: this.mainWindow,
+          width: 520,
+          height: 720,
+          webPreferences: {
+            partition: PARTITION,
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+          },
+        },
+      };
+    });
+    popupContents.on('did-create-window', (nestedPopup) => {
+      this.installAuthenticationPopupHandlers(nestedPopup);
     });
   }
 
@@ -1078,7 +1163,10 @@ class ChatGPTView {
       const targetConversationId = conversationIdFromRouteUrl(conversationUrl);
       const conversationAlreadyOpen = currentUrl === conversationUrl
         || Boolean(targetConversationId && currentConversationId === targetConversationId);
-      if (!conversationAlreadyOpen) await this.view.webContents.loadURL(conversationUrl);
+      if (!conversationAlreadyOpen) {
+        const navigatedInPage = await this.navigateWithinChatGPT(conversationUrl);
+        if (!navigatedInPage) await this.view.webContents.loadURL(conversationUrl);
+      }
     }
     this.installResultWatcher();
   }
@@ -1099,7 +1187,8 @@ class ChatGPTView {
     // streamed thoughts may not be persisted yet, so keep the existing renderer alive when
     // both routes identify the same conversation.
     if (!conversationAlreadyOpen) {
-      await this.view.webContents.loadURL(task.conversationUrl);
+      const navigatedInPage = await this.navigateWithinChatGPT(task.conversationUrl);
+      if (!navigatedInPage) await this.view.webContents.loadURL(task.conversationUrl);
     }
     this.installResultWatcher();
     await this.onEvent({
@@ -1112,12 +1201,56 @@ class ChatGPTView {
 
   async newChat(projectId = null, projectShortUrl = null) {
     const targetUrl = projectId ? chatGPTProjectUrl(projectId, projectShortUrl) : CHATGPT_URL;
-    if (this.view.webContents.getURL() !== targetUrl) {
+    const navigatedInPage = await this.navigateWithinChatGPT(targetUrl, { preferNewChat: true });
+    if (!navigatedInPage && this.view.webContents.getURL() !== targetUrl) {
       await this.view.webContents.loadURL(targetUrl);
-    } else {
-      await this.view.webContents.reload();
     }
     return true;
+  }
+
+  async navigateWithinChatGPT(targetUrl, { preferNewChat = false } = {}) {
+    const result = await this.view.webContents.executeJavaScript(`(() => {
+      const target = new URL(${JSON.stringify(targetUrl)});
+      const targetRoute = target.pathname + target.search + target.hash;
+      const currentRoute = location.pathname + location.search + location.hash;
+      const visible = (element) => {
+        if (!element) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const controls = [...document.querySelectorAll('a[href], button')].filter(visible);
+      const label = (element) => [
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.textContent,
+      ].filter(Boolean).join(' ').trim();
+      const exactLink = controls.find((element) => {
+        if (!(element instanceof HTMLAnchorElement)) return false;
+        try {
+          const url = new URL(element.href, location.href);
+          return url.origin === target.origin
+            && url.pathname + url.search + url.hash === targetRoute;
+        } catch {
+          return false;
+        }
+      });
+      const newChatControl = controls.find((element) =>
+        element.matches('[data-testid="create-new-chat-button"], [data-testid="new-chat-button"]')
+        || /^(?:new chat|start new chat|new conversation)$/i.test(label(element)));
+      const control = preferNewChat
+        ? (currentRoute === targetRoute ? newChatControl || exactLink : exactLink || newChatControl)
+        : exactLink;
+      if (control) {
+        control.click();
+        return { navigated: true, method: 'in-page-control' };
+      }
+      if (currentRoute === targetRoute) {
+        return { navigated: true, method: 'reuse-current-page' };
+      }
+      return { navigated: false, method: 'unavailable' };
+    })()`, true).catch(() => ({ navigated: false, method: 'script-failed' }));
+    if (result?.navigated) await delay(300);
+    return Boolean(result?.navigated);
   }
 
   async listProjects() {
@@ -1274,6 +1407,22 @@ class ChatGPTView {
     return true;
   }
 
+  async resetAuthentication() {
+    const contents = this.view.webContents;
+    const browserSession = contents.session;
+    await browserSession.clearAuthCache();
+    await browserSession.clearStorageData();
+    await browserSession.clearCache();
+    await browserSession.closeAllConnections();
+    contents.navigationHistory.clear();
+    await contents.loadURL(CHATGPT_LOGIN_URL);
+    await this.onEvent({
+      type: 'browser-authentication-reset',
+      message: 'ChatGPT sign-in data was cleared. Start a fresh login when ready.',
+    });
+    return true;
+  }
+
   async goBack() {
     if (this.view.webContents.navigationHistory.canGoBack()) {
       this.view.webContents.navigationHistory.goBack();
@@ -1301,6 +1450,42 @@ class ChatGPTView {
       await delay(350);
     }
     return false;
+  }
+
+  pageLoadFailureReason(now = Date.now()) {
+    this.recentConsoleErrors = this.recentConsoleErrors || [];
+    if (this.pageLoadFailure) {
+      return `the main page failed to load (${this.pageLoadFailure.errorDescription || this.pageLoadFailure.errorCode})`;
+    }
+    if (this.view?.webContents?.isLoading?.()
+      && this.pageLoadStartedAt
+      && now - this.pageLoadStartedAt >= PAGE_LOAD_RECOVERY_THRESHOLD_MILLISECONDS) {
+      return 'the page was still loading after several seconds';
+    }
+    if (this.recentConsoleErrors.length >= PAGE_LOAD_CONSOLE_ERROR_THRESHOLD) {
+      return `the page produced ${this.recentConsoleErrors.length} console errors while loading`;
+    }
+    return null;
+  }
+
+  async recoverSubmissionPage(task, reason, recoveryNumber) {
+    await this.onEvent({
+      type: 'browser-load-recovery',
+      taskId: task.taskId,
+      message: `ChatGPT did not finish loading correctly (${reason}). Reopening a fresh composer inside the existing ChatGPT page (${recoveryNumber}/${MAX_SUBMISSION_PAGE_RECOVERIES}) and retrying the automation…`,
+    });
+    this.pageLoadStartedAt = Date.now();
+    this.pageLoadStoppedAt = 0;
+    this.pageLoadFailure = null;
+    this.recentConsoleErrors = [];
+    const targetUrl = task.chatgptProject?.id
+      ? chatGPTProjectUrl(task.chatgptProject.id, task.chatgptProject.shortUrl)
+      : CHATGPT_URL;
+    await ChatGPTView.prototype.navigateWithinChatGPT.call(
+      this,
+      targetUrl,
+      { preferNewChat: true },
+    );
   }
 
   async configureTaskModel(task) {
@@ -1647,6 +1832,33 @@ class ChatGPTView {
   }
 
   async submit(task) {
+    let recoveryReason = null;
+    for (let recoveryAttempt = 0; recoveryAttempt <= MAX_SUBMISSION_PAGE_RECOVERIES; recoveryAttempt += 1) {
+      this.submissionSendStarted = false;
+      try {
+        const submitOnce = this.submitOnce || ChatGPTView.prototype.submitOnce;
+        return await submitOnce.call(this, task);
+      } catch (error) {
+        const detectedReason = !this.submissionSendStarted
+          ? ChatGPTView.prototype.pageLoadFailureReason.call(this)
+          : null;
+        const reason = detectedReason || (recoveryReason && !this.submissionSendStarted
+          ? 'the page was still not ready after the previous refresh'
+          : null);
+        if (!reason || recoveryAttempt >= MAX_SUBMISSION_PAGE_RECOVERIES) throw error;
+        recoveryReason = detectedReason || recoveryReason;
+        await ChatGPTView.prototype.recoverSubmissionPage.call(
+          this,
+          task,
+          reason,
+          recoveryAttempt + 1,
+        );
+      }
+    }
+    throw new Error('ChatGPT submission recovery stopped unexpectedly.');
+  }
+
+  async submitOnce(task) {
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -1670,12 +1882,18 @@ class ChatGPTView {
     await this.configureTaskModel(task);
     const requestEnforcement = await this.beginTaskRequestEnforcement(task);
     let verifiedRequest;
+    let automationSendStarted = false;
     try {
       await this.injectPrompt(task.handoffPrompt);
       await this.uploadPackage(task.packagePath);
       await ChatGPTView.prototype.uploadAttachments.call(this, task.attachments);
+      automationSendStarted = true;
+      this.submissionSendStarted = true;
       await this.clickSend();
       verifiedRequest = await requestEnforcement.wait();
+    } catch (error) {
+      error.automationSendStarted = automationSendStarted;
+      throw error;
     } finally {
       await requestEnforcement.dispose();
     }
@@ -1977,7 +2195,8 @@ class ChatGPTView {
       const conversationAlreadyOpen = currentUrl === task.conversationUrl
         || Boolean(taskConversationId && currentConversationId === taskConversationId);
       if (!conversationAlreadyOpen) {
-        await this.view.webContents.loadURL(task.conversationUrl);
+        const navigatedInPage = await this.navigateWithinChatGPT(task.conversationUrl);
+        if (!navigatedInPage) await this.view.webContents.loadURL(task.conversationUrl);
       }
 
       this.resultAttempts.delete(taskId);
@@ -2074,6 +2293,7 @@ class ChatGPTView {
 
 module.exports = {
   CHATGPT_URL,
+  CHATGPT_LOGIN_URL,
   ChatGPTView,
   buildTaskConfigurationScript,
   chatGPTProjectUrl,
@@ -2084,7 +2304,9 @@ module.exports = {
   buildConversationStatusScript,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
+  isChatGPTAuthenticationCallbackUrl,
   isChatGPTConversationUrl,
+  isChatGPTAuthenticationUrl,
   isDismissibleLimitNotice,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,

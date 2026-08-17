@@ -9,6 +9,9 @@ const { resolveGitSummaryPrompt, TaskService } = require('./task-service');
 const { validateCommitMessage, WorktreeService } = require('./worktree-service');
 
 const HEADLESS = process.env.PATCHWORK_HEADLESS === '1';
+const AUTH_SERVER_ALLOWLIST = process.env.PATCHWORK_AUTH_SERVER_ALLOWLIST || 'ap.idf.medcity.net';
+app.commandLine.appendSwitch('auth-server-allowlist', AUTH_SERVER_ALLOWLIST);
+app.commandLine.appendSwitch('auth-server-whitelist', AUTH_SERVER_ALLOWLIST);
 if (process.env.PATCHWORK_DEBUG_PORT) {
   app.commandLine.appendSwitch('remote-debugging-port', process.env.PATCHWORK_DEBUG_PORT);
 }
@@ -503,6 +506,7 @@ function registerIpc() {
   ipcMain.handle('browser:set-visible', async (_event, visible) => chatGPTView.setVisible(visible));
   ipcMain.handle('browser:new-chat', async () => chatGPTView.newChat());
   ipcMain.handle('browser:reload', async () => chatGPTView.reload());
+  ipcMain.handle('browser:reset-authentication', async () => chatGPTView.resetAuthentication());
   ipcMain.handle('browser:back', async () => chatGPTView.goBack());
   ipcMain.handle('browser:forward', async () => chatGPTView.goForward());
   ipcMain.handle('task:apply', async (_event, taskId) => publicTask(await resultService.apply(taskId)));

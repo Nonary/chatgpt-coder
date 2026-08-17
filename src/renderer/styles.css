@@ -419,6 +419,8 @@ textarea::placeholder { color: #606659; }
 .browser-location > span.loading { background: var(--warning); animation: pulse 1s infinite alternate; }
 .browser-location strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .browser-location small { margin-left: auto; color: #6d7467; font-size: 9px; }
+.browser-toolbar-actions { display: flex; align-items: center; gap: 6px; }
+.browser-reset-login { padding: 7px 10px; font-size: 10px; color: #c9a66b; }
 .browser-new-chat { padding: 7px 10px; font-size: 10px; }
 .chatgpt-surface { position: relative; flex: 1 1 auto; min-height: 0; background: #151714; }
 .browser-placeholder { position: absolute; inset: 0; display: grid; place-items: center; align-content: center; gap: 5px; color: #8c9385; }

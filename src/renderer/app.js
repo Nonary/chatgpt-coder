@@ -63,7 +63,7 @@ const elements = Object.fromEntries(
     'browser-reload-button', 'new-chat-button', 'browser-title', 'browser-status',
     'browser-status-dot',
     'session-chatgpt-surface', 'session-back-button', 'session-forward-button',
-    'session-reload-button', 'session-new-chat-button', 'session-browser-title',
+    'session-reload-button', 'session-reset-login-button', 'session-new-chat-button', 'session-browser-title',
     'session-browser-status', 'session-status-dot',
     'source-control-button', 'source-count', 'source-repository-select',
     'source-add-repository', 'source-refresh', 'source-remove-repository',
@@ -2137,6 +2137,10 @@ elements['browser-back-button'].addEventListener('click', () => runBrowserAction
 elements['browser-forward-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserForward));
 elements['session-new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
 elements['session-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));
+elements['session-reset-login-button'].addEventListener('click', () => {
+  if (!window.confirm('Reset the embedded ChatGPT sign-in? This signs you out of ChatGPT in Patchwork, but keeps all tasks and repositories.')) return;
+  runBrowserAction(window.patchwork.resetBrowserAuthentication, 'ChatGPT sign-in reset. Start a fresh login when ready.');
+});
 elements['session-back-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserBack));
 elements['session-forward-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserForward));
 let diffScrollSyncing = false;

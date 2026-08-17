@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   setBrowserVisible: (visible) => ipcRenderer.invoke('browser:set-visible', visible),
   newChat: () => ipcRenderer.invoke('browser:new-chat'),
   reloadBrowser: () => ipcRenderer.invoke('browser:reload'),
+  resetBrowserAuthentication: () => ipcRenderer.invoke('browser:reset-authentication'),
   browserBack: () => ipcRenderer.invoke('browser:back'),
   browserForward: () => ipcRenderer.invoke('browser:forward'),
   onTaskEvent: (listener) => {
