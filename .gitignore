@@ -6,3 +6,5 @@ release/
 src/renderer-dist/
 *.log
 .DS_Store
+
+settings.json

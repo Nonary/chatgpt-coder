@@ -10,14 +10,18 @@ const {
   CHATGPT_URL,
   ChatGPTView,
   buildConversationStatusScript,
+  conversationRequestIncludesAttachment,
   buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
   buildPackageAttachmentStatusScript,
+  buildSendButtonScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   conversationStreamStatusUrl,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
+  isChatGPTAuthenticationCallbackUrl,
+  isChatGPTAuthenticationUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
   isRetryableChatStatus,
@@ -37,9 +41,15 @@ const {
 } = require('../src/main/chatgpt-view');
 const { fingerprintRepository, runGit } = require('../src/main/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/main/git-service');
+const { IacService } = require('../src/main/iac-service');
 const { ResultService, parsePlainTextResult } = require('../src/main/result-service');
 const { SkillService } = require('../src/main/skill-service');
-const { DEFAULT_GIT_SUMMARY_PROMPT, resolveGitSummaryPrompt, TaskService } = require('../src/main/task-service');
+const {
+  DEFAULT_GIT_SUMMARY_PROMPT,
+  resolveGitSummaryPrompt,
+  resolveTreeTaskRepositories,
+  TaskService,
+} = require('../src/main/task-service');
 const {
   WorktreeService,
   mergeResultFilename,
@@ -327,6 +337,44 @@ test('Git Summary prompts use the saved prompt when present and the built-in pro
   assert.ok(DEFAULT_GIT_SUMMARY_PROMPT.includes('<type>(<optional-scope>): <concise summary>'));
 });
 
+test('ChatGPT authentication URLs and callbacks are identified safely', () => {
+  assert.equal(isChatGPTAuthenticationUrl('https://auth.openai.com/log-in'), true);
+  assert.equal(isChatGPTAuthenticationUrl('https://tenant.auth.openai.com/authorize'), true);
+  assert.equal(isChatGPTAuthenticationUrl('https://chatgpt.com/auth/login'), true);
+  assert.equal(isChatGPTAuthenticationUrl('https://chatgpt.com/c/1234'), false);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://chatgpt.com/api/auth/callback/openai?code=secret'), true);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://chatgpt.com/auth/callback?code=secret'), true);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://auth.openai.com/callback'), false);
+  assert.equal(isChatGPTAuthenticationCallbackUrl('https://chatgpt.com/'), false);
+});
+
+test('Electron startup enables integrated authentication for the configured SSO host', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '..', 'src', 'main', 'app.js'), 'utf8');
+  assert.match(appSource, /PATCHWORK_AUTH_SERVER_ALLOWLIST/);
+  assert.match(appSource, /appendSwitch\('auth-server-allowlist'/);
+  assert.match(appSource, /appendSwitch\('auth-server-whitelist'/);
+});
+
+test('ChatGPT sign-in reset clears only the shared browser partition and exposes a confirmed UI action', async () => {
+  const [viewSource, mainSource, preloadSource, rendererSource] = await Promise.all([
+    fs.readFile(path.join(__dirname, '..', 'src', 'main', 'chatgpt-view.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'main', 'app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '..', 'src', 'renderer', 'app.tsx'), 'utf8'),
+  ]);
+  assert.match(viewSource, /async resetAuthentication\(\)/);
+  assert.match(viewSource, /clearAuthCache\(\)/);
+  assert.match(viewSource, /clearStorageData\(\)/);
+  assert.match(viewSource, /clearCache\(\)/);
+  assert.match(viewSource, /closeAllConnections\(\)/);
+  assert.match(viewSource, /navigationHistory\.clear\(\)/);
+  assert.match(viewSource, /loadURL\(CHATGPT_LOGIN_URL\)/);
+  assert.match(mainSource, /session:reset-authentication/);
+  assert.match(preloadSource, /resetSessionAuthentication/);
+  assert.match(rendererSource, /window\.confirm\('Clear Patchwork’s ChatGPT sign-in data/);
+  assert.match(rendererSource, />Reset sign-in</);
+});
+
 function plainTextResult(task, patch, commitMessage = 'fix(task): apply generated changes') {
   return `PATCHWORK_RESULT_V1\n${JSON.stringify({
     schemaVersion: 2,
@@ -348,6 +396,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-summary-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
+  const resolvedRepositoryPath = await fs.realpath(repositoryPath);
   await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'staged change\n');
   await runGit(repositoryPath, ['add', 'hello.txt']);
   await fs.writeFile(path.join(repositoryPath, 'unstaged.txt'), 'unstaged change\n');
@@ -363,6 +412,9 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   });
 
   assert.equal(task.summaryOnly, true);
+  assert.equal(task.repositories.length, 1);
+  assert.equal(task.repositories[0].path, resolvedRepositoryPath);
+  assert.equal(task.repositories[0].readOnly, true);
   assert.equal(task.repositories[0].workingChanges, true);
   assert.match(task.resultFilename, /^chatgpt-ide-result-[0-9a-f-]{36}\.txt$/i);
   assert.match(task.handoffPrompt, /PATCHWORK_RESULT_V1/);
@@ -373,6 +425,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
   assert.equal(manifest.repositories[0].workingChanges, true);
   assert.equal(manifest.repositories[0].snapshot, true);
+  assert.equal(manifest.repositories[0].readOnly, true);
   const agentInstructions = zip.getEntry('AGENTS.md').getData().toString('utf8');
   assert.match(agentInstructions, /read-only Git summary task/i);
   assert.match(agentInstructions, /PATCHWORK_RESULT_V1/);
@@ -399,6 +452,7 @@ test('Source Control summaries run as persistent Luna Medium tasks with an expli
   );
 
   assert.match(summaryHandler, /model: 'luna',[\s\S]*reasoningMode: 'medium'/);
+  assert.match(summaryHandler, /repositories: \[\{ path: status\.repository\.path, readOnly: true \}\]/);
   assert.match(summaryHandler, /type: 'task-prepared'/);
   assert.match(summaryHandler, /state: 'completed'/);
   assert.match(summaryHandler, /type: 'git-summary-ready',[\s\S]*task: publicTask\(completed\)/);
@@ -452,6 +506,220 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   const extractedBundle = path.join(root, 'uploaded-repository.bundle');
   await fs.writeFile(extractedBundle, packagedBundle);
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
+});
+
+test('tasks can package multiple repositories into one ZIP', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-task-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(root);
+  const secondRepositoryPath = path.join(root, 'second-repository');
+  await fs.mkdir(secondRepositoryPath, { recursive: true });
+  await runGit(secondRepositoryPath, ['init', '-b', 'main']);
+  await runGit(secondRepositoryPath, ['config', 'user.email', 'patchwork@example.invalid']);
+  await runGit(secondRepositoryPath, ['config', 'user.name', 'Patchwork Test']);
+  await fs.writeFile(path.join(secondRepositoryPath, 'other.txt'), 'other repository\n');
+  await runGit(secondRepositoryPath, ['add', 'other.txt']);
+  await runGit(secondRepositoryPath, ['commit', '-m', 'Initial commit']);
+  await fs.writeFile(path.join(secondRepositoryPath, 'other.txt'), 'updated other repository\n');
+  await fs.writeFile(path.join(secondRepositoryPath, 'untracked.txt'), 'untracked context\n');
+
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repositories = await tasks.inspectRepositories([firstRepositoryPath, secondRepositoryPath]);
+  assert.equal(repositories.length, 2);
+
+  const task = await tasks.createTask({
+    taskText: 'Coordinate the change across both repositories.',
+    repositories,
+  });
+
+  assert.equal(task.repositories.length, 2);
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.deepEqual(
+    manifest.repositories.map((repository) => repository.bundleFile),
+    repositories.map((repository) => `repositories/${repository.id}.bundle`),
+  );
+  for (const repository of repositories) {
+    const entry = archive.getEntry(`repositories/${repository.id}.bundle`);
+    assert.ok(entry);
+    const stored = await fs.readFile(path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`));
+    assert.deepEqual(entry.getData(), stored);
+  }
+
+  for (const repository of manifest.repositories) {
+    const clonePath = path.join(root, `clone-${repository.id}`);
+    await runGit(root, [
+      'clone', '--no-checkout',
+      path.join(tasks.taskDirectory(task.taskId), repository.bundleFile),
+      clonePath,
+    ]);
+    await runGit(clonePath, ['checkout', '-b', `patchwork/${task.taskId}`, repository.baseCommit]);
+    const { stdout: clonedHead } = await runGit(clonePath, ['rev-parse', 'HEAD']);
+    assert.equal(clonedHead.trim(), repository.baseCommit);
+  }
+  assert.equal(await fs.readFile(path.join(root, `clone-${repositories[1].id}`, 'other.txt'), 'utf8'), 'updated other repository\n');
+  assert.equal(await fs.readFile(path.join(root, `clone-${repositories[1].id}`, 'untracked.txt'), 'utf8'), 'untracked context\n');
+});
+
+test('coding-tree tasks keep additional selected repositories as read-only context', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-context-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const sourcePath = await createRepository(root);
+  const contextPath = await createRepository(path.join(root, 'context-root'));
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+  const tree = await trees.create(sourcePath, 'Multi-repository task');
+
+  const repositories = await resolveTreeTaskRepositories(tree, [
+    { path: sourcePath },
+    { path: contextPath },
+    { path: contextPath },
+  ]);
+
+  assert.deepEqual(repositories, [
+    { path: await fs.realpath(tree.path) },
+    { path: await fs.realpath(contextPath), readOnly: true },
+  ]);
+  const task = await tasks.createTask({
+    taskText: 'Update the tree while referencing the context repository.',
+    repositories,
+    tree,
+  });
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.repositories.length, 2);
+  assert.equal(manifest.repositories[0].readOnly, false);
+  assert.equal(manifest.repositories[1].readOnly, true);
+  for (const repository of manifest.repositories) assert.ok(archive.getEntry(repository.bundleFile));
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(appSource, /resolveTreeTaskRepositories\(tree, input\.repositories\)/);
+  assert.doesNotMatch(appSource, /repositories: tree \? \[\{ path: tree\.path \}\]/);
+});
+
+test('tasks can include configured IaC repositories as read-only bundle context', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-context-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const iacRepositoryPath = await createRepository(path.join(root, 'iac-root'));
+  const settingsPath = path.join(root, 'settings.json');
+  await fs.writeFile(settingsPath, `${JSON.stringify({ iac_urls: [iacRepositoryPath] }, null, 2)}\n`);
+
+  const tasks = new TaskService(
+    path.join(root, 'data'),
+    undefined,
+    new IacService({ settingsPath }),
+  );
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Use the infrastructure repository as read-only deployment context.',
+    repositories: [repository],
+    includeIac: true,
+  });
+
+  assert.equal(task.includeIac, true);
+  assert.equal(task.includes_iac_repos, true);
+  assert.equal(task.iac_repos.length, 1);
+  assert.equal(task.repositories.length, 1);
+  assert.equal(task.iac_repos[0].readOnly, true);
+  assert.equal(task.iac_repos[0].status, 'bundled');
+  assert.equal(task.iac_repos[0].source, 'local_path');
+  assert.equal(task.iac_repos[0].source_path, await fs.realpath(iacRepositoryPath));
+  assert.match(task.iac_repos[0].bundle, /^iac\/sample-repository(?:-2)?\.bundle$/);
+
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.iac_settings_path, settingsPath);
+  assert.equal(manifest.iac_repos[0].bundle, task.iac_repos[0].bundle);
+  assert.ok(archive.getEntry(task.iac_repos[0].bundle));
+
+  const clonePath = path.join(root, 'iac-clone');
+  await runGit(root, ['clone', '--no-checkout', path.join(tasks.taskDirectory(task.taskId), task.iac_repos[0].bundle), clonePath]);
+  await runGit(clonePath, ['checkout', '-b', `patchwork/${task.taskId}`, task.iac_repos[0].baseCommit]);
+  const { stdout: clonedHead } = await runGit(clonePath, ['rev-parse', 'HEAD']);
+  assert.equal(clonedHead.trim(), task.iac_repos[0].baseCommit);
+  assert.equal(await fs.readFile(path.join(clonePath, 'hello.txt'), 'utf8'), 'hello\n');
+});
+
+test('IaC bundles preserve local working changes without making the IaC repository patchable', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-dirty-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const iacRepositoryPath = await createRepository(path.join(root, 'iac-root'));
+  await fs.writeFile(path.join(iacRepositoryPath, 'hello.txt'), 'iac working change\n');
+  await fs.writeFile(path.join(iacRepositoryPath, 'untracked.tf'), 'resource "demo" {}\n');
+  const settingsPath = path.join(root, 'settings.json');
+  await fs.writeFile(settingsPath, `${JSON.stringify({ iac_urls: [iacRepositoryPath] }, null, 2)}\n`);
+
+  const tasks = new TaskService(
+    path.join(root, 'data'),
+    undefined,
+    new IacService({ settingsPath }),
+  );
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Reference the current infrastructure working tree.',
+    repositories: [repository],
+    includeIac: true,
+  });
+
+  const iac = task.iac_repos[0];
+  assert.equal(iac.workingChanges, true);
+  assert.equal(iac.snapshot, true);
+  assert.match(iac.workingStatus, /hello\.txt|untracked\.tf/);
+
+  const clonePath = path.join(root, 'iac-dirty-clone');
+  await runGit(root, ['clone', '--no-checkout', path.join(tasks.taskDirectory(task.taskId), iac.bundle), clonePath]);
+  await runGit(clonePath, ['checkout', '-b', `patchwork/${task.taskId}`, iac.baseCommit]);
+  assert.equal(await fs.readFile(path.join(clonePath, 'hello.txt'), 'utf8'), 'iac working change\n');
+  assert.equal(await fs.readFile(path.join(clonePath, 'untracked.tf'), 'utf8'), 'resource "demo" {}\n');
+});
+
+test('IaC configuration stays opt-in and malformed settings are rejected', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-settings-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const settingsPath = path.join(root, 'settings.json');
+  const service = new IacService({ settingsPath });
+
+  assert.deepEqual(await service.getConfig(), {
+    settingsPath,
+    exists: false,
+    valid: true,
+    selectors: [],
+    error: null,
+  });
+
+  await fs.writeFile(settingsPath, JSON.stringify({ gitops_urls: ['~/ignored'] }));
+  const ignored = await service.getConfig();
+  assert.deepEqual(ignored.selectors, []);
+
+  await fs.writeFile(settingsPath, JSON.stringify({ iac_urls: ['path-a'] }));
+  const configured = await service.getConfig();
+  assert.deepEqual(configured.selectors, ['path-a']);
+
+  await fs.writeFile(settingsPath, JSON.stringify({ iac_urls: 'not-a-list' }));
+  await assert.rejects(service.resolveRepositories(path.join(root, 'clones')), /settings\.iac_urls must be a list of strings/);
+});
+
+test('IaC settings are exposed to the task composer and task handoff', async () => {
+  const [mainSource, preloadSource, rendererSource, taskServiceSource] = await Promise.all([
+    fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/task-service.js'), 'utf8'),
+  ]);
+  assert.match(mainSource, /new IacService\(/);
+  assert.match(mainSource, /iac:config/);
+  assert.match(preloadSource, /getIacConfig/);
+  assert.match(rendererSource, /patchwork\.task-iac/);
+  assert.match(rendererSource, /includeIac: includeIac && iacAvailable/);
+  assert.match(rendererSource, /Include infrastructure context/);
+  assert.match(taskServiceSource, /manifest\.json\.iac_repos/);
+  assert.match(taskServiceSource, /read-only infrastructure context/);
 });
 
 test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {
@@ -1473,7 +1741,7 @@ test('task creation preserves an existing worktree selected as the current repos
 
   const appSource = await fs.readFile(path.join(__dirname, '..', 'src', 'main', 'app.js'), 'utf8');
   assert.match(appSource, /findForTask\(\{ repositories: input\.repositories \}\)/);
-  assert.match(appSource, /repositories: tree \? \[\{ path: tree\.path \}\] : input\.repositories/);
+  assert.match(appSource, /taskRepositories = await resolveTreeTaskRepositories\(tree, input\.repositories\)/);
 });
 
 test('creating a task tree with the same repository and name reuses the existing tree', async (context) => {
@@ -2079,6 +2347,62 @@ test('conversation payload rewriting enforces the selected model and thinking ef
   assert.equal(lowPayload.thinking_effort, 'min');
 });
 
+test('conversation attachment verification accepts ChatGPT file assets without the original filename', () => {
+  const filename = 'chatgpt-ide-task-example.zip';
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    messages: [{ content: { parts: [{ name: filename, asset_pointer: 'file-service://asset' }] } }],
+  }), filename), true);
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    messages: [{ content: { parts: [{ content_type: 'file_asset_pointer', asset_pointer: 'file-service://asset-id' }] } }],
+  }), filename), true);
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    attachments: [{ id: 'asset-id-without-filename' }],
+  }), filename), true);
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    messages: [{ content: { parts: ['I attached a task ZIP.'] } }],
+  }), filename), false);
+});
+
+test('task request enforcement aborts and retries a text-only send without the task ZIP', async () => {
+  const commands = [];
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (command, params) => {
+    commands.push({ command, params });
+    return {};
+  };
+  const view = {
+    view: {
+      webContents: {
+        debugger: debuggerApi,
+        executeJavaScript: async () => null,
+      },
+    },
+  };
+  const enforcement = await ChatGPTView.prototype.beginTaskRequestEnforcement.call(view, {
+    model: 'default',
+    reasoningMode: 'default',
+    packagePath: '/tasks/chatgpt-ide-task-example.zip',
+  });
+  debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
+    requestId: 'request-without-package',
+    request: {
+      method: 'POST',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+      postData: JSON.stringify({ action: 'next', model: 'gpt-5-6', messages: [] }),
+    },
+  });
+
+  await assert.rejects(enforcement.wait(500), (error) => {
+    assert.match(error.message, /did not include the task ZIP attachment.*chatgpt-ide-task-example\.zip/i);
+    assert.equal(error.retrySubmission, true);
+    return true;
+  });
+  await enforcement.dispose();
+  assert.ok(commands.some((item) => item.command === 'Fetch.failRequest'));
+  assert.equal(commands.some((item) => item.command === 'Fetch.continueRequest'), false);
+});
+
 test('task request enforcement observes and rewrites ChatGPT’s actual conversation request', async () => {
   const commands = [];
   let attached = false;
@@ -2576,6 +2900,127 @@ test('task submit does not report success until a ChatGPT conversation exists', 
   assert.equal(events.at(-1).type, 'task-submit-unconfirmed');
 });
 
+test('new chat prefers in-page navigation without hard loading the browser document', async () => {
+  let targetUrl = null;
+  let hardLoads = 0;
+  const view = {
+    navigateWithinChatGPT: async (url, options) => {
+      targetUrl = { url, options };
+      return true;
+    },
+    view: {
+      webContents: {
+        getURL: () => 'https://chatgpt.com/c/current-conversation',
+        loadURL: async () => { hardLoads += 1; },
+      },
+    },
+  };
+
+  await ChatGPTView.prototype.newChat.call(view);
+  assert.deepEqual(targetUrl, { url: 'https://chatgpt.com/', options: { preferNewChat: true } });
+  assert.equal(hardLoads, 0);
+});
+
+test('task submit reopens a composer in the existing page when loading stalls before Send', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
+  const events = [];
+  let attempts = 0;
+  let softNavigations = 0;
+  let loading = true;
+  const view = {
+    pageLoadStartedAt: Date.now() - 7_000,
+    pageLoadFailure: null,
+    recentConsoleErrors: [],
+    view: {
+      webContents: {
+        isLoading: () => loading,
+        executeJavaScript: async () => {
+          softNavigations += 1;
+          loading = false;
+          return { navigated: true, method: 'in-page-control' };
+        },
+      },
+    },
+    onEvent: async (event) => events.push(event),
+    submitOnce: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('Composer unavailable');
+      return { ...task, state: 'submitted' };
+    },
+  };
+
+  const submitted = await ChatGPTView.prototype.submit.call(view, task);
+  assert.equal(submitted.state, 'submitted');
+  assert.equal(attempts, 2);
+  assert.equal(softNavigations, 1);
+  assert.equal(events.at(-1).type, 'browser-load-recovery');
+  assert.match(events.at(-1).message, /existing ChatGPT page \(1\/3\)/);
+});
+
+test('task submit keeps soft navigating the same page after an initial confirmed load failure', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
+  let attempts = 0;
+  let softNavigations = 0;
+  const webContents = {
+    isLoading: () => false,
+    executeJavaScript: async () => {
+      softNavigations += 1;
+      return { navigated: true, method: 'in-page-control' };
+    },
+  };
+  const events = [];
+  const view = {
+    pageLoadStartedAt: Date.now(),
+    pageLoadFailure: { errorDescription: 'ERR_FAILED' },
+    recentConsoleErrors: [],
+    view: { webContents },
+    onEvent: async (event) => events.push(event),
+    submitOnce: async () => {
+      attempts += 1;
+      throw new Error('Composer unavailable');
+    },
+  };
+
+  await assert.rejects(ChatGPTView.prototype.submit.call(view, task), /composer unavailable/i);
+  assert.equal(view.view.webContents, webContents);
+  assert.equal(attempts, 4);
+  assert.equal(softNavigations, 3);
+  assert.deepEqual(
+    events.map((event) => event.message.match(/\((\d)\/3\)/)?.[1]),
+    ['1', '2', '3'],
+  );
+});
+
+test('page load recovery detects a burst of console errors on the current load', () => {
+  const reason = ChatGPTView.prototype.pageLoadFailureReason.call({
+    pageLoadStartedAt: Date.now(),
+    pageLoadFailure: null,
+    recentConsoleErrors: Array.from({ length: 8 }, () => ({ at: Date.now(), message: 'load failed' })),
+    view: { webContents: { isLoading: () => false } },
+  });
+
+  assert.match(reason, /8 console errors/i);
+});
+
+test('task submit never retries after the Send action starts', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7' };
+  let attempts = 0;
+  const view = {
+    pageLoadStartedAt: Date.now() - 7_000,
+    pageLoadFailure: null,
+    recentConsoleErrors: [],
+    view: { webContents: { isLoading: () => true } },
+    submitOnce: async () => {
+      attempts += 1;
+      view.submissionSendStarted = true;
+      throw new Error('Request confirmation timed out');
+    },
+  };
+
+  await assert.rejects(ChatGPTView.prototype.submit.call(view, task), /confirmation timed out/i);
+  assert.equal(attempts, 1);
+});
+
 test('task submit persists the confirmed ChatGPT conversation with submitted state', async () => {
   const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7', handoffPrompt: 'Task', packagePath: '/task.txt' };
   const conversationUrl = 'https://chatgpt.com/c/confirmed-conversation';
@@ -2728,7 +3173,30 @@ test('task upload selects the composer file input and dispatches its change even
     params: { files: ['/tasks/chatgpt-ide-task-example.txt'], nodeId: 42 },
   });
   assert.match(scripts[0], /dispatchEvent\(new Event\('change'/);
+  assert.match(scripts[0], /element\.shadowRoot/);
   assert.equal(attachmentWaitedFor, 'chatgpt-ide-task-example.txt');
+});
+
+test('attachment wait redispatches a selected ZIP when ChatGPT hydration missed the first change event', async () => {
+  const statuses = [
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: true, busy: false, selectedByInput: true },
+    { attached: true, busy: false, selectedByInput: true },
+  ];
+  let redispatches = 0;
+  const view = {
+    packageAttachmentStatus: async () => statuses.shift() || { attached: true, busy: false },
+    dispatchSelectedFileInput: async () => { redispatches += 1; return true; },
+  };
+
+  assert.equal(await ChatGPTView.prototype.waitForPackageAttachment.call(
+    view,
+    'chatgpt-ide-task-hydration.zip',
+    5_000,
+  ), true);
+  assert.equal(redispatches, 1);
 });
 
 test('task upload reuses an attachment that is already in the composer', async () => {
@@ -2792,7 +3260,7 @@ test('task attachment confirmation finds uploaded packages in a hidden view and 
   assert.equal(result.busy, false);
 });
 
-test('task attachment confirmation waits for ChatGPT to render an attachment card after input selection', () => {
+test('task attachment confirmation keeps selected inputs pending until an attachment chip exists', () => {
   const filename = 'chatgpt-ide-task-hidden-input.zip';
   const fileInput = { files: [{ name: filename }] };
   const document = {
@@ -2808,7 +3276,88 @@ test('task attachment confirmation waits for ChatGPT to render an attachment car
   });
 
   assert.equal(result.attached, false);
+  assert.equal(result.busy, true);
+  assert.equal(result.selectedByInput, true);
+});
+
+test('task attachment confirmation accepts an exact filename chip without private test attributes', () => {
+  const filename = 'chatgpt-ide-task-filename-only.zip';
+  const chip = {
+    textContent: filename,
+    getAttribute: () => null,
+    closest: () => null,
+    parentElement: {
+      textContent: filename,
+      getAttribute: () => null,
+      querySelector: () => null,
+    },
+  };
+  const document = {
+    querySelectorAll: (selector) => {
+      if (selector === 'input[type="file"]') return [];
+      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') return [chip];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  });
+
+  assert.equal(result.attached, true);
   assert.equal(result.busy, false);
+});
+
+test('task attachment confirmation waits for ChatGPT cursor-wait processing to finish', () => {
+  const filename = 'chatgpt-ide-task-processing.zip';
+  const tile = {
+    textContent: `${filename} Zip Archive`,
+    getAttribute: (name) => (name === 'aria-label' ? filename : null),
+    matches: () => false,
+    querySelector: (selector) => (selector.includes('.cursor-wait') ? { className: 'cursor-wait' } : null),
+  };
+  const attachment = {
+    textContent: filename,
+    getAttribute: (name) => (name === 'aria-label' ? filename : null),
+    closest: (selector) => (selector.includes('[role="group"]') ? tile : null),
+    parentElement: tile,
+  };
+  const document = {
+    querySelectorAll: (selector) => {
+      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') return [attachment];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  });
+
+  assert.equal(result.attached, true);
+  assert.equal(result.busy, true);
+});
+
+test('send automation finds the composer button inside a shadow root', () => {
+  let clicked = false;
+  const send = {
+    disabled: false,
+    textContent: '',
+    getAttribute: (name) => (name === 'data-testid' ? 'send-button' : null),
+    scrollIntoView: () => {},
+    click: () => { clicked = true; },
+  };
+  const shadowRoot = {
+    querySelectorAll: (selector) => (selector === 'button, [role="button"]' ? [send] : []),
+  };
+  const document = {
+    querySelectorAll: (selector) => (selector === '*' ? [{ shadowRoot }] : []),
+  };
+
+  const result = vm.runInNewContext(buildSendButtonScript(), { document });
+  assert.equal(result.clicked, true);
+  assert.equal(clicked, true);
 });
 
 test('task attachments upload after the package and before ChatGPT is sent', async () => {

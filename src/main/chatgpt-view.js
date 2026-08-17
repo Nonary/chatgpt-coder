@@ -4,6 +4,7 @@ const { BrowserWindow, clipboard, dialog, shell } = require('electron');
 const { mergeResultFilename } = require('./worktree-service');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
+const CHATGPT_LOGIN_URL = 'https://chatgpt.com/auth/login';
 const CHATGPT_PROJECT_ID_PATTERN = /^g-p-[A-Za-z0-9_-]+$/;
 const PARTITION = 'persist:patchwork-chatgpt';
 const CHATGPT_ALLOWED_HOSTS = new Set([
@@ -26,6 +27,9 @@ const CHAT_API_RETRY_BASE_DELAY_MILLISECONDS = 1_000;
 const CHAT_API_RETRY_MAX_DELAY_MILLISECONDS = 30_000;
 const CHAT_REQUEST_RESPONSE_TIMEOUT_MILLISECONDS = 20_000;
 const TRANSPORT_RECOVERY_DELAY_MILLISECONDS = 500;
+const PAGE_LOAD_RECOVERY_THRESHOLD_MILLISECONDS = 6_000;
+const PAGE_LOAD_CONSOLE_ERROR_THRESHOLD = 8;
+const MAX_SUBMISSION_PAGE_RECOVERIES = 3;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
@@ -38,6 +42,17 @@ function isAllowedChatGPTUrl(value) {
     const hostname = url.hostname.toLowerCase();
     return CHATGPT_ALLOWED_HOSTS.has(hostname)
       || hostname.endsWith('.chatgpt.com');
+  } catch {
+    return false;
+  }
+}
+
+function isChatGPTAuthenticationUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:') return false;
+    if (url.hostname === 'auth.openai.com' || url.hostname.endsWith('.auth.openai.com')) return true;
+    return url.hostname === 'chatgpt.com' && /^\/auth(?:\/|$)/i.test(url.pathname);
   } catch {
     return false;
   }
@@ -61,6 +76,16 @@ function transportWindowOptions(backgroundThrottling = false) {
       backgroundThrottling,
     },
   };
+}
+
+function isChatGPTAuthenticationCallbackUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com') return false;
+    return /^\/(?:api\/)?auth\/callback(?:\/|$)/i.test(url.pathname);
+  } catch {
+    return false;
+  }
 }
 
 const TASK_MODEL_PICKER_OPTIONS = {
@@ -122,6 +147,33 @@ function rewriteConversationRequestBody(postData, configuration) {
     model: payload.model,
     thinkingEffort: payload.thinking_effort || null,
   };
+}
+
+function conversationRequestIncludesAttachment(postData, filename) {
+  const target = String(filename || '').trim().toLowerCase();
+  try {
+    const payload = JSON.parse(String(postData || ''));
+    const visit = (value, key = '') => {
+      if (typeof value === 'string') {
+        const normalized = value.toLowerCase();
+        return (target && normalized.includes(target))
+          || normalized.startsWith('file-service://')
+          || normalized.includes('file_asset_pointer');
+      }
+      if (Array.isArray(value)) {
+        if (/attachments?|files?/i.test(key) && value.length > 0) return true;
+        return value.some((item) => visit(item, key));
+      }
+      if (!value || typeof value !== 'object') return false;
+      return Object.entries(value).some(([childKey, childValue]) => {
+        if (/^(?:asset_pointer|file_id|upload_id)$/i.test(childKey) && childValue) return true;
+        return visit(childValue, childKey);
+      });
+    };
+    return visit(payload);
+  } catch {
+    return false;
+  }
 }
 
 function delay(milliseconds) {
@@ -881,6 +933,7 @@ function buildTaskConfigurationScript(model, reasoningMode, taskId = null) {
 function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = false) {
   return `(() => {
     const filename = ${JSON.stringify(filename)};
+    const target = filename.toLowerCase();
     const visible = (element) => {
       if (!element) return false;
       const style = getComputedStyle(element);
@@ -891,11 +944,13 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
     const visited = new Set();
     const notices = [];
     const candidates = [];
+    const fileInputs = [];
     while (roots.length) {
       const root = roots.shift();
       if (!root || visited.has(root)) continue;
       visited.add(root);
       notices.push(...root.querySelectorAll('[role="dialog"], [role="alert"], [aria-live]'));
+      fileInputs.push(...root.querySelectorAll('input[type="file"]'));
       candidates.push(...root.querySelectorAll(
         '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div'
       ));
@@ -918,32 +973,88 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
         dismissedDuplicate = true;
       }
     }
-    // Selecting a hidden file input only starts ChatGPT's upload. Wait for the
-    // attachment card itself: the frontend can reject or still be processing a
-    // selected file while leaving input.files populated. Source Control keeps
-    // its transport view hidden, so DOM presence—not rendered geometry—is the
-    // reliable confirmation signal once the card exists.
-    const attachment = candidates.find((element) => [
-      element.textContent,
-      element.getAttribute('aria-label'),
-      element.getAttribute('title'),
-    ].filter(Boolean).some((value) => String(value).includes(filename)));
+    const selectedByInput = fileInputs.some((input) => [...(input.files || [])]
+      .some((file) => file.name === filename));
+    // Source Control intentionally keeps the embedded ChatGPT view hidden at
+    // zero bounds while a summary runs. Attachment chips still exist in the
+    // page DOM in that state, but their client rectangles are empty. The task
+    // package filename contains a unique task ID, so DOM presence is the
+    // reliable confirmation signal here; rendered geometry is not.
+    const attachment = candidates.find((element) => {
+      const labels = [
+        element.textContent,
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+      ].filter(Boolean).map((value) => String(value).replace(/\\s+/g, ' ').trim().toLowerCase());
+      const matchesFilename = labels.some((value) => value.includes(target));
+      if (!matchesFilename) return false;
+      return Boolean(element.closest?.('[data-testid*="file"], [data-testid*="attach"]'))
+        || labels.some((value) => value === target)
+        || /file|attach/i.test([
+          element.getAttribute('data-testid'),
+          element.getAttribute('aria-label'),
+        ].filter(Boolean).join(' '));
+    });
     if (!attachment) return {
       attached: false,
-      busy: false,
+      busy: selectedByInput,
+      selectedByInput,
       duplicateNotice: Boolean(duplicateNotice),
       dismissedDuplicate,
     };
-    const card = attachment.closest('[data-testid*="file"], [data-testid*="attach"]') || attachment.parentElement;
+    const card = attachment.closest?.('[role="group"][aria-label]')
+      || attachment.closest?.('[data-testid*="file"], [data-testid*="attach"]')
+      || attachment.parentElement
+      || attachment;
     const statusText = [card?.textContent, card?.getAttribute?.('aria-label')].filter(Boolean).join(' ');
     const busy = /uploading|processing|attaching/i.test(statusText)
-      || Boolean(card?.querySelector?.('[role="progressbar"], progress, [aria-busy="true"]'));
+      || Boolean(card?.matches?.('.cursor-wait, [aria-busy="true"]'))
+      || Boolean(card?.querySelector?.('.cursor-wait, [role="progressbar"], progress, [aria-busy="true"]'));
     return {
       attached: true,
       busy,
+      selectedByInput,
       duplicateNotice: Boolean(duplicateNotice),
       dismissedDuplicate,
     };
+  })()`;
+}
+
+function buildSendButtonScript(allowClick = true) {
+  return `(() => {
+    const roots = [document];
+    const candidates = [];
+    const visited = new Set();
+    while (roots.length) {
+      const root = roots.shift();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      candidates.push(...root.querySelectorAll('button, [role="button"]'));
+      for (const element of root.querySelectorAll('*')) {
+        if (element.shadowRoot) roots.push(element.shadowRoot);
+      }
+    }
+    const stop = candidates.find((item) => {
+      const label = [item.getAttribute('data-testid'), item.getAttribute('aria-label'), item.getAttribute('title')]
+        .filter(Boolean).join(' ');
+      return /stop-button|stop generating|stop response/i.test(label)
+        && !item.disabled
+        && item.getAttribute('aria-disabled') !== 'true';
+    });
+    if (stop) return { found: true, enabled: false, submitted: true, clicked: false };
+    const button =
+      candidates.find((item) => item.getAttribute('data-testid') === 'send-button') ||
+      candidates.find((item) => /send prompt|send message|^send$/i.test([
+        item.getAttribute('aria-label'), item.getAttribute('title'), item.textContent,
+      ].filter(Boolean).join(' ').trim()));
+    if (!button) return { found: false, enabled: false, submitted: false, clicked: false };
+    const enabled = !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+    if (!enabled || !${Boolean(allowClick)}) {
+      return { found: true, enabled, submitted: false, clicked: false };
+    }
+    button.scrollIntoView?.({ block: 'center', inline: 'center' });
+    button.click();
+    return { found: true, enabled: true, submitted: false, clicked: true };
   })()`;
 }
 
@@ -1126,6 +1237,10 @@ class ChatGPTView {
     this.chatConversationListRequest = null;
     this.chatConversationRequests = new Map();
     this.chatConversationCache = new Map();
+    this.pageLoadStartedAt = Date.now();
+    this.pageLoadStoppedAt = 0;
+    this.pageLoadFailure = null;
+    this.recentConsoleErrors = [];
     // Keep ChatGPT transport pages out of the local Patchwork window. They still
     // use the persistent authenticated partition, but cannot cover or navigate
     // the native renderer. Task and Chat automation use separate webContents so
@@ -1181,18 +1296,59 @@ class ChatGPTView {
   installNavigationHandlers() {
     const contents = this.view.webContents;
     contents.setWindowOpenHandler(({ url }) => {
-      // Transport pages do not get child windows. Manual navigation belongs in
-      // the explicit app-owned ChatGPT session window below.
-      if (!isAllowedChatGPTUrl(url) && String(url || '').startsWith('https://')) {
-        shell.openExternal(url).catch(() => {});
+      if (!isChatGPTAuthenticationUrl(url)) {
+        if (!isAllowedChatGPTUrl(url) && String(url || '').startsWith('https://')) {
+          shell.openExternal(url).catch(() => {});
+        }
+        return { action: 'deny' };
       }
-      return { action: 'deny' };
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          parent: this.mainWindow,
+          width: 520,
+          height: 720,
+          webPreferences: {
+            partition: PARTITION,
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+          },
+        },
+      };
     });
-    contents.on('did-start-loading', () => this.onEvent({ type: 'browser-loading', loading: true }));
+    contents.on('did-create-window', (popup, details) => {
+      if (isChatGPTAuthenticationUrl(details.url)) this.installAuthenticationPopupHandlers(popup, contents);
+      else if (!isAllowedChatGPTUrl(details.url) && String(details.url || '').startsWith('https://')) {
+        shell.openExternal(details.url).catch(() => {});
+      }
+    });
+    contents.on('did-start-loading', () => {
+      this.pageLoadStartedAt = Date.now();
+      this.pageLoadStoppedAt = 0;
+      this.pageLoadFailure = null;
+      this.recentConsoleErrors = [];
+      this.onEvent({ type: 'browser-loading', loading: true });
+    });
     contents.on('did-stop-loading', () => {
+      this.pageLoadStoppedAt = Date.now();
       this.onEvent({ type: 'browser-loading', loading: false, url: contents.getURL() });
       this.installResultWatcher();
       this.scheduleTaskConfigurationPicker();
+    });
+    contents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (!isMainFrame || errorCode === -3) return;
+      this.pageLoadFailure = {
+        at: Date.now(),
+        errorCode,
+        errorDescription,
+        url: validatedURL,
+      };
+    });
+    contents.on('console-message', (_event, level, message) => {
+      if (Number(level) < 3) return;
+      this.recentConsoleErrors.push({ at: Date.now(), message: String(message || '') });
+      if (this.recentConsoleErrors.length > 50) this.recentConsoleErrors.shift();
     });
     contents.on('dom-ready', () => {
       this.installResultWatcher();
@@ -1227,6 +1383,38 @@ class ChatGPTView {
           ? 'The ChatGPT connection was interrupted and is restarting automatically.'
           : `The ChatGPT connection stopped: ${details.reason}`,
       });
+    });
+  }
+
+  installAuthenticationPopupHandlers(popup, callbackContents = this.view.webContents) {
+    const popupContents = popup.webContents;
+    const transferCallback = (event, url) => {
+      if (!isChatGPTAuthenticationCallbackUrl(url)) return;
+      event.preventDefault();
+      callbackContents.loadURL(url).catch(() => {});
+      if (!popup.isDestroyed()) popup.close();
+    };
+    popupContents.on('will-navigate', transferCallback);
+    popupContents.on('will-redirect', transferCallback);
+    popupContents.setWindowOpenHandler(({ url }) => {
+      if (!url.startsWith('https://')) return { action: 'deny' };
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          parent: this.mainWindow,
+          width: 520,
+          height: 720,
+          webPreferences: {
+            partition: PARTITION,
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+          },
+        },
+      };
+    });
+    popupContents.on('did-create-window', (nestedPopup) => {
+      this.installAuthenticationPopupHandlers(nestedPopup, callbackContents);
     });
   }
 
@@ -1481,7 +1669,10 @@ class ChatGPTView {
       const targetConversationId = conversationIdFromRouteUrl(conversationUrl);
       const conversationAlreadyOpen = currentUrl === conversationUrl
         || Boolean(targetConversationId && currentConversationId === targetConversationId);
-      if (!conversationAlreadyOpen) await this.view.webContents.loadURL(conversationUrl);
+      if (!conversationAlreadyOpen) {
+        const navigatedInPage = await this.navigateWithinChatGPT(conversationUrl);
+        if (!navigatedInPage) await this.view.webContents.loadURL(conversationUrl);
+      }
     }
     this.installResultWatcher();
   }
@@ -1502,7 +1693,8 @@ class ChatGPTView {
     // streamed thoughts may not be persisted yet, so keep the existing renderer alive when
     // both routes identify the same conversation.
     if (!conversationAlreadyOpen) {
-      await this.view.webContents.loadURL(task.conversationUrl);
+      const navigatedInPage = await this.navigateWithinChatGPT(task.conversationUrl);
+      if (!navigatedInPage) await this.view.webContents.loadURL(task.conversationUrl);
     }
     this.installResultWatcher();
     await this.onEvent({
@@ -1515,10 +1707,9 @@ class ChatGPTView {
 
   async newChat(projectId = null, projectShortUrl = null) {
     const targetUrl = projectId ? chatGPTProjectUrl(projectId, projectShortUrl) : CHATGPT_URL;
-    if (this.view.webContents.getURL() !== targetUrl) {
+    const navigatedInPage = await this.navigateWithinChatGPT(targetUrl, { preferNewChat: true });
+    if (!navigatedInPage && this.view.webContents.getURL() !== targetUrl) {
       await this.view.webContents.loadURL(targetUrl);
-    } else {
-      await this.view.webContents.reload();
     }
     return true;
   }
@@ -2275,6 +2466,11 @@ class ChatGPTView {
           },
         };
       });
+      this.chatSessionWindow.webContents.on('did-create-window', (popup, details) => {
+        if (isChatGPTAuthenticationUrl(details.url)) {
+          this.installAuthenticationPopupHandlers(popup, this.chatSessionWindow.webContents);
+        }
+      });
       this.chatSessionWindow.webContents.on('did-start-loading', () => {
         this.onEvent({ type: 'session-loading', loading: true });
       });
@@ -2363,6 +2559,52 @@ class ChatGPTView {
     const contents = this.chatSessionWindow?.webContents;
     if (contents && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
     return true;
+  }
+
+  async navigateWithinChatGPT(targetUrl, { preferNewChat = false } = {}) {
+    if (typeof this.view?.webContents?.executeJavaScript !== 'function') return false;
+    const result = await this.view.webContents.executeJavaScript(`(() => {
+      const target = new URL(${JSON.stringify(targetUrl)});
+      const targetRoute = target.pathname + target.search + target.hash;
+      const currentRoute = location.pathname + location.search + location.hash;
+      const visible = (element) => {
+        if (!element) return false;
+        const style = getComputedStyle(element);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const controls = [...document.querySelectorAll('a[href], button')].filter(visible);
+      const label = (element) => [
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.textContent,
+      ].filter(Boolean).join(' ').trim();
+      const exactLink = controls.find((element) => {
+        if (!(element instanceof HTMLAnchorElement)) return false;
+        try {
+          const url = new URL(element.href, location.href);
+          return url.origin === target.origin
+            && url.pathname + url.search + url.hash === targetRoute;
+        } catch {
+          return false;
+        }
+      });
+      const newChatControl = controls.find((element) =>
+        element.matches('[data-testid="create-new-chat-button"], [data-testid="new-chat-button"]')
+        || /^(?:new chat|start new chat|new conversation)$/i.test(label(element)));
+      const control = preferNewChat
+        ? (currentRoute === targetRoute ? newChatControl || exactLink : exactLink || newChatControl)
+        : exactLink;
+      if (control) {
+        control.click();
+        return { navigated: true, method: 'in-page-control' };
+      }
+      if (currentRoute === targetRoute) {
+        return { navigated: true, method: 'reuse-current-page' };
+      }
+      return { navigated: false, method: 'unavailable' };
+    })()`, true).catch(() => ({ navigated: false, method: 'script-failed' }));
+    if (result?.navigated) await delay(300);
+    return Boolean(result?.navigated);
   }
 
   async listProjects() {
@@ -2514,6 +2756,50 @@ class ChatGPTView {
     };
   }
 
+  async reload() {
+    this.view.webContents.reload();
+    return true;
+  }
+
+  async resetAuthentication() {
+    const contents = this.view.webContents;
+    const browserSession = contents.session;
+    await browserSession.clearAuthCache();
+    await browserSession.clearStorageData();
+    await browserSession.clearCache();
+    await browserSession.closeAllConnections();
+    contents.navigationHistory.clear();
+    await contents.loadURL(CHATGPT_LOGIN_URL);
+    if (this.chatView && !this.chatView.isDestroyed()) {
+      this.chatView.webContents.navigationHistory.clear();
+      await this.chatView.webContents.loadURL(CHATGPT_URL);
+    }
+    if (this.chatSessionWindow && !this.chatSessionWindow.isDestroyed()) {
+      this.chatSessionWindow.webContents.navigationHistory.clear();
+      await this.chatSessionWindow.webContents.loadURL(CHATGPT_LOGIN_URL);
+      this.chatSessionWindow.show();
+    }
+    await this.onEvent({
+      type: 'browser-authentication-reset',
+      message: 'ChatGPT sign-in data was cleared. Start a fresh login when ready.',
+    });
+    return true;
+  }
+
+  async goBack() {
+    if (this.view.webContents.navigationHistory.canGoBack()) {
+      this.view.webContents.navigationHistory.goBack();
+    }
+    return true;
+  }
+
+  async goForward() {
+    if (this.view.webContents.navigationHistory.canGoForward()) {
+      this.view.webContents.navigationHistory.goForward();
+    }
+    return true;
+  }
+
   async waitForComposer(timeoutMilliseconds = 12_000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < timeoutMilliseconds) {
@@ -2527,6 +2813,42 @@ class ChatGPTView {
       await delay(350);
     }
     return false;
+  }
+
+  pageLoadFailureReason(now = Date.now()) {
+    this.recentConsoleErrors = this.recentConsoleErrors || [];
+    if (this.pageLoadFailure) {
+      return `the main page failed to load (${this.pageLoadFailure.errorDescription || this.pageLoadFailure.errorCode})`;
+    }
+    if (this.view?.webContents?.isLoading?.()
+      && this.pageLoadStartedAt
+      && now - this.pageLoadStartedAt >= PAGE_LOAD_RECOVERY_THRESHOLD_MILLISECONDS) {
+      return 'the page was still loading after several seconds';
+    }
+    if (this.recentConsoleErrors.length >= PAGE_LOAD_CONSOLE_ERROR_THRESHOLD) {
+      return `the page produced ${this.recentConsoleErrors.length} console errors while loading`;
+    }
+    return null;
+  }
+
+  async recoverSubmissionPage(task, reason, recoveryNumber) {
+    await this.onEvent({
+      type: 'browser-load-recovery',
+      taskId: task.taskId,
+      message: `ChatGPT did not finish loading correctly (${reason}). Reopening a fresh composer inside the existing ChatGPT page (${recoveryNumber}/${MAX_SUBMISSION_PAGE_RECOVERIES}) and retrying the automation…`,
+    });
+    this.pageLoadStartedAt = Date.now();
+    this.pageLoadStoppedAt = 0;
+    this.pageLoadFailure = null;
+    this.recentConsoleErrors = [];
+    const targetUrl = task.chatgptProject?.id
+      ? chatGPTProjectUrl(task.chatgptProject.id, task.chatgptProject.shortUrl)
+      : CHATGPT_URL;
+    await ChatGPTView.prototype.navigateWithinChatGPT.call(
+      this,
+      targetUrl,
+      { preferNewChat: true },
+    );
   }
 
   async configureTaskModel(task) {
@@ -2634,6 +2956,20 @@ class ChatGPTView {
           postData = body?.postData;
         }
         const rewritten = rewriteConversationRequestBody(postData, configuration);
+        const packageFilename = task?.packagePath ? path.basename(task.packagePath) : '';
+        if (isConversation && packageFilename
+          && !conversationRequestIncludesAttachment(rewritten.text, packageFilename)) {
+          await debuggerApi.sendCommand('Fetch.failRequest', {
+            requestId,
+            errorReason: 'Aborted',
+          });
+          complete({
+            ok: false,
+            retrySubmission: true,
+            error: `ChatGPT's outgoing request did not include the task ZIP attachment (${packageFilename}).`,
+          });
+          return;
+        }
         await debuggerApi.sendCommand('Fetch.continueRequest', {
           requestId,
           postData: Buffer.from(rewritten.text, 'utf8').toString('base64'),
@@ -2687,7 +3023,11 @@ class ChatGPTView {
             error: 'ChatGPT did not send a conversation request after Send.',
           })),
         ]);
-        if (!result.ok) throw new Error(result.error || 'Could not verify ChatGPT’s outgoing model request.');
+        if (!result.ok) {
+          const error = new Error(result.error || 'Could not verify ChatGPT’s outgoing model request.');
+          error.retrySubmission = Boolean(result.retrySubmission);
+          throw error;
+        }
         return result;
       },
       dispose: async () => {
@@ -2790,20 +3130,37 @@ class ChatGPTView {
         files: [packagePath],
         nodeId,
       });
-      const eventDispatched = await webContents.executeJavaScript(`(() => {
-        const filename = ${JSON.stringify(filename)};
-        const input = [...document.querySelectorAll('input[type="file"]')]
-          .find((element) => [...element.files].some((file) => file.name === filename));
-        if (!input) return false;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      })()`, true);
+      const dispatchSelectedFileInput = this.dispatchSelectedFileInput
+        || ChatGPTView.prototype.dispatchSelectedFileInput;
+      const eventDispatched = await dispatchSelectedFileInput.call(this, filename, webContents);
       if (!eventDispatched) throw new Error('ChatGPT did not accept the selected task package. Nothing was submitted.');
     } finally {
       if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
     }
     await this.waitForPackageAttachment(path.basename(packagePath), 60_000, webContents);
+  }
+
+  async dispatchSelectedFileInput(filename, webContents = this.view.webContents) {
+    return webContents.executeJavaScript(`(() => {
+      const filename = ${JSON.stringify(filename)};
+      const roots = [document];
+      const visited = new Set();
+      let input = null;
+      while (roots.length && !input) {
+        const root = roots.shift();
+        if (!root || visited.has(root)) continue;
+        visited.add(root);
+        input = [...root.querySelectorAll('input[type="file"]')]
+          .find((element) => [...(element.files || [])].some((file) => file.name === filename));
+        for (const element of root.querySelectorAll('*')) {
+          if (element.shadowRoot) roots.push(element.shadowRoot);
+        }
+      }
+      if (!input) return false;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`, true).catch(() => false);
   }
 
   async uploadAttachments(attachments = [], webContents = null) {
@@ -2819,9 +3176,17 @@ class ChatGPTView {
   async packageAttachmentStatus(
     filename,
     dismissDuplicateNotice = false,
-    webContents = this.view.webContents,
+    webContents = null,
   ) {
-    return webContents.executeJavaScript(
+    const contents = webContents || this.view?.webContents;
+    if (!contents) return {
+      attached: false,
+      busy: false,
+      selectedByInput: false,
+      duplicateNotice: false,
+      dismissedDuplicate: false,
+    };
+    return contents.executeJavaScript(
       buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice),
       true,
     ).catch(() => ({
@@ -2835,14 +3200,19 @@ class ChatGPTView {
   async waitForPackageAttachment(
     filename,
     timeoutMilliseconds = 60_000,
-    webContents = this.view.webContents,
+    webContents = null,
   ) {
     const startedAt = Date.now();
     let consecutiveReadyChecks = 0;
+    let lastRedispatchAt = startedAt;
     while (Date.now() - startedAt < timeoutMilliseconds) {
       const status = await this.packageAttachmentStatus(filename, true, webContents);
       consecutiveReadyChecks = status.attached && !status.busy ? consecutiveReadyChecks + 1 : 0;
       if (consecutiveReadyChecks >= 2) return true;
+      if (!status.attached && status.selectedByInput && Date.now() - lastRedispatchAt >= 1_000) {
+        lastRedispatchAt = Date.now();
+        await this.dispatchSelectedFileInput(filename, webContents || this.view?.webContents);
+      }
       await delay(500);
     }
     throw new Error(`ChatGPT did not confirm the attachment ${filename}. Nothing was submitted; open ChatGPT to verify sign-in, then retry.`);
@@ -2860,25 +3230,25 @@ class ChatGPTView {
 
   async clickSend(timeoutMilliseconds = 60_000) {
     const startedAt = Date.now();
+    let clicked = false;
+    let lastClickedAt = 0;
     while (Date.now() - startedAt < timeoutMilliseconds) {
-      const result = await this.view.webContents.executeJavaScript(`(() => {
-        const candidates = [...document.querySelectorAll('button')];
-        const button =
-          document.querySelector('[data-testid="send-button"]') ||
-          candidates.find((item) => /send prompt|send message|^send$/i.test([
-            item.getAttribute('aria-label'), item.getAttribute('title'), item.textContent,
-          ].filter(Boolean).join(' ').trim()));
-        if (!button) return { found: false, enabled: false };
-        if (button.disabled || button.getAttribute('aria-disabled') === 'true') {
-          return { found: true, enabled: false };
-        }
-        button.click();
-        return { found: true, enabled: true };
-      })()`, true).catch(() => ({ found: false, enabled: false }));
-      if (result.enabled) return true;
-      await delay(500);
+      if (clicked && isChatGPTConversationUrl(this.view.webContents.getURL())) return true;
+      const allowClick = !clicked || Date.now() - lastClickedAt >= 1_500;
+      const result = await this.view.webContents.executeJavaScript(
+        buildSendButtonScript(allowClick),
+        true,
+      ).catch(() => ({ found: false, enabled: false, submitted: false, clicked: false }));
+      if (result.submitted || (clicked && result.found && !result.enabled)) return true;
+      if (result.clicked) {
+        clicked = true;
+        lastClickedAt = Date.now();
+      }
+      await delay(clicked ? 250 : 500);
     }
-    throw new Error('ChatGPT did not enable the Send button. The attachment may still be uploading.');
+    throw new Error(clicked
+      ? 'ChatGPT did not start the conversation after Send. The composer may be blocked or still processing the attachment.'
+      : 'ChatGPT did not enable the Send button. The attachment may still be uploading.');
   }
 
   async submit(task) {
@@ -2901,6 +3271,36 @@ class ChatGPTView {
   }
 
   async submitTask(task) {
+    let recoveryReason = null;
+    for (let recoveryAttempt = 0; recoveryAttempt <= MAX_SUBMISSION_PAGE_RECOVERIES; recoveryAttempt += 1) {
+      this.submissionSendStarted = false;
+      try {
+        const submitOnce = this.submitOnce || ChatGPTView.prototype.submitOnce;
+        return await submitOnce.call(this, task);
+      } catch (error) {
+        const attachmentRetryReason = error.retrySubmission
+          ? 'the outgoing request omitted the task ZIP'
+          : null;
+        const detectedReason = !this.submissionSendStarted
+          ? ChatGPTView.prototype.pageLoadFailureReason.call(this)
+          : null;
+        const reason = attachmentRetryReason || detectedReason || (recoveryReason && !this.submissionSendStarted
+          ? 'the page was still not ready after the previous refresh'
+          : null);
+        if (!reason || recoveryAttempt >= MAX_SUBMISSION_PAGE_RECOVERIES) throw error;
+        recoveryReason = detectedReason || recoveryReason;
+        await ChatGPTView.prototype.recoverSubmissionPage.call(
+          this,
+          task,
+          reason,
+          recoveryAttempt + 1,
+        );
+      }
+    }
+    throw new Error('ChatGPT submission recovery stopped unexpectedly.');
+  }
+
+  async submitOnce(task) {
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -2924,12 +3324,18 @@ class ChatGPTView {
     await this.configureTaskModel(task);
     const requestEnforcement = await this.beginTaskRequestEnforcement(task);
     let verifiedRequest;
+    let automationSendStarted = false;
     try {
       await this.injectPrompt(task.handoffPrompt);
       await this.uploadPackage(task.packagePath);
       await ChatGPTView.prototype.uploadAttachments.call(this, task.attachments);
+      automationSendStarted = true;
+      this.submissionSendStarted = true;
       await this.clickSend();
       verifiedRequest = await requestEnforcement.wait();
+    } catch (error) {
+      error.automationSendStarted = automationSendStarted;
+      throw error;
     } finally {
       await requestEnforcement.dispose();
     }
@@ -3322,7 +3728,8 @@ class ChatGPTView {
       const conversationAlreadyOpen = currentUrl === task.conversationUrl
         || Boolean(taskConversationId && currentConversationId === taskConversationId);
       if (!conversationAlreadyOpen) {
-        await this.view.webContents.loadURL(task.conversationUrl);
+        const navigatedInPage = await this.navigateWithinChatGPT(task.conversationUrl);
+        if (!navigatedInPage) await this.view.webContents.loadURL(task.conversationUrl);
       }
 
       this.resultAttempts.delete(taskId);
@@ -3420,19 +3827,24 @@ class ChatGPTView {
 module.exports = {
   CHATGPT_URL,
   CHATGPT_ALLOWED_HOSTS,
+  CHATGPT_LOGIN_URL,
   ChatGPTView,
   buildTaskConfigurationScript,
   chatGPTProjectUrl,
   buildLimitNoticeDismissalScript,
   buildPackageAttachmentStatusScript,
+  buildSendButtonScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   buildConversationStatusScript,
   conversationStreamStatusUrl,
+  conversationRequestIncludesAttachment,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
+  isChatGPTAuthenticationCallbackUrl,
   isChatGPTConversationUrl,
   isAllowedChatGPTUrl,
+  isChatGPTAuthenticationUrl,
   isDismissibleLimitNotice,
   chatMessageSources,
   chatMessageText,

@@ -6,7 +6,7 @@ Patchwork does not use the OpenAI developer API or copy ChatGPT authentication c
 
 ## App shell and workspaces
 
-Patchwork opens to **Home**, where a centered task composer accepts the coding request and exposes repository, model, reasoning, target, project, attachment, skill, and prompt choices. The left rail provides **New task**, **New chat**, recent tasks, and navigation to **Chats**, **Source control**, **Coding trees**, and **Task history**. The rail can collapse, and the selected system/light/dark theme is retained locally.
+Patchwork opens to **Home**, where a centered task composer accepts the coding request and exposes repository, model, reasoning, target, project, attachment, skill, prompt, and optional infrastructure-context choices. All repositories in the workspace are included in a task; the selected primary repository is used as the writable source when creating a coding tree. The left rail provides **New task**, **New chat**, recent tasks, and navigation to **Chats**, **Source control**, **Coding trees**, and **Task history**. The rail can collapse, and the selected system/light/dark theme is retained locally.
 
 The app shell is inspired by the information density and interaction patterns of the official ChatGPT desktop app, but its layout, components, styling, and icons are implemented independently for Patchwork. ChatGPT's web UI is not rendered inside the native workspace. Long-running authenticated operations continue in hidden transport windows and surface progress, errors, and recovery actions in the native renderer.
 
@@ -54,24 +54,28 @@ The Home composer keeps skills out of the main form. **Skills** opens a compact 
 
 The generated task instructions tell ChatGPT that skills may be present and to read or invoke a selected skill only when it is relevant to the task. Unrelated skills remain available in the package but should not be loaded just because they were selected.
 
+## Infrastructure context
+
+Copy `settings.example.json` to `settings.json` and add local paths, `file://` URLs, or remote Git URLs under `iac_urls`. The Home composer then offers an opt-in **Include infrastructure context** control. Configured IaC repositories are captured as read-only bundles under `iac/`; dirty local repositories are snapshotted so ChatGPT sees their current working state without making those repositories patch targets. Packaged installs can set `PATCHWORK_IAC_SETTINGS` to an explicit settings-file path.
+
 ## Prompt library
 
 The Home composer includes a local **Prompt library** dialog. Saved prompts have a name, short description, and reusable instruction text. Multiple prompts can be selected for a task, removed from the selection as chips, and managed from the prompt library dialog. The instruction text is appended to the task only when selected, and the saved library stays local to the Patchwork installation. A saved prompt named **Git Summary** is also used by Source control's AI summary action.
 
 ## Current workflow
 
-1. Patchwork opens to the native Home workspace. Add a repository, describe a task, and optionally choose a coding-tree target, model, reasoning mode, ChatGPT project, attachments, skills, or saved prompts. The selected task configuration stays sticky where supported and is restored after application restarts.
-2. Choose **New task**, then use the current working changes, create a coding tree from one clean, committed Git repository, or attach the task to an existing tree. Every task uses a fresh ChatGPT conversation destination.
-3. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, and the selected repository or coding-tree Git bundles under `repositories/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
+1. Patchwork opens to the native Home workspace. Add one or more repositories, describe a task, and optionally choose a coding-tree target, model, reasoning mode, ChatGPT project, attachments, skills, saved prompts, or configured IaC context. The selected task configuration stays sticky where supported and is restored after application restarts.
+2. Choose **New task**, then use the current working changes from all workspace repositories, create a coding tree from the primary clean, committed Git repository, or attach the task to an existing tree. Additional repositories become deduplicated read-only context for coding-tree tasks. Every task uses a fresh ChatGPT conversation destination.
+3. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, repository or coding-tree Git bundles under `repositories/`, and opted-in read-only IaC bundles under `iac/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
 4. Patchwork prepares the selected ChatGPT destination through a hidden authenticated transport window, injects the instructions, attaches the ZIP package plus any user-selected reference files, waits for the attachments to finish processing, and clicks ChatGPT's Send control. The React workspace remains a native Patchwork surface throughout.
-5. If authentication or manual intervention is required, open the separate app-owned ChatGPT window, sign in or complete the action there, then return to Patchwork. **Copy prompt**, **Show package**, and **Import result** remain available if automation cannot complete.
+5. If authentication or manual intervention is required, open the separate app-owned ChatGPT window, sign in or complete the action there, then return to Patchwork. Authentication popups and callbacks remain in the persistent browser partition. **Reset sign-in** clears only that partition and opens a fresh login without affecting tasks or repositories. **Copy prompt**, **Show package**, and **Import result** remain available if automation cannot complete.
 6. ChatGPT follows the Patchwork protocol and attaches `chatgpt-ide-result-<task-id>.txt`, containing a marked `PATCHWORK_RESULT_V1` JSON envelope with base64-encoded `git diff --binary` patches. The envelope is not printed in the chat.
 7. Patchwork's application-level monitor activates that exact download, reads the text file locally, verifies the task ID, repository set, base commits, size limits, and base64 integrity, then applies the patch to the task target. Coding-tree tasks also verify the Conventional Commit message and commit the patch. If the target's `HEAD` advanced, Patchwork first tries a clean contextual apply and then Git's three-way merge.
 8. When **Merge tree** is chosen, Patchwork opens another fresh ChatGPT chat through the authenticated transport with the tree's commit history and diff summary. It reads the returned merge envelope, creates one squash commit on the original branch through a temporary integration worktree, and removes the coding tree.
 
 If Git reports conflicts, Patchwork leaves the conflict markers and unmerged files in the target, reports the affected files, and offers **Retry apply**. It also offers **Resolve with ChatGPT** when the task has a writable target, which opens a new ChatGPT task containing the current dirty target, `CONFLICTS.md`, the original result patch, and the original task attachments.
 
-If page automation is temporarily unavailable because ChatGPT's markup changed, the authenticated transport remains isolated and Patchwork does not corrupt the native workspace. Use the separate app-owned ChatGPT window for sign-in or manual recovery, or use **Copy prompt**, **Show package**, and **Import result** to complete the workflow manually.
+If page automation is temporarily unavailable because ChatGPT's markup changed, the authenticated transport remains isolated and Patchwork does not corrupt the native workspace. Before Send, Patchwork can recover a failed or stalled page in place and retry a task whose outgoing request omitted the ZIP; after Send begins it will not retry and risk a duplicate submission. Use the separate app-owned ChatGPT window for sign-in or manual recovery, or use **Copy prompt**, **Show package**, and **Import result** to complete the workflow manually.
 
 ## Development
 

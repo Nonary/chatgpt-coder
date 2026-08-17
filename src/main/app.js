@@ -3,12 +3,16 @@ const fs = require('node:fs/promises');
 const { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell } = require('electron');
 const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
+const { IacService } = require('./iac-service');
 const { ResultService } = require('./result-service');
 const { SkillService } = require('./skill-service');
-const { resolveGitSummaryPrompt, TaskService } = require('./task-service');
+const { resolveGitSummaryPrompt, resolveTreeTaskRepositories, TaskService } = require('./task-service');
 const { validateCommitMessage, WorktreeService } = require('./worktree-service');
 
 const HEADLESS = process.env.PATCHWORK_HEADLESS === '1';
+const AUTH_SERVER_ALLOWLIST = process.env.PATCHWORK_AUTH_SERVER_ALLOWLIST || 'ap.idf.medcity.net';
+app.commandLine.appendSwitch('auth-server-allowlist', AUTH_SERVER_ALLOWLIST);
+app.commandLine.appendSwitch('auth-server-whitelist', AUTH_SERVER_ALLOWLIST);
 if (process.env.PATCHWORK_DEBUG_PORT) {
   app.commandLine.appendSwitch('remote-debugging-port', process.env.PATCHWORK_DEBUG_PORT);
 }
@@ -22,6 +26,7 @@ let taskService;
 let gitService;
 let resultService;
 let skillService;
+let iacService;
 let worktreeService;
 let chatGPTView;
 const chosenAttachmentPaths = new Map();
@@ -200,8 +205,8 @@ function registerIpc() {
   });
   ipcMain.handle('repositories:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
-      title: 'Choose a Git repository',
-      properties: ['openDirectory'],
+      title: 'Choose Git repositories',
+      properties: ['openDirectory', 'multiSelections'],
     });
     if (response.canceled) return [];
     return gitService.addRepositories(response.filePaths);
@@ -242,6 +247,10 @@ function registerIpc() {
     assertMainWindowRenderer(event);
     return chatGPTView.reloadChatSession();
   });
+  ipcMain.handle('session:reset-authentication', async (event) => {
+    assertMainWindowRenderer(event);
+    return chatGPTView.resetAuthentication();
+  });
   ipcMain.handle('session:new-chat', async (event) => {
     assertMainWindowRenderer(event);
     return chatGPTView.openChatInSession();
@@ -260,6 +269,7 @@ function registerIpc() {
     const skills = await skillService.discover(Array.isArray(repositoryPaths) ? repositoryPaths : []);
     return skills.map(({ sourcePath, skillFile, ...skill }) => skill);
   });
+  ipcMain.handle('iac:config', async () => iacService.getConfig());
 
   ipcMain.handle('attachments:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
@@ -299,7 +309,7 @@ function registerIpc() {
     const prompt = resolveGitSummaryPrompt(customPrompt);
     const task = await taskService.createTask({
       taskText: prompt,
-      repositories: [{ path: status.repository.path }],
+      repositories: [{ path: status.repository.path, readOnly: true }],
       model: 'luna',
       reasoningMode: 'medium',
       autoApply: false,
@@ -453,6 +463,8 @@ function registerIpc() {
       throw new Error('Describe the software task before creating a task package.');
     }
     let tree = null;
+    let taskRepositories = input.repositories;
+    let skillsResolved = false;
     let skillRepositoryPaths = Array.isArray(input.repositories)
       ? input.repositories.map((item) => item.path)
       : [];
@@ -461,12 +473,12 @@ function registerIpc() {
       const inspected = await worktreeService.inspect(tree);
       if (!inspected.available) throw new Error(inspected.error);
       if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
-      skillRepositoryPaths = [tree.path];
     } else if (input.createTree) {
-      if (!Array.isArray(input.repositories) || input.repositories.length !== 1) {
-        throw new Error('Choose exactly one repository when creating a coding tree.');
+      if (!Array.isArray(input.repositories) || input.repositories.length === 0) {
+        throw new Error('Choose at least one repository when creating a coding tree.');
       }
       await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
+      skillsResolved = true;
       const suggestedName = String(input.treeName || input.taskText || '').split('\n')[0].trim();
       tree = await worktreeService.create(input.repositories[0].path, suggestedName);
     } else if (Array.isArray(input.repositories) && input.repositories.length === 1) {
@@ -479,11 +491,15 @@ function registerIpc() {
       }
       if (tree) skillRepositoryPaths = [tree.path];
     }
-    if (!input.createTree) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
+    if (tree) {
+      taskRepositories = await resolveTreeTaskRepositories(tree, input.repositories);
+      skillRepositoryPaths = taskRepositories.map((item) => item.path);
+    }
+    if (!skillsResolved) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
     const task = await taskService.createTask({
       ...input,
       skillRepositoryPaths,
-      repositories: tree ? [{ path: tree.path }] : input.repositories,
+      repositories: taskRepositories,
       tree,
       autoApply: true,
     });
@@ -688,7 +704,10 @@ if (!hasSingleInstanceLock) {
   app.whenReady().then(async () => {
   const dataRoot = path.join(app.getPath('userData'), 'patchwork');
   skillService = new SkillService();
-  taskService = new TaskService(dataRoot, skillService);
+  iacService = new IacService({
+    settingsPath: process.env.PATCHWORK_IAC_SETTINGS || path.join(app.getAppPath(), 'settings.json'),
+  });
+  taskService = new TaskService(dataRoot, skillService, iacService);
   await taskService.initialize();
   gitService = new GitService(dataRoot);
   await gitService.initialize();
