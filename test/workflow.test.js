@@ -10,9 +10,11 @@ const {
   CHATGPT_URL,
   ChatGPTView,
   buildConversationStatusScript,
+  conversationRequestIncludesAttachment,
   buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
   buildPackageAttachmentStatusScript,
+  buildSendButtonScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   conversationIdFromRouteUrl,
@@ -134,6 +136,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-summary-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
+  const resolvedRepositoryPath = await fs.realpath(repositoryPath);
   await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'staged change\n');
   await runGit(repositoryPath, ['add', 'hello.txt']);
   await fs.writeFile(path.join(repositoryPath, 'unstaged.txt'), 'unstaged change\n');
@@ -149,6 +152,9 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   });
 
   assert.equal(task.summaryOnly, true);
+  assert.equal(task.repositories.length, 1);
+  assert.equal(task.repositories[0].path, resolvedRepositoryPath);
+  assert.equal(task.repositories[0].readOnly, true);
   assert.equal(task.repositories[0].workingChanges, true);
   assert.match(task.resultFilename, /^chatgpt-ide-result-[0-9a-f-]{36}\.txt$/i);
   assert.match(task.handoffPrompt, /PATCHWORK_RESULT_V1/);
@@ -159,6 +165,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
   assert.equal(manifest.repositories[0].workingChanges, true);
   assert.equal(manifest.repositories[0].snapshot, true);
+  assert.equal(manifest.repositories[0].readOnly, true);
   const agentInstructions = zip.getEntry('AGENTS.md').getData().toString('utf8');
   assert.match(agentInstructions, /read-only Git summary task/i);
   assert.match(agentInstructions, /PATCHWORK_RESULT_V1/);
@@ -186,6 +193,7 @@ test('Source Control summaries run as persistent Luna Medium tasks with an expli
   );
 
   assert.match(summaryHandler, /model: 'luna',[\s\S]*reasoningMode: 'medium'/);
+  assert.match(summaryHandler, /repositories: \[\{ path: status\.repository\.path, readOnly: true \}\]/);
   assert.match(summaryHandler, /type: 'task-prepared'/);
   assert.match(summaryHandler, /state: 'completed'/);
   assert.match(summaryHandler, /type: 'git-summary-ready',[\s\S]*task: publicTask\(completed\)/);
@@ -2004,6 +2012,62 @@ test('conversation payload rewriting enforces the selected model and thinking ef
   assert.equal(lowPayload.thinking_effort, 'min');
 });
 
+test('conversation attachment verification accepts ChatGPT file assets without the original filename', () => {
+  const filename = 'chatgpt-ide-task-example.zip';
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    messages: [{ content: { parts: [{ name: filename, asset_pointer: 'file-service://asset' }] } }],
+  }), filename), true);
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    messages: [{ content: { parts: [{ content_type: 'file_asset_pointer', asset_pointer: 'file-service://asset-id' }] } }],
+  }), filename), true);
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    attachments: [{ id: 'asset-id-without-filename' }],
+  }), filename), true);
+  assert.equal(conversationRequestIncludesAttachment(JSON.stringify({
+    messages: [{ content: { parts: ['I attached a task ZIP.'] } }],
+  }), filename), false);
+});
+
+test('task request enforcement aborts and retries a text-only send without the task ZIP', async () => {
+  const commands = [];
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (command, params) => {
+    commands.push({ command, params });
+    return {};
+  };
+  const view = {
+    view: {
+      webContents: {
+        debugger: debuggerApi,
+        executeJavaScript: async () => null,
+      },
+    },
+  };
+  const enforcement = await ChatGPTView.prototype.beginTaskRequestEnforcement.call(view, {
+    model: 'default',
+    reasoningMode: 'default',
+    packagePath: '/tasks/chatgpt-ide-task-example.zip',
+  });
+  debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
+    requestId: 'request-without-package',
+    request: {
+      method: 'POST',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+      postData: JSON.stringify({ action: 'next', model: 'gpt-5-6', messages: [] }),
+    },
+  });
+
+  await assert.rejects(enforcement.wait(500), (error) => {
+    assert.match(error.message, /did not include the task ZIP attachment.*chatgpt-ide-task-example\.zip/i);
+    assert.equal(error.retrySubmission, true);
+    return true;
+  });
+  await enforcement.dispose();
+  assert.ok(commands.some((item) => item.command === 'Fetch.failRequest'));
+  assert.equal(commands.some((item) => item.command === 'Fetch.continueRequest'), false);
+});
+
 test('task request enforcement observes and rewrites ChatGPT’s actual conversation request', async () => {
   const commands = [];
   let attached = false;
@@ -2417,7 +2481,30 @@ test('task upload selects the composer file input and dispatches its change even
     params: { files: ['/tasks/chatgpt-ide-task-example.txt'], nodeId: 42 },
   });
   assert.match(scripts[0], /dispatchEvent\(new Event\('change'/);
+  assert.match(scripts[0], /element\.shadowRoot/);
   assert.equal(attachmentWaitedFor, 'chatgpt-ide-task-example.txt');
+});
+
+test('attachment wait redispatches a selected ZIP when ChatGPT hydration missed the first change event', async () => {
+  const statuses = [
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: true, busy: false, selectedByInput: true },
+    { attached: true, busy: false, selectedByInput: true },
+  ];
+  let redispatches = 0;
+  const view = {
+    packageAttachmentStatus: async () => statuses.shift() || { attached: true, busy: false },
+    dispatchSelectedFileInput: async () => { redispatches += 1; return true; },
+  };
+
+  assert.equal(await ChatGPTView.prototype.waitForPackageAttachment.call(
+    view,
+    'chatgpt-ide-task-hydration.zip',
+    5_000,
+  ), true);
+  assert.equal(redispatches, 1);
 });
 
 test('task upload reuses an attachment that is already in the composer', async () => {
@@ -2481,7 +2568,7 @@ test('task attachment confirmation finds uploaded packages in a hidden view and 
   assert.equal(result.busy, false);
 });
 
-test('task attachment confirmation trusts the selected input before broad busy page matches', () => {
+test('task attachment confirmation keeps selected inputs pending until an attachment chip exists', () => {
   const filename = 'chatgpt-ide-task-hidden-input.zip';
   const fileInput = { files: [{ name: filename }] };
   const broadPageMatch = {
@@ -2509,8 +2596,89 @@ test('task attachment confirmation trusts the selected input before broad busy p
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
   });
 
+  assert.equal(result.attached, false);
+  assert.equal(result.busy, true);
+  assert.equal(result.selectedByInput, true);
+});
+
+test('task attachment confirmation accepts an exact filename chip without private test attributes', () => {
+  const filename = 'chatgpt-ide-task-filename-only.zip';
+  const chip = {
+    textContent: filename,
+    getAttribute: () => null,
+    closest: () => null,
+    parentElement: {
+      textContent: filename,
+      getAttribute: () => null,
+      querySelector: () => null,
+    },
+  };
+  const document = {
+    querySelectorAll: (selector) => {
+      if (selector === 'input[type="file"]') return [];
+      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') return [chip];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  });
+
   assert.equal(result.attached, true);
   assert.equal(result.busy, false);
+});
+
+test('task attachment confirmation waits for ChatGPT cursor-wait processing to finish', () => {
+  const filename = 'chatgpt-ide-task-processing.zip';
+  const tile = {
+    textContent: `${filename} Zip Archive`,
+    getAttribute: (name) => (name === 'aria-label' ? filename : null),
+    matches: () => false,
+    querySelector: (selector) => (selector.includes('.cursor-wait') ? { className: 'cursor-wait' } : null),
+  };
+  const attachment = {
+    textContent: filename,
+    getAttribute: (name) => (name === 'aria-label' ? filename : null),
+    closest: (selector) => (selector.includes('[role="group"]') ? tile : null),
+    parentElement: tile,
+  };
+  const document = {
+    querySelectorAll: (selector) => {
+      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') return [attachment];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
+    document,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
+  });
+
+  assert.equal(result.attached, true);
+  assert.equal(result.busy, true);
+});
+
+test('send automation finds the composer button inside a shadow root', () => {
+  let clicked = false;
+  const send = {
+    disabled: false,
+    textContent: '',
+    getAttribute: (name) => (name === 'data-testid' ? 'send-button' : null),
+    scrollIntoView: () => {},
+    click: () => { clicked = true; },
+  };
+  const shadowRoot = {
+    querySelectorAll: (selector) => (selector === 'button, [role="button"]' ? [send] : []),
+  };
+  const document = {
+    querySelectorAll: (selector) => (selector === '*' ? [{ shadowRoot }] : []),
+  };
+
+  const result = vm.runInNewContext(buildSendButtonScript(), { document });
+  assert.equal(result.clicked, true);
+  assert.equal(clicked, true);
 });
 
 test('task attachments upload after the package and before ChatGPT is sent', async () => {

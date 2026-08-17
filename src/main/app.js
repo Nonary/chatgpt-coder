@@ -163,7 +163,7 @@ function registerIpc() {
     const prompt = resolveGitSummaryPrompt(customPrompt);
     const task = await taskService.createTask({
       taskText: prompt,
-      repositories: [{ path: status.repository.path }],
+      repositories: [{ path: status.repository.path, readOnly: true }],
       model: 'luna',
       reasoningMode: 'medium',
       autoApply: false,

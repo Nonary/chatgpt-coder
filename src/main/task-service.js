@@ -413,6 +413,7 @@ class TaskService {
     }
     const model = normalizeTaskModel(input.model);
     const reasoningMode = normalizeReasoningMode(input.reasoningMode);
+    const summaryOnly = Boolean(input.summaryOnly);
 
     const repositories = await this.inspectRepositories(input.repositories.map((item) => item.path));
     const skillRepositoryPaths = Array.isArray(input.skillRepositoryPaths) && input.skillRepositoryPaths.length
@@ -488,7 +489,7 @@ class TaskService {
     const publicRepositories = [];
     const taskRepositories = [];
     for (const repository of repositories) {
-      const readOnly = Boolean(requestedRepositories.get(repository.path)?.readOnly);
+      const readOnly = summaryOnly || Boolean(requestedRepositories.get(repository.path)?.readOnly);
       const bundleFile = `repositories/${repository.id}.bundle`;
       const bundlePath = path.join(taskDir, bundleFile);
       let taskRepository;
@@ -553,7 +554,6 @@ class TaskService {
 
     const iacPackage = await this.packageIacRepositories(taskDir, Boolean(input.includeIac));
 
-    const summaryOnly = Boolean(input.summaryOnly);
     const createdAt = new Date().toISOString();
     const packageAttachments = attachments.map(({ name, size }) => ({
       name,
