@@ -2,6 +2,9 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { test } = require('node:test');
+const { EventEmitter } = require('node:events');
+
+const { scheduleTransportRecovery } = require('../src/main/chatgpt-view');
 
 const root = path.join(__dirname, '..');
 
@@ -26,6 +29,27 @@ test('ChatGPT transports are window-hosted and the renderer only gets explicit s
   assert.match(app, /ipcMain\.handle\('session:status'/);
   assert.match(preload, /openSession:[\s\S]*getSessionStatus:/);
   assert.match(app, /renderer-dist.*index\.html/);
+});
+
+test('a crashed ChatGPT transport reloads once and can recover again after loading', async () => {
+  const contents = new EventEmitter();
+  contents.id = 42;
+  contents.isDestroyed = () => false;
+  let reloads = 0;
+  contents.reload = () => { reloads += 1; };
+  const transportWindow = { webContents: contents, isDestroyed: () => false };
+  const attempts = new Set();
+
+  assert.equal(scheduleTransportRecovery(transportWindow, { reason: 'crashed' }, attempts, assert.fail, 0), true);
+  assert.equal(scheduleTransportRecovery(transportWindow, { reason: 'crashed' }, attempts, assert.fail, 0), false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(reloads, 1);
+
+  contents.emit('did-finish-load');
+  assert.equal(scheduleTransportRecovery(transportWindow, { reason: 'oom' }, attempts, assert.fail, 0), true);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(reloads, 2);
+  assert.equal(scheduleTransportRecovery(transportWindow, { reason: 'clean-exit' }, new Set(), assert.fail, 0), false);
 });
 
 test('native Chat accepts structured sends with positional compatibility', async () => {

@@ -21,10 +21,14 @@ const {
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
   isRetryableChatStatus,
+  chatRetryDelayMilliseconds,
+  parseRetryAfterMilliseconds,
+  chatMessageSources,
   chatMessageText,
   normalizeChatConversation,
   normalizeChatConversationId,
   normalizeConversationStreamStatus,
+  reconcileChatConversation,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,
   taskRequestConfiguration,
@@ -89,7 +93,7 @@ test('native Chat normalizes the active ChatGPT conversation branch safely', () 
       },
       'analysis-1': {
         id: 'analysis-1',
-        parent: 'user-1',
+        parent: 'thoughts-1',
         message: {
           id: 'analysis-message',
           author: { role: 'assistant' },
@@ -98,13 +102,31 @@ test('native Chat normalizes the active ChatGPT conversation branch safely', () 
           create_time: 1.5,
         },
       },
+      'thoughts-1': {
+        id: 'thoughts-1',
+        parent: 'user-1',
+        message: {
+          id: 'thoughts-message',
+          author: { role: 'assistant' },
+          channel: 'analysis',
+          content: {
+            content_type: 'thoughts',
+            thoughts: [
+              { summary: 'Earlier visible thought', finished: true },
+              { summary: 'Reviewing the visible context', finished: false },
+            ],
+          },
+          create_time: 1.25,
+          status: 'in_progress',
+        },
+      },
       'reasoning-1': {
         id: 'reasoning-1',
         parent: 'analysis-1',
         message: {
           id: 'reasoning-message',
           author: { role: 'assistant' },
-          content: { content_type: 'reasoning_recap', parts: ['Checked the visible context'] },
+          content: { content_type: 'reasoning_recap', content: 'Checked the visible context' },
           create_time: 1.75,
         },
       },
@@ -114,10 +136,13 @@ test('native Chat normalizes the active ChatGPT conversation branch safely', () 
         message: {
           id: 'assistant-message',
           author: { role: 'assistant' },
-          content: { parts: ['Hi', { text: 'from ChatGPT' }] },
+          content: { parts: ['Hi', { text: 'from ChatGPT\n\uE200cite\uE202turn0search0\uE201' }] },
           create_time: 2,
           status: 'finished_successfully',
           end_turn: true,
+          metadata: {
+            citations: [{ metadata: { url: 'https://example.com/source', title: 'Example source' } }],
+          },
         },
       },
       orphan: {
@@ -140,12 +165,53 @@ test('native Chat normalizes the active ChatGPT conversation branch safely', () 
   assert.equal(conversation.url, `https://chatgpt.com/g/g-p-project_123/c/${conversationId}`);
   assert.deepEqual(conversation.messages.map((message) => [message.role, message.kind, message.text]), [
     ['user', 'message', 'Hello'],
+    ['assistant', 'thought', 'Reviewing the visible context'],
     ['assistant', 'reasoning', 'Checked the visible context'],
     ['assistant', 'message', 'Hi\nfrom ChatGPT'],
   ]);
   assert.equal(chatMessageText({ content: { parts: [{ content: 'Text object' }] } }), 'Text object');
   assert.equal(chatMessageText({ content: { content_type: 'reasoning_recap', parts: ['Visible recap'] } }), 'Visible recap');
+  assert.equal(chatMessageText({ content: { content_type: 'reasoning_recap', content: 'Follow-up recap' } }), 'Follow-up recap');
+  assert.equal(chatMessageText({ content: { content_type: 'follow_up_summary', parts: ['Follow-up summary'] } }), 'Follow-up summary');
+  assert.equal(chatMessageText({ content: { content_type: 'thoughts', thoughts: [{ summary: 'Visible thought' }] } }), 'Visible thought');
+  assert.doesNotMatch(conversation.messages.at(-1).text, /turn0search0|\uE200|\uE201|\uE202/);
+  assert.deepEqual(conversation.messages.at(-1).sources, [{
+    url: 'https://example.com/source',
+    label: 'Example source',
+  }]);
+  assert.deepEqual(chatMessageSources({
+    metadata: { content_references: [{ url: 'javascript:alert(1)', title: 'Unsafe' }] },
+  }), []);
   assert.equal(normalizeChatConversation({ ...conversation, mapping: {} }, 'IS_STREAMING').status, 'streaming');
+});
+
+test('the rendered ChatGPT turn ends stale API streaming state after a follow-up', () => {
+  const apiConversation = {
+    id: '6a80f4cf-1650-83ea-8609-adb411b3e4bc',
+    status: 'streaming',
+    statusRaw: 'IS_STREAMING',
+    messages: [{ id: 'user-2', role: 'user', text: 'Follow up' }],
+  };
+  const renderedConversation = {
+    ...apiConversation,
+    status: 'completed',
+    statusRaw: null,
+    renderedFallback: true,
+    messages: [
+      ...apiConversation.messages,
+      { id: 'assistant-2', role: 'assistant', text: 'Done' },
+    ],
+  };
+
+  const result = reconcileChatConversation(apiConversation, renderedConversation);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.messages.at(-1).text, 'Done');
+
+  const pendingRender = reconcileChatConversation(apiConversation, {
+    ...renderedConversation,
+    messages: apiConversation.messages,
+  });
+  assert.equal(pendingRender.status, 'streaming');
 });
 
 test('native Chat is wired through the authenticated ChatGPT browser partition', async () => {
@@ -190,6 +256,8 @@ test('native Chat is wired through the authenticated ChatGPT browser partition',
   assert.match(chatViewSource, /function transportWindowOptions\(backgroundThrottling = false\)/);
   assert.match(chatViewSource, /partition: PARTITION/);
   assert.match(chatViewSource, /\/backend-api\/conversations/);
+  assert.match(chatViewSource, /CHAT_CONVERSATION_PAGE_SIZE = 20/);
+  assert.match(chatViewSource, /exclude_conversation_origin', 'tpp'/);
   assert.match(chatViewSource, /\/backend-api\/pins/);
   assert.match(chatViewSource, /\/backend-api\/conversation\//);
   assert.match(chatViewSource, /\/stream_status/);
@@ -197,6 +265,7 @@ test('native Chat is wired through the authenticated ChatGPT browser partition',
   assert.match(chatViewSource, /isRetryableChatStatus\(result\?\.status\)[\s\S]*getRenderedChatConversation\(id\)/);
   assert.match(chatViewSource, /waitForChatComposer[\s\S]*injectChatPrompt[\s\S]*clickChatSend[\s\S]*waitForChatPromptAcceptance/);
   assert.match(chatViewSource, /CHAT_API_RETRY_ATTEMPTS = 4/);
+  assert.match(chatViewSource, /CHAT_API_RETRY_BASE_DELAY_MILLISECONDS = 1_000/);
   assert.match(chatViewSource, /beginChatRequestEnforcement[\s\S]*Fetch.enable[\s\S]*requestStage: 'Response'/);
   assert.match(chatViewSource, /status === 429/);
   assert.match(chatViewSource, /retryAfterMilliseconds/);
@@ -1383,6 +1452,30 @@ test('existing Git worktrees are discovered from workspace repositories', async 
   assert.equal((await trees.list()).length, 0);
 });
 
+test('task creation preserves an existing worktree selected as the current repository', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-original-worktree-target-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const existingPath = path.join(root, 'existing-worktree');
+  await runGit(repositoryPath, ['worktree', 'add', '-b', 'feature/original-target', existingPath]);
+
+  const trees = new WorktreeService(
+    path.join(root, 'data'),
+    () => {},
+    async () => [{ path: repositoryPath }],
+  );
+  const tree = await trees.findForTask({ repositories: [{ path: existingPath }] });
+
+  assert.equal(tree.path, await fs.realpath(existingPath));
+  assert.equal(tree.repositoryPath, await fs.realpath(repositoryPath));
+  assert.equal(tree.branch, 'feature/original-target');
+  assert.equal(tree.clean, true);
+
+  const appSource = await fs.readFile(path.join(__dirname, '..', 'src', 'main', 'app.js'), 'utf8');
+  assert.match(appSource, /findForTask\(\{ repositories: input\.repositories \}\)/);
+  assert.match(appSource, /repositories: tree \? \[\{ path: tree\.path \}\] : input\.repositories/);
+});
+
 test('creating a task tree with the same repository and name reuses the existing tree', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-reused-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -2038,24 +2131,85 @@ test('task request enforcement observes and rewrites ChatGPT’s actual conversa
 
 test('native Chat retries transient conversation API responses before surfacing an error', async () => {
   let calls = 0;
+  const delays = [];
   const view = {
     chatView: {
       webContents: {
         executeJavaScript: async () => {
           calls += 1;
-          return calls === 1
+          return calls < 4
             ? { ok: false, status: 429, retryAfterMilliseconds: 0 }
             : { ok: true, items: [] };
         },
       },
     },
   };
-  const result = await ChatGPTView.prototype.executeChatApiWithRetry.call(view, 'ignored');
+  const result = await ChatGPTView.prototype.executeChatApiWithRetry.call(
+    view,
+    'ignored',
+    true,
+    async (milliseconds) => delays.push(milliseconds),
+  );
   assert.deepEqual(result, { ok: true, items: [] });
-  assert.equal(calls, 2);
+  assert.equal(calls, 4);
+  assert.deepEqual(delays, [1_000, 2_000, 4_000]);
   assert.equal(isRetryableChatStatus(429), true);
   assert.equal(isRetryableChatStatus(503), true);
+  assert.equal(isRetryableChatStatus(0), true);
+  assert.equal(isRetryableChatStatus(425), true);
   assert.equal(isRetryableChatStatus(400), false);
+  assert.equal(chatRetryDelayMilliseconds({ retryAfterMilliseconds: 0 }, 0), 1_000);
+  assert.equal(chatRetryDelayMilliseconds({ retryAfterMilliseconds: 8_000 }, 1), 8_000);
+  assert.equal(chatRetryDelayMilliseconds({ retryAfterMilliseconds: 90_000 }, 2), 30_000);
+  assert.equal(parseRetryAfterMilliseconds('0'), 0);
+  assert.equal(parseRetryAfterMilliseconds('90'), 30_000);
+});
+
+test('native Chat coalesces simultaneous conversation history refreshes', async () => {
+  let loadCalls = 0;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const view = {
+    chatConversationListRequest: null,
+    loadChatConversations: async () => {
+      loadCalls += 1;
+      return pending;
+    },
+  };
+
+  const first = ChatGPTView.prototype.listChatConversations.call(view);
+  const second = ChatGPTView.prototype.listChatConversations.call(view);
+  assert.equal(loadCalls, 1);
+  release([{ id: 'conversation-1' }]);
+  assert.deepEqual(await Promise.all([first, second]), [
+    [{ id: 'conversation-1' }],
+    [{ id: 'conversation-1' }],
+  ]);
+  assert.equal(view.chatConversationListRequest, null);
+});
+
+test('native Chat coalesces simultaneous opens of the same conversation', async () => {
+  const id = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  let loadCalls = 0;
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const view = {
+    chatConversationRequests: new Map(),
+    loadChatConversation: async () => {
+      loadCalls += 1;
+      return pending;
+    },
+  };
+
+  const first = ChatGPTView.prototype.getChatConversation.call(view, id);
+  const second = ChatGPTView.prototype.getChatConversation.call(view, id);
+  assert.equal(loadCalls, 1);
+  release({ id, messages: [] });
+  assert.deepEqual(await Promise.all([first, second]), [
+    { id, messages: [] },
+    { id, messages: [] },
+  ]);
+  assert.equal(view.chatConversationRequests.size, 0);
 });
 
 test('native Chat request enforcement rewrites the selected model and observes rate-limit responses', async () => {
@@ -2190,6 +2344,49 @@ test('ChatGPT stream status uses the persistent browser session for background p
   assert.equal(request.options.method, 'GET');
   assert.equal(request.options.credentials, 'include');
   assert.equal(request.options.cache, 'no-store');
+});
+
+test('background monitor opens a completed task conversation and checks its result without a click', async () => {
+  const activeTask = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    chatStatus: 'streaming',
+    conversationUrl: 'https://chatgpt.com/c/6a80f4cf-1650-83ea-8609-adb411b3e4bc',
+  };
+  const completedTask = {
+    taskId: '1f56d3a2-e53d-4e24-8a1b-a7b6941b75de',
+    state: 'submitted',
+    chatStatus: 'completed',
+    conversationUrl: 'https://chatgpt.com/c/7b91f4cf-1650-83ea-8609-adb411b3e4bc',
+  };
+  let loadedUrl = null;
+  let checkedTaskId = null;
+  const view = {
+    activeTask,
+    activeMerge: null,
+    knownTasks: new Map([
+      [activeTask.taskId, activeTask],
+      [completedTask.taskId, completedTask],
+    ]),
+    processingTasks: new Set(),
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => activeTask.conversationUrl,
+        loadURL: async (url) => { loadedUrl = url; },
+      },
+    },
+    checkForResult: async function checkForResult() {
+      checkedTaskId = this.activeTask?.taskId || null;
+      return true;
+    },
+  };
+
+  const result = await ChatGPTView.prototype.checkForBackgroundResult.call(view);
+  assert.equal(result, true);
+  assert.equal(loadedUrl, completedTask.conversationUrl);
+  assert.equal(view.activeTask, completedTask);
+  assert.equal(checkedTaskId, completedTask.taskId);
 });
 
 test('background ChatGPT status polling checks every submitted task instead of only the active one', async () => {

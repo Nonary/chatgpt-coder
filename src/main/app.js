@@ -469,6 +469,15 @@ function registerIpc() {
       await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
       const suggestedName = String(input.treeName || input.taskText || '').split('\n')[0].trim();
       tree = await worktreeService.create(input.repositories[0].path, suggestedName);
+    } else if (Array.isArray(input.repositories) && input.repositories.length === 1) {
+      // A repository added to the workspace may itself be an existing Git
+      // worktree. Preserve that identity even when the renderer describes the
+      // selection as the current repository instead of sending a tree id.
+      tree = await worktreeService.findForTask({ repositories: input.repositories });
+      if (tree && !tree.clean) {
+        throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
+      }
+      if (tree) skillRepositoryPaths = [tree.path];
     }
     if (!input.createTree) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
     const task = await taskService.createTask({

@@ -20,11 +20,12 @@ const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
 const CHAT_MESSAGE_MAX_LENGTH = 32_000;
-const CHAT_CONVERSATION_PAGE_SIZE = 50;
+const CHAT_CONVERSATION_PAGE_SIZE = 20;
 const CHAT_API_RETRY_ATTEMPTS = 4;
-const CHAT_API_RETRY_BASE_DELAY_MILLISECONDS = 750;
-const CHAT_API_RETRY_MAX_DELAY_MILLISECONDS = 5_000;
+const CHAT_API_RETRY_BASE_DELAY_MILLISECONDS = 1_000;
+const CHAT_API_RETRY_MAX_DELAY_MILLISECONDS = 30_000;
 const CHAT_REQUEST_RESPONSE_TIMEOUT_MILLISECONDS = 20_000;
+const TRANSPORT_RECOVERY_DELAY_MILLISECONDS = 500;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
@@ -127,16 +128,46 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function scheduleTransportRecovery(
+  transportWindow,
+  details,
+  recoveryAttempts,
+  onFailure = () => {},
+  delayMilliseconds = TRANSPORT_RECOVERY_DELAY_MILLISECONDS,
+) {
+  const contents = transportWindow?.webContents;
+  if (details?.reason === 'clean-exit'
+    || !contents
+    || contents.isDestroyed()
+    || transportWindow.isDestroyed()
+    || recoveryAttempts.has(contents.id)) {
+    return false;
+  }
+
+  recoveryAttempts.add(contents.id);
+  contents.once('did-finish-load', () => recoveryAttempts.delete(contents.id));
+  const timer = setTimeout(() => {
+    if (transportWindow.isDestroyed() || contents.isDestroyed()) return;
+    try {
+      Promise.resolve(contents.reload()).catch(onFailure);
+    } catch (error) {
+      onFailure(error);
+    }
+  }, delayMilliseconds);
+  timer.unref?.();
+  return true;
+}
+
 function parseRetryAfterMilliseconds(value) {
   const text = String(value || '').trim();
   if (!text) return null;
   const seconds = Number(text);
   if (Number.isFinite(seconds) && seconds >= 0) {
-    return Math.min(15_000, Math.round(seconds * 1_000));
+    return Math.min(CHAT_API_RETRY_MAX_DELAY_MILLISECONDS, Math.round(seconds * 1_000));
   }
   const timestamp = Date.parse(text);
   if (!Number.isFinite(timestamp)) return null;
-  return Math.min(15_000, Math.max(0, timestamp - Date.now()));
+  return Math.min(CHAT_API_RETRY_MAX_DELAY_MILLISECONDS, Math.max(0, timestamp - Date.now()));
 }
 
 function retryAfterMillisecondsFromHeaders(headers) {
@@ -147,15 +178,19 @@ function retryAfterMillisecondsFromHeaders(headers) {
 }
 
 function isRetryableChatStatus(status) {
-  return [408, 429, 500, 502, 503, 504].includes(Number(status));
+  return [0, 408, 425, 429, 500, 502, 503, 504].includes(Number(status));
 }
 
 function chatRetryDelayMilliseconds(result, attempt) {
-  const retryAfter = Number(result?.retryAfterMilliseconds);
-  if (Number.isFinite(retryAfter) && retryAfter >= 0) return retryAfter;
-  return Math.min(
+  const exponentialDelay = Math.min(
     CHAT_API_RETRY_MAX_DELAY_MILLISECONDS,
     CHAT_API_RETRY_BASE_DELAY_MILLISECONDS * (2 ** Math.max(0, attempt)),
+  );
+  const retryAfter = result?.retryAfterMilliseconds;
+  if (!Number.isFinite(retryAfter) || retryAfter <= 0) return exponentialDelay;
+  return Math.max(
+    exponentialDelay,
+    Math.min(CHAT_API_RETRY_MAX_DELAY_MILLISECONDS, retryAfter),
   );
 }
 
@@ -229,11 +264,73 @@ function normalizeChatSendRequest(conversationIdOrRequest, message, model, reaso
   };
 }
 
+function cleanChatMessageText(value) {
+  return String(value || '')
+    // ChatGPT's API transcript contains private-use citation instructions such as
+    // "\uE200cite\uE202turn0search0\uE201". Those are renderer directives, not user-visible text.
+    .replace(/\uE200(?:cite|filecite|navlist)\uE202[^\uE201]*\uE201/gi, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function chatMessageSources(message) {
+  const metadata = message?.metadata || {};
+  const content = message?.content || {};
+  const references = [
+    ...(Array.isArray(metadata.citations) ? metadata.citations : []),
+    ...(Array.isArray(metadata.content_references) ? metadata.content_references : []),
+    ...(Array.isArray(content.references) ? content.references : []),
+    ...(Array.isArray(content.annotations) ? content.annotations : []),
+  ];
+  const sources = [];
+  const seen = new Set();
+  for (const reference of references) {
+    if (!reference || typeof reference !== 'object') continue;
+    const details = [
+      reference,
+      reference.metadata,
+      reference.attribution,
+      reference.source,
+      reference.webpage,
+    ].find((item) => item && typeof item === 'object' && [
+      item.url, item.href, item.web_url,
+    ].some((value) => typeof value === 'string'));
+    const urlValue = details?.url || details?.href || details?.web_url;
+    let url;
+    try {
+      url = new URL(String(urlValue || ''));
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) continue;
+    } catch {
+      continue;
+    }
+    if (seen.has(url.href)) continue;
+    seen.add(url.href);
+    const label = String(
+      details.title || details.name || details.label || reference.title || reference.name
+      || url.hostname.replace(/^www\./i, ''),
+    ).replace(/\s+/g, ' ').trim();
+    sources.push({ url: url.href, label: label || url.hostname });
+  }
+  return sources;
+}
+
 function chatMessageText(message) {
   const content = message?.content || {};
   const contentType = String(content.content_type || '').toLowerCase();
-  const visibleTypes = ['text', 'multimodal_text', 'reasoning_recap', 'reasoning_summary'];
+  const visibleTypes = [
+    'text', 'multimodal_text', 'thoughts', 'reasoning_recap', 'reasoning_summary',
+    'followup_summary', 'follow_up_summary',
+  ];
   if (contentType && !visibleTypes.includes(contentType)) return '';
+  if (contentType === 'thoughts' && Array.isArray(content.thoughts)) {
+    // ChatGPT exposes a short, user-visible summary for thought activity. Keep the
+    // private reasoning payload out of Patchwork and mirror only the latest recap.
+    const summary = [...content.thoughts].reverse().find((thought) => (
+      typeof thought?.summary === 'string' && thought.summary.trim()
+    ))?.summary;
+    return cleanChatMessageText(summary);
+  }
   const parts = Array.isArray(content.parts) ? content.parts : [];
   const text = [];
   for (const part of parts) {
@@ -247,7 +344,7 @@ function chatMessageText(message) {
   }
   if (text.length === 0 && typeof content.text === 'string') text.push(content.text);
   if (text.length === 0 && typeof content.content === 'string') text.push(content.content);
-  return text.join('\n').trim();
+  return cleanChatMessageText(text.join('\n'));
 }
 
 function normalizeChatConversation(payload, streamStatus = null) {
@@ -279,21 +376,25 @@ function normalizeChatConversation(payload, streamStatus = null) {
     const role = message?.author?.role;
     if (!['user', 'assistant'].includes(role)) continue;
     if (message?.metadata?.is_visually_hidden_from_conversation || message?.metadata?.is_user_system_message) continue;
+    const contentType = String(message?.content?.content_type || '').toLowerCase();
     const channel = String(message?.channel || message?.metadata?.channel || '').toLowerCase();
-    if (channel === 'analysis') continue;
+    const visibleReasoning = [
+      'thoughts', 'reasoning_recap', 'reasoning_summary', 'followup_summary', 'follow_up_summary',
+    ].includes(contentType);
+    if (channel === 'analysis' && !visibleReasoning) continue;
     const text = chatMessageText(message);
     if (!text) continue;
-    const contentType = String(message?.content?.content_type || '').toLowerCase();
     messages.push({
       id: String(message.id || node?.id || ''),
       role,
       text,
-      kind: ['reasoning_recap', 'reasoning_summary'].includes(contentType)
-        ? 'reasoning'
-        : 'message',
+      kind: contentType === 'thoughts'
+        ? 'thought'
+        : visibleReasoning ? 'reasoning' : 'message',
       createdAt: Number.isFinite(Number(message.create_time)) ? Number(message.create_time) : null,
       status: String(message.status || ''),
       endTurn: Boolean(message.end_turn),
+      sources: chatMessageSources(message),
     });
   }
 
@@ -320,6 +421,23 @@ function normalizeChatConversation(payload, streamStatus = null) {
     statusRaw: rawStatus,
     status,
     messages,
+  };
+}
+
+function reconcileChatConversation(conversation, rendered) {
+  if (!rendered) return conversation;
+  const renderedCompletedTurn = rendered.status === 'completed'
+    && rendered.messages?.at(-1)?.role === 'assistant';
+  const status = conversation.status === 'streaming' && !renderedCompletedTurn
+    ? conversation.status
+    : rendered.status;
+  return {
+    ...conversation,
+    ...rendered,
+    // The authenticated page owns the active turn. Its visible, enabled Stop control is
+    // a stronger lifecycle signal than stream_status, which can lag after follow-up turns.
+    status,
+    messages: rendered.messages?.length ? rendered.messages : conversation.messages,
   };
 }
 
@@ -1002,8 +1120,11 @@ class ChatGPTView {
     this.dismissedNoticeEvents = new Map();
     this.configurationPickerTimer = null;
     this.chatSendBusy = false;
+    this.transportRecoveryAttempts = new Set();
     this.chatSessionWindow = null;
     this.chatConversationListCache = [];
+    this.chatConversationListRequest = null;
+    this.chatConversationRequests = new Map();
     this.chatConversationCache = new Map();
     // Keep ChatGPT transport pages out of the local Patchwork window. They still
     // use the persistent authenticated partition, but cannot cover or navigate
@@ -1039,7 +1160,21 @@ class ChatGPTView {
     const contents = this.chatView.webContents;
     contents.setWindowOpenHandler(() => ({ action: 'deny' }));
     contents.on('render-process-gone', (_event, details) => {
-      this.onEvent({ type: 'chat-error', message: `The background ChatGPT chat transport stopped: ${details.reason}` });
+      const recovering = scheduleTransportRecovery(
+        this.chatView,
+        details,
+        this.transportRecoveryAttempts,
+        (error) => this.onEvent({
+          type: 'chat-error',
+          message: `The ChatGPT connection could not restart: ${error.message}`,
+        }),
+      );
+      this.onEvent({
+        type: recovering ? 'chat-transport-recovering' : 'chat-error',
+        message: recovering
+          ? 'The ChatGPT connection was interrupted and is restarting automatically.'
+          : `The background ChatGPT connection stopped: ${details.reason}`,
+      });
     });
   }
 
@@ -1075,7 +1210,23 @@ class ChatGPTView {
       this.handlePageTitleUpdated(title).catch(() => {});
     });
     contents.on('render-process-gone', (_event, details) => {
-      this.onEvent({ type: 'task-failed', message: `The ChatGPT transport stopped: ${details.reason}` });
+      const recovering = scheduleTransportRecovery(
+        this.view,
+        details,
+        this.transportRecoveryAttempts,
+        (error) => this.onEvent({
+          type: 'task-failed',
+          taskId: this.activeTask?.taskId,
+          message: `The ChatGPT connection could not restart: ${error.message}`,
+        }),
+      );
+      this.onEvent({
+        type: recovering ? 'task-transport-recovering' : 'task-failed',
+        taskId: this.activeTask?.taskId,
+        message: recovering
+          ? 'The ChatGPT connection was interrupted and is restarting automatically.'
+          : `The ChatGPT connection stopped: ${details.reason}`,
+      });
     });
   }
 
@@ -1390,20 +1541,31 @@ class ChatGPTView {
     return false;
   }
 
-  async executeChatApiWithRetry(script) {
+  async executeChatApiWithRetry(script, userGesture = true, wait = delay) {
     let result = null;
     for (let attempt = 0; attempt < CHAT_API_RETRY_ATTEMPTS; attempt += 1) {
-      result = await this.chatView.webContents.executeJavaScript(script, true)
+      result = await this.chatView.webContents.executeJavaScript(script, userGesture)
         .catch((error) => ({ ok: false, status: 0, message: error.message }));
       if (result?.ok || !isRetryableChatStatus(result?.status) || attempt >= CHAT_API_RETRY_ATTEMPTS - 1) {
         return result;
       }
-      await delay(chatRetryDelayMilliseconds(result, attempt));
+      await wait(chatRetryDelayMilliseconds(result, attempt));
     }
     return result;
   }
 
   async listChatConversations() {
+    if (this.chatConversationListRequest) return this.chatConversationListRequest;
+    const request = this.loadChatConversations();
+    this.chatConversationListRequest = request;
+    try {
+      return await request;
+    } finally {
+      if (this.chatConversationListRequest === request) this.chatConversationListRequest = null;
+    }
+  }
+
+  async loadChatConversations() {
     const ready = await this.waitForChatTransport();
     if (!ready) throw new Error('ChatGPT is still loading. Open the ChatGPT session, sign in, and retry.');
     const result = await this.executeChatApiWithRetry(`(async () => {
@@ -1414,6 +1576,7 @@ class ChatGPTView {
       url.searchParams.set('order', 'updated');
       url.searchParams.set('is_archived', 'false');
       url.searchParams.set('is_starred', 'false');
+      url.searchParams.set('exclude_conversation_origin', 'tpp');
       const response = await fetch(url.toString(), {
         credentials: 'include',
         cache: 'no-store',
@@ -1431,9 +1594,9 @@ class ChatGPTView {
           retryAfterMilliseconds: (() => {
             const value = response.headers.get('retry-after');
             const seconds = Number(value);
-            if (Number.isFinite(seconds) && seconds >= 0) return Math.min(15000, Math.round(seconds * 1000));
+            if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30000, Math.round(seconds * 1000));
             const timestamp = Date.parse(value || '');
-            return Number.isFinite(timestamp) ? Math.min(15000, Math.max(0, timestamp - Date.now())) : null;
+            return Number.isFinite(timestamp) ? Math.min(30000, Math.max(0, timestamp - Date.now())) : null;
           })(),
         };
       }
@@ -1520,6 +1683,18 @@ class ChatGPTView {
           if (role !== 'user' && role !== 'assistant') return null;
           const text = String(element.innerText || element.textContent || '').trim();
           if (!text) return null;
+          const seenSources = new Set();
+          const sources = [...element.querySelectorAll('a[href]')].map((link) => {
+            try {
+              const url = new URL(link.href, location.href);
+              if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
+                || seenSources.has(url.href)) return null;
+              seenSources.add(url.href);
+              const label = String(link.innerText || link.textContent || link.title || url.hostname)
+                .replace(/\s+/g, ' ').trim();
+              return { url: url.href, label: label || url.hostname };
+            } catch { return null; }
+          }).filter(Boolean);
           return {
             id: element.getAttribute('data-message-id') || 'rendered-' + index,
             role,
@@ -1528,11 +1703,19 @@ class ChatGPTView {
             createdAt: null,
             status: '',
             endTurn: false,
+            sources,
           };
         })
         .filter(Boolean);
-      const stopButton = document.querySelector('[data-testid="stop-button"]');
-      const generating = Boolean(stopButton && !stopButton.disabled && stopButton.getAttribute('aria-disabled') !== 'true');
+      const generating = [...document.querySelectorAll('[data-testid="stop-button"]')].some((stopButton) => {
+        const style = getComputedStyle(stopButton);
+        return !stopButton.disabled
+          && stopButton.getAttribute('aria-disabled') !== 'true'
+          && stopButton.getAttribute('aria-hidden') !== 'true'
+          && style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && stopButton.getClientRects().length > 0;
+      });
       const title = String(document.title || 'New chat').replace(/\\s*[|·-]\\s*ChatGPT\\s*$/i, '').trim() || 'New chat';
       return { rows, generating, title };
     })()`, true).catch(() => null);
@@ -1552,7 +1735,9 @@ class ChatGPTView {
         turnIndex += 1;
         insertedReasoning = false;
       } else if (!insertedReasoning) {
-        const summaries = (cachedTurns[turnIndex] || []).filter((item) => item.kind === 'reasoning');
+        const summaries = (cachedTurns[turnIndex] || []).filter((item) => (
+          item.kind === 'thought' || item.kind === 'reasoning'
+        ));
         messages.push(...summaries);
         insertedReasoning = true;
       }
@@ -1582,6 +1767,20 @@ class ChatGPTView {
   async getChatConversation(conversationId) {
     const id = normalizeChatConversationId(conversationId);
     if (!id) throw new Error('Choose a valid ChatGPT conversation.');
+    if (this.chatConversationRequests.has(id)) return this.chatConversationRequests.get(id);
+    const request = this.loadChatConversation(id);
+    this.chatConversationRequests.set(id, request);
+    try {
+      return await request;
+    } finally {
+      if (this.chatConversationRequests.get(id) === request) {
+        this.chatConversationRequests.delete(id);
+      }
+    }
+  }
+
+  async loadChatConversation(conversationId) {
+    const id = normalizeChatConversationId(conversationId);
     const ready = await this.waitForChatTransport();
     if (!ready) throw new Error('ChatGPT is still loading. Open the ChatGPT session, sign in, and retry.');
     const result = await this.executeChatApiWithRetry(`(async () => {
@@ -1603,9 +1802,9 @@ class ChatGPTView {
           retryAfterMilliseconds: (() => {
             const value = response.headers.get('retry-after');
             const seconds = Number(value);
-            if (Number.isFinite(seconds) && seconds >= 0) return Math.min(15000, Math.round(seconds * 1000));
+            if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30000, Math.round(seconds * 1000));
             const timestamp = Date.parse(value || '');
-            return Number.isFinite(timestamp) ? Math.min(15000, Math.max(0, timestamp - Date.now())) : null;
+            return Number.isFinite(timestamp) ? Math.min(30000, Math.max(0, timestamp - Date.now())) : null;
           })(),
         };
       }
@@ -1641,18 +1840,14 @@ class ChatGPTView {
       throw new Error(`Could not load the ChatGPT conversation${result?.status ? ` (${result.status})` : ''}.`);
     }
     const conversation = normalizeChatConversation(result.conversation, result.streamStatus);
+    this.chatConversationCache.set(id, conversation);
     // The page can be ahead of the conversation endpoint while an answer is streaming. Prefer
     // that user-visible transcript whenever it contains additional turns or live status, rather
     // than leaving the native thread frozen behind the browser transport.
     const rendered = await this.getRenderedChatConversation(id).catch(() => null);
-    if (rendered && (
-      rendered.messages.length > conversation.messages.length
-      || (rendered.status === 'streaming' && conversation.status !== 'streaming')
-    )) {
-      return rendered;
-    }
-    this.chatConversationCache.set(id, conversation);
-    return conversation;
+    const reconciled = reconcileChatConversation(conversation, rendered);
+    this.chatConversationCache.set(id, reconciled);
+    return reconciled;
   }
 
   async waitForChatComposer(timeoutMilliseconds = 12_000) {
@@ -2848,6 +3043,31 @@ class ChatGPTView {
   async monitorPage() {
     await this.dismissBlockingLimitNotice();
     await this.pollConversationStatuses();
+    const started = await this.checkForResult();
+    if (started || this.activeMerge || this.monitorBusy || this.pendingDownload) return started;
+    return this.checkForBackgroundResult();
+  }
+
+  async checkForBackgroundResult() {
+    const candidate = [...this.knownTasks.values()].find((task) => (
+      task?.state === 'submitted'
+      && task.chatStatus === 'completed'
+      && task.taskId !== this.activeTask?.taskId
+      && isChatGPTConversationUrl(task.conversationUrl)
+      && !this.processingTasks.has(task.taskId)
+    ));
+    if (!candidate || this.view.webContents.isDestroyed()) return false;
+
+    this.activeMerge = null;
+    this.activeTask = candidate;
+    const currentUrl = this.view.webContents.getURL();
+    const currentConversationId = conversationIdFromRouteUrl(currentUrl);
+    const candidateConversationId = conversationIdFromRouteUrl(candidate.conversationUrl) || candidate.conversationId;
+    const conversationAlreadyOpen = currentUrl === candidate.conversationUrl
+      || Boolean(candidateConversationId && currentConversationId === candidateConversationId);
+    if (!conversationAlreadyOpen) {
+      await this.view.webContents.loadURL(candidate.conversationUrl);
+    }
     return this.checkForResult();
   }
 
@@ -3214,15 +3434,20 @@ module.exports = {
   isChatGPTConversationUrl,
   isAllowedChatGPTUrl,
   isDismissibleLimitNotice,
+  chatMessageSources,
   chatMessageText,
   normalizeChatSendRequest,
   normalizeChatConversation,
   normalizeChatConversationId,
   normalizeConversationStreamStatus,
+  reconcileChatConversation,
   recoverUnconfirmedSubmissions,
   isRetryableChatStatus,
+  chatRetryDelayMilliseconds,
+  parseRetryAfterMilliseconds,
   rewriteConversationRequestBody,
   taskRequestConfiguration,
   mergeTreeId,
   resultTaskId,
+  scheduleTransportRecovery,
 };
