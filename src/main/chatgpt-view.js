@@ -773,13 +773,11 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
     const visited = new Set();
     const notices = [];
     const candidates = [];
-    const fileInputs = [];
     while (roots.length) {
       const root = roots.shift();
       if (!root || visited.has(root)) continue;
       visited.add(root);
       notices.push(...root.querySelectorAll('[role="dialog"], [role="alert"], [aria-live]'));
-      fileInputs.push(...root.querySelectorAll('input[type="file"]'));
       candidates.push(...root.querySelectorAll(
         '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div'
       ));
@@ -802,24 +800,11 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
         dismissedDuplicate = true;
       }
     }
-    const selectedByInput = fileInputs.some((input) => [...(input.files || [])]
-      .some((file) => file.name === filename));
-    // DOM.setFileInputFiles selected the exact unique package. Treat that as
-    // authoritative before inspecting attachment-chip text: broad page-level
-    // containers also contain the filename and can include unrelated progress
-    // indicators, which would otherwise look like an upload that is busy forever.
-    // clickSend separately waits for ChatGPT to enable submission.
-    if (selectedByInput) return {
-      attached: true,
-      busy: false,
-      duplicateNotice: Boolean(duplicateNotice),
-      dismissedDuplicate,
-    };
-    // Source Control intentionally keeps the ChatGPT transport window hidden
-    // while a summary runs. Attachment chips still exist in the page DOM in
-    // that state, but their client rectangles are empty. The task
-    // package filename contains a unique task ID, so DOM presence is the
-    // reliable confirmation signal here; rendered geometry is not.
+    // Selecting a hidden file input only starts ChatGPT's upload. Wait for the
+    // attachment card itself: the frontend can reject or still be processing a
+    // selected file while leaving input.files populated. Source Control keeps
+    // its transport view hidden, so DOM presence—not rendered geometry—is the
+    // reliable confirmation signal once the card exists.
     const attachment = candidates.find((element) => [
       element.textContent,
       element.getAttribute('aria-label'),
@@ -893,10 +878,28 @@ function buildTaskResultDetectionScript(taskOrId, streamFinished = false) {
         break;
       }
     }
+    const downloadUrl = [control, match].map((element) => {
+      const href = element?.getAttribute?.('href') || element?.href;
+      if (!href) return null;
+      try {
+        const url = new URL(String(href), window.location.href);
+        return url.protocol === 'https:' ? url.href : null;
+      } catch {
+        return null;
+      }
+    }).find(Boolean);
+    if (downloadUrl) {
+      return {
+        kind: 'download',
+        downloadUrl,
+        label: String(match.textContent || match.getAttribute('aria-label') || '').trim(),
+      };
+    }
     control.scrollIntoView({ block: 'center', inline: 'center' });
     control.click();
     return {
       kind: 'download',
+      downloadUrl: null,
       label: String(match.textContent || match.getAttribute('aria-label') || '').trim(),
     };
   })()`;
@@ -988,6 +991,7 @@ class ChatGPTView {
         .localeCompare(String(left.updatedAt || left.createdAt)))[0] || null;
     this.resultAttempts = new Map();
     this.resultWaiters = new Map();
+    this.submissionPromises = new Map();
     this.pendingDownload = null;
     this.processingTasks = new Set();
     this.monitorBusy = false;
@@ -1554,7 +1558,6 @@ class ChatGPTView {
       }
       messages.push(message);
     }
-    const lastMessage = messages.at(-1);
     const conversation = {
       id,
       title: rendered.title || cached?.title || 'New chat',
@@ -1564,7 +1567,11 @@ class ChatGPTView {
       projectId: cached?.projectId || null,
       url: sourceWindow.webContents.getURL(),
       statusRaw: null,
-      status: rendered.generating || lastMessage?.role === 'user' ? 'streaming' : 'completed',
+      // A trailing user message is not evidence that ChatGPT is still working: a
+      // completed response can be delayed in the conversation endpoint, omitted
+      // by a rendered fallback, or end in a non-text item. The native client uses
+      // its live Stop control to represent generation, so do the same here.
+      status: rendered.generating ? 'streaming' : 'completed',
       messages,
       renderedFallback: true,
     };
@@ -2680,6 +2687,25 @@ class ChatGPTView {
   }
 
   async submit(task) {
+    const taskId = String(task?.taskId || '').trim().toLowerCase();
+    if (!taskId) throw new Error('The task is missing its task ID.');
+    if (!this.submissionPromises) this.submissionPromises = new Map();
+
+    const existing = this.submissionPromises.get(taskId);
+    if (existing) return existing;
+
+    const submission = ChatGPTView.prototype.submitTask.call(this, task);
+    this.submissionPromises.set(taskId, submission);
+    try {
+      return await submission;
+    } finally {
+      if (this.submissionPromises.get(taskId) === submission) {
+        this.submissionPromises.delete(taskId);
+      }
+    }
+  }
+
+  async submitTask(task) {
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -3008,8 +3034,10 @@ class ChatGPTView {
     try {
       const expectedName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
       this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
-      // A fresh, synchronous user gesture is required for ChatGPT's generated-file link.
-      // A click fired later by a page-owned timer can be silently blocked by Chromium.
+      // Prefer ChatGPT's direct file URL when it is exposed in the attachment. A
+      // native download uses the same persistent browser session, but does not
+      // depend on ChatGPT accepting an untrusted synthetic click. Older controls
+      // without a URL still use the page-click fallback in the detection script.
       const result = await this.view.webContents.executeJavaScript(
         buildTaskResultDetectionScript(task, task.chatStatus === 'completed'),
         true,
@@ -3019,6 +3047,11 @@ class ChatGPTView {
           this.pendingDownload = null;
         }
         return false;
+      }
+      const downloadUrl = String(result.downloadUrl || '').trim();
+      if (downloadUrl && isAllowedChatGPTUrl(downloadUrl)
+        && typeof this.view.webContents.downloadURL === 'function') {
+        this.view.webContents.downloadURL(downloadUrl);
       }
       this.resultAttempts.set(task.taskId, Date.now());
       await this.onEvent({

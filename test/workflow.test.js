@@ -338,7 +338,9 @@ test('Source Control summaries run as persistent Luna Medium tasks with an expli
   assert.match(renderer, /function SourceControl\(/);
   assert.match(renderer, /AI summary/);
   assert.match(renderer, /call<AnyRecord>\('gitSummary', selected, null\)/);
-  assert.match(renderer, /setMessage\(result\.commitMessage \|\| ''\)/);
+  assert.match(renderer, /onCommitMessageChange\(result\.commitMessage \|\| ''\)/);
+  assert.match(renderer, /name === 'useGitSummary'[\s\S]*setSourceCommitMessage\(text\(result\.result\?\.commitMessage\)\)[\s\S]*setRoute\('source'\)/);
+  assert.match(renderer, /<SourceControl repositories=\{repositories\} selectedRepositoryPath=\{sourceRepositoryPath\} commitMessage=\{sourceCommitMessage\}/);
   assert.doesNotMatch(renderer, /Generating Git Summary/);
   assert.match(renderer, /Commit staged changes/);
   assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
@@ -1639,6 +1641,8 @@ test('conflict resolution reapplies the original patch before creating the resol
   assert.match(service, /applyPatch\(repository\.path, patch\.localPath, \{ threeWay: true, index: true \}\)/);
   assert.match(service, /applyAttempted: Boolean\(applyAttempted\)/);
   assert.match(appSource, /await resultService\.prepareConflictResolution\(task\.taskId\)/);
+  assert.match(appSource, /prepareConflictResolution\(task\.taskId\)[\s\S]*task = await taskService\.getTask\(task\.taskId\)/);
+  assert.match(appSource, /gitService\.status\(conflictRepository\?\.path\)[\s\S]*change\.indexStatus === 'U' \|\| change\.worktreeStatus === 'U'/);
 });
 
 test('conflict resolution can recover a coding tree from the original task association', async (context) => {
@@ -1672,6 +1676,20 @@ test('task target and conflict fallback wiring is exposed through the task UI', 
   assert.match(renderer, /createTree/);
   assert.match(renderer, /treeName/);
   assert.match(preload, /setTaskTarget: \(taskId, input\)/);
+});
+
+test('coding trees expose a direct create flow through the main workspace', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  const preload = await fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8');
+  assert.match(appSource, /ipcMain\.handle\('trees:create'/);
+  assert.match(appSource, /gitService\.listRepositories\(\)/);
+  assert.match(appSource, /worktreeService\.create\(repository\.path, input\.treeName\)/);
+  assert.match(preload, /createTree: \(input\) => ipcRenderer\.invoke\('trees:create', input\)/);
+  assert.match(renderer, /function TreeCreateDialog\(/);
+  assert.match(renderer, /New coding tree/);
+  assert.match(renderer, /call<Tree>\('createTree'/);
+  assert.match(renderer, /event\.type === 'tree-created' \|\| event\.type === 'tree-removed' \|\| event\.type === 'tree-merged'/);
 });
 
 test('worktree lookup skips unavailable matching records so conflict resolution can fall back', async (context) => {
@@ -1841,6 +1859,15 @@ test('ChatGPT task submission only accepts real conversation URLs', () => {
   assert.equal(isChatGPTConversationUrl('https://chatgpt.com/'), false);
   assert.equal(isChatGPTConversationUrl('https://chatgpt.com/c/'), false);
   assert.equal(isChatGPTConversationUrl('https://example.com/c/abc123'), false);
+});
+
+test('task composer exposes extra-high reasoning and keeps the settings grid shrinkable', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.tsx'), 'utf8');
+  const styles = await fs.readFile(path.join(__dirname, '../src/renderer/styles.css'), 'utf8');
+  const taskSettings = renderer.slice(renderer.indexOf('Task settings'), renderer.indexOf('Task settings') + 1600);
+  assert.match(taskSettings, /<option value="extra-high">Extra High<\/option>/);
+  assert.match(styles, /\.field-grid \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.match(styles, /\.field-grid > label \{ min-width: 0; \}/);
 });
 
 test('task composer persists all sticky task selections in local storage', async () => {
@@ -2111,6 +2138,28 @@ test('ChatGPT stream status helpers follow the status endpoint captured in the H
   assert.match(buildConversationStatusScript(conversationId), /cache: 'no-store'/);
 });
 
+test('rendered ChatGPT conversations do not infer an active reply from a trailing user message', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const view = {
+    chatView: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => `https://chatgpt.com/c/${conversationId}`,
+        executeJavaScript: async () => ({
+          rows: [{ id: 'user-turn', role: 'user', text: 'Follow up', kind: 'message' }],
+          generating: false,
+          title: 'Follow up',
+        }),
+      },
+    },
+    view: null,
+    chatConversationCache: new Map(),
+  };
+
+  const conversation = await ChatGPTView.prototype.getRenderedChatConversation.call(view, conversationId);
+  assert.equal(conversation.status, 'completed');
+});
+
 test('ChatGPT stream status uses the persistent browser session for background polling', async () => {
   const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
   let request = null;
@@ -2365,6 +2414,46 @@ test('task submit persists the confirmed ChatGPT conversation with submitted sta
   assert.equal(submitted.conversationUrl, conversationUrl);
 });
 
+test('duplicate task submissions share the in-flight ChatGPT request', async () => {
+  const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7', handoffPrompt: 'Task', packagePath: '/task.txt' };
+  let releaseComposer;
+  let composerStarted;
+  const composerReady = new Promise((resolve) => { composerStarted = resolve; });
+  let sendCount = 0;
+  const view = {
+    activeMerge: null,
+    activeTask: null,
+    knownTasks: new Map(),
+    taskService: {
+      updateTask: async (_taskId, next) => ({ ...task, ...next }),
+    },
+    onEvent: async () => {},
+    waitForComposer: async () => {
+      composerStarted();
+      return new Promise((resolve) => { releaseComposer = resolve; });
+    },
+    configureTaskModel: async () => {},
+    beginTaskRequestEnforcement: async () => ({
+      wait: async () => ({ model: 'gpt-5-6', thinkingEffort: null }),
+      dispose: async () => {},
+    }),
+    injectPrompt: async () => {},
+    uploadPackage: async () => {},
+    clickSend: async () => { sendCount += 1; return true; },
+    waitForConversationUrl: async () => 'https://chatgpt.com/c/confirmed-conversation',
+    installResultWatcher: () => {},
+  };
+
+  const first = ChatGPTView.prototype.submit.call(view, task);
+  const second = ChatGPTView.prototype.submit.call(view, task);
+  await composerReady;
+  releaseComposer(true);
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(sendCount, 1);
+  assert.equal(firstResult.conversationUrl, secondResult.conversationUrl);
+});
+
 test('task submit selects the requested model and reasoning before injecting the prompt', async () => {
   const task = {
     taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
@@ -2506,25 +2595,12 @@ test('task attachment confirmation finds uploaded packages in a hidden view and 
   assert.equal(result.busy, false);
 });
 
-test('task attachment confirmation trusts the selected input before broad busy page matches', () => {
+test('task attachment confirmation waits for ChatGPT to render an attachment card after input selection', () => {
   const filename = 'chatgpt-ide-task-hidden-input.zip';
   const fileInput = { files: [{ name: filename }] };
-  const broadPageMatch = {
-    textContent: `Chat history ${filename} unrelated processing status`,
-    getAttribute: () => null,
-    parentElement: {
-      textContent: `Chat history ${filename} unrelated processing status`,
-      getAttribute: () => null,
-      querySelector: () => ({ role: 'progressbar' }),
-    },
-    closest: () => null,
-  };
   const document = {
     querySelectorAll: (selector) => {
       if (selector === 'input[type="file"]') return [fileInput];
-      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') {
-        return [broadPageMatch];
-      }
       return [];
     },
   };
@@ -2534,7 +2610,7 @@ test('task attachment confirmation trusts the selected input before broad busy p
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
   });
 
-  assert.equal(result.attached, true);
+  assert.equal(result.attached, false);
   assert.equal(result.busy, false);
 });
 
@@ -2657,6 +2733,71 @@ test('task result detection clicks ChatGPT’s download control instead of openi
   assert.equal(result.kind, 'download');
   assert.equal(downloaded, true);
   assert.equal(previewOpened, false);
+});
+
+test('task result detection returns ChatGPT’s direct file URL before falling back to a synthetic click', () => {
+  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
+  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
+  let clicked = false;
+  const link = {
+    getAttribute: (name) => ({ download: resultFilename, href: '/backend-api/files/result/download' })[name] || null,
+    textContent: resultFilename,
+    scrollIntoView: () => {},
+    click: () => { clicked = true; },
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => {
+      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [link];
+      if (selector === '*') return [];
+      return [];
+    },
+  };
+
+  const result = vm.runInNewContext(buildTaskResultDetectionScript(taskId), {
+    document,
+    URL,
+    window: { location: { href: `https://chatgpt.com/c/${taskId}` } },
+  });
+  assert.equal(result.kind, 'download');
+  assert.equal(result.downloadUrl, 'https://chatgpt.com/backend-api/files/result/download');
+  assert.equal(clicked, false);
+});
+
+test('task result retrieval starts the matched ChatGPT file URL through the authenticated session', async () => {
+  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
+  const task = {
+    taskId,
+    state: 'submitted',
+    chatStatus: 'completed',
+    resultFilename: `chatgpt-ide-result-${taskId}.txt`,
+  };
+  let downloadedUrl = null;
+  const events = [];
+  const view = {
+    activeMerge: null,
+    activeTask: task,
+    monitorBusy: false,
+    processingTasks: new Set(),
+    resultAttempts: new Map(),
+    pendingDownload: null,
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        executeJavaScript: async () => ({
+          kind: 'download',
+          downloadUrl: 'https://chatgpt.com/backend-api/files/result/download',
+        }),
+        downloadURL: (url) => { downloadedUrl = url; },
+      },
+    },
+    onEvent: async (event) => events.push(event),
+  };
+
+  const started = await ChatGPTView.prototype.checkForResult.call(view);
+  assert.equal(started, true);
+  assert.equal(downloadedUrl, 'https://chatgpt.com/backend-api/files/result/download');
+  assert.equal(events.at(-1).type, 'result-link-activated');
 });
 
 test('merge result detection accepts the requested text file after generation stops', () => {

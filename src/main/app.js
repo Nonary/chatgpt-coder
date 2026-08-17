@@ -378,6 +378,13 @@ function registerIpc() {
   });
 
   ipcMain.handle('trees:list', async () => worktreeService.list());
+  ipcMain.handle('trees:create', async (_event, input = {}) => {
+    const requestedPath = String(input.repositoryPath || '').trim();
+    const repositories = await gitService.listRepositories();
+    const repository = repositories.find((item) => item.path === requestedPath && !item.unavailable);
+    if (!repository) throw new Error('Choose a repository from the Patchwork workspace before creating a coding tree.');
+    return worktreeService.create(repository.path, input.treeName);
+  });
   ipcMain.handle('trees:reveal', async (_event, treeId) => {
     const tree = await worktreeService.get(treeId);
     shell.showItemInFolder(tree.path);
@@ -591,6 +598,18 @@ function registerIpc() {
       }
     }
     if (!tree) tree = await worktreeService.findForTask(task);
+    await resultService.prepareConflictResolution(task.taskId);
+    task = await taskService.getTask(task.taskId);
+    const conflict = task.result.conflicts?.[0] || {};
+    const conflictRepository = task.repositories.find((repository) => repository.id === conflict.repositoryId);
+    const currentConflictFiles = await gitService.status(conflictRepository?.path)
+      .then((status) => status.changes
+        .filter((change) => change.indexStatus === 'U' || change.worktreeStatus === 'U')
+        .map((change) => change.path))
+      .catch(() => []);
+    const resolutionConflict = currentConflictFiles.length
+      ? { ...conflict, files: currentConflictFiles }
+      : conflict;
     const writableRepositories = task.repositories
       .filter((repository) => !repository.readOnly)
       .map((repository) => ({ path: repository.path }));
@@ -601,11 +620,9 @@ function registerIpc() {
       repositories = [{ path: task.sourceRepositoryPath }];
     }
     if (repositories.length === 0) throw new Error('This conflicted task has no writable repository to resolve.');
-    const conflict = task.result.conflicts?.[0] || {};
-    await resultService.prepareConflictResolution(task.taskId);
     const resolutionOptions = options && typeof options === 'object' ? options : {};
     const resolutionTask = await taskService.createTask({
-      taskText: buildConflictResolutionTaskText(task, conflict, resolutionOptions.additionalInstructions),
+      taskText: buildConflictResolutionTaskText(task, resolutionConflict, resolutionOptions.additionalInstructions),
       repositories,
       attachments: task.attachments || [],
       tree,
@@ -617,8 +634,8 @@ function registerIpc() {
       resolvesTaskId: task.taskId,
       conflictContext: {
         originalTaskId: task.taskId,
-        error: conflict.error || task.error,
-        files: conflict.files || [],
+        error: resolutionConflict.error || task.error,
+        files: resolutionConflict.files || [],
         patches: task.result.patches,
       },
     });

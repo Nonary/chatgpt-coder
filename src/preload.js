@@ -32,6 +32,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   gitDiff: (repositoryPath, filePath, staged) => ipcRenderer.invoke('git:diff', repositoryPath, filePath, staged),
   gitSummary: (repositoryPath, customPrompt) => ipcRenderer.invoke('git:summary', repositoryPath, customPrompt),
   listTrees: () => ipcRenderer.invoke('trees:list'),
+  createTree: (input) => ipcRenderer.invoke('trees:create', input),
   revealTree: (treeId) => ipcRenderer.invoke('trees:reveal', treeId),
   removeTree: (treeId) => ipcRenderer.invoke('trees:remove', treeId),
   mergeTree: (treeId, chatgptProject) => ipcRenderer.invoke('trees:merge', treeId, chatgptProject),
