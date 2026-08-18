@@ -2305,7 +2305,6 @@ async function initialize() {
 initialize();
 
 function upsertTask(task) {
-  if (task?.summaryOnly) return;
   const index = state.tasks.findIndex((item) => item.taskId === task.taskId);
   if (index >= 0) state.tasks[index] = task;
   else state.tasks.unshift(task);

@@ -148,6 +148,7 @@ test('Source Control summaries prepare a normal Luna Medium task and reuse stand
   assert.match(summaryHandler, /ipcMain\.handle\('task:use-git-summary'/);
   assert.doesNotMatch(summaryHandler, /deleteTask\(task\.taskId\)/);
   assert.doesNotMatch(renderer, /const hiddenTask = Boolean\(event\.task\?\.summaryOnly\)/);
+  assert.doesNotMatch(renderer, /function upsertTask\(task\) \{\s*if \(task\?\.summaryOnly\) return;/);
   assert.match(renderer, /task\.summaryOnly \|\| task\.state !== 'ready'/);
   assert.match(renderer, /window\.patchwork\.gitSummary\([\s\S]*chatgptProject/);
   assert.match(renderer, /window\.patchwork\.submitTask\(task\.taskId\)/);
