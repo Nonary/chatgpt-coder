@@ -27,6 +27,13 @@ const state = {
   chatLoading: false,
   chatSending: false,
   chatError: null,
+  chatConfigurationTaskId: null,
+  sessionSnapshot: null,
+  sessionConfiguration: { model: 'default', reasoning: 'default' },
+  sessionLoading: false,
+  sessionSending: false,
+  sessionError: null,
+  sessionBrowserOpen: false,
 };
 
 const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
@@ -68,9 +75,14 @@ const elements = Object.fromEntries(
     'use-git-summary-button', 'apply-button', 'retry-apply-button', 'resolve-conflict-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
     'task-chat-status', 'task-chat-thinking', 'task-chat-messages', 'task-chat-form',
     'task-chat-input', 'task-chat-refresh-button', 'task-chat-stop-button', 'task-chat-send-button',
+    'task-chat-model-select', 'task-chat-reasoning-select', 'task-chat-configuration-status',
+    'session-chat-status', 'session-chat-thinking', 'session-chat-messages', 'session-chat-form',
+    'session-chat-input', 'session-chat-refresh-button', 'session-chat-stop-button', 'session-chat-send-button',
+    'session-chat-model-select', 'session-chat-reasoning-select',
     'session-chatgpt-surface', 'session-back-button', 'session-forward-button',
-    'session-reload-button', 'session-new-chat-button', 'session-browser-title',
-    'session-browser-status', 'session-status-dot',
+    'session-reload-button', 'session-new-chat-button', 'session-open-browser-button', 'session-close-browser-button',
+    'session-browser-new-chat-button', 'session-browser-overlay', 'session-browser-title', 'session-browser-status',
+    'session-status-dot',
     'source-control-button', 'source-count', 'source-repository-select',
     'source-add-repository', 'source-refresh', 'source-remove-repository',
     'source-branch', 'source-commit-message', 'source-commit-button', 'source-ai-summary-button', 'source-git-summary-prompt-button', 'source-git-summary-status',
@@ -1333,11 +1345,74 @@ function taskHasChat(task) {
   return Boolean(task?.conversationId || task?.conversationUrl);
 }
 
+function normalizedChatMessageText(message) {
+  return String(message?.text ?? message?.content ?? '').trim();
+}
+
+function renderChatTranscript(container, snapshot, prefix, emptyTitle, emptyCopy) {
+  const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
+  if (messages.length === 0) {
+    container.innerHTML = `<div class="${prefix}-empty">
+      <strong>${escapeHtml(emptyTitle)}</strong>
+      <span>${escapeHtml(emptyCopy)}</span>
+    </div>`;
+    return;
+  }
+  container.innerHTML = messages.map((message) => {
+    const role = ['user', 'assistant', 'system'].includes(message?.role) ? message.role : 'assistant';
+    const label = role === 'user' ? 'You' : role === 'system' ? 'System' : 'ChatGPT';
+    const text = normalizedChatMessageText(message);
+    if (!text) return '';
+    return `<article class="${prefix}-message ${role}" data-message-id="${escapeHtml(message.id || '')}">
+      <div class="${prefix}-message-label">${label}</div>
+      <pre>${escapeHtml(text)}</pre>
+    </article>`;
+  }).join('');
+  requestAnimationFrame(() => {
+    container.scrollTop = container.scrollHeight;
+  });
+}
+
+function setChatConfigurationSelects(prefix, configuration = {}) {
+  const model = ['default', 'sol', 'luna'].includes(configuration.model) ? configuration.model : 'default';
+  const reasoning = ['default', 'instant', 'low', 'medium', 'high', 'extra-high'].includes(configuration.reasoning)
+    ? configuration.reasoning
+    : 'default';
+  elements[`${prefix}-chat-model-select`].value = model;
+  elements[`${prefix}-chat-reasoning-select`].value = reasoning;
+  return { model, reasoning };
+}
+
+function taskChatConfiguration(task) {
+  if (state.chatConfigurationTaskId !== task?.taskId) {
+    state.chatConfigurationTaskId = task?.taskId || null;
+    setChatConfigurationSelects('task', {
+      model: task?.model || 'default',
+      reasoning: task?.reasoningMode || 'default',
+    });
+  }
+  return {
+    model: elements['task-chat-model-select'].value,
+    reasoning: elements['task-chat-reasoning-select'].value,
+  };
+}
+
+function updateTaskChatConfigurationStatus(task) {
+  const configuration = taskChatConfiguration(task);
+  const saved = configuration.model === (task?.model || 'default')
+    && configuration.reasoning === (task?.reasoningMode || 'default');
+  elements['task-chat-configuration-status'].textContent = saved
+    ? 'Uses the task’s saved configuration.'
+    : `Next message: ${taskConfigurationLabel({ model: configuration.model, reasoningMode: configuration.reasoning })}`;
+  elements['task-chat-configuration-status'].classList.toggle('is-custom', !saved);
+  return configuration;
+}
+
 function renderTaskChat(task = state.activeTask) {
   if (!task) return;
   const hasChat = taskHasChat(task);
+  const configuration = updateTaskChatConfigurationStatus(task);
   const snapshot = state.chatTaskId === task.taskId ? state.chatSnapshot : null;
-  const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
   const runStatus = snapshot?.run?.status || task.chatStatus || 'unknown';
   const streaming = runStatus === 'streaming';
 
@@ -1346,6 +1421,8 @@ function renderTaskChat(task = state.activeTask) {
   elements['task-chat-send-button'].disabled = !hasChat || state.chatSending || streaming;
   elements['task-chat-stop-button'].classList.toggle('hidden', !hasChat || !streaming);
   elements['task-chat-stop-button'].disabled = state.chatSending;
+  elements['task-chat-model-select'].disabled = !hasChat || state.chatSending || streaming;
+  elements['task-chat-reasoning-select'].disabled = !hasChat || state.chatSending || streaming;
 
   if (!hasChat) {
     elements['task-chat-status'].textContent = 'Submit this task to start a ChatGPT conversation.';
@@ -1368,26 +1445,13 @@ function renderTaskChat(task = state.activeTask) {
   const thinking = String(snapshot?.thinkingSummary || '').trim();
   elements['task-chat-thinking'].classList.toggle('hidden', !thinking);
   elements['task-chat-thinking'].textContent = thinking ? `Reasoning summary: ${thinking}` : '';
-
-  if (messages.length === 0) {
-    elements['task-chat-messages'].innerHTML = `<div class="task-chat-empty">
-      <strong>${hasChat ? (state.chatLoading ? 'Loading conversation…' : 'No messages found') : 'No conversation yet'}</strong>
-      <span>${hasChat ? 'Refresh to read the current browser transcript.' : 'After submission, Patchwork reads the hidden browser and renders the conversation here.'}</span>
-    </div>`;
-    return;
-  }
-
-  elements['task-chat-messages'].innerHTML = messages.map((message) => {
-    const role = ['user', 'assistant', 'system'].includes(message.role) ? message.role : 'assistant';
-    const label = role === 'user' ? 'You' : role === 'system' ? 'System' : 'ChatGPT';
-    return `<article class="task-chat-message ${role}" data-message-id="${escapeHtml(message.id || '')}">
-      <div class="task-chat-message-label">${label}</div>
-      <pre>${escapeHtml(message.text || '')}</pre>
-    </article>`;
-  }).join('');
-  requestAnimationFrame(() => {
-    elements['task-chat-messages'].scrollTop = elements['task-chat-messages'].scrollHeight;
-  });
+  renderChatTranscript(
+    elements['task-chat-messages'],
+    snapshot,
+    'task-chat',
+    hasChat ? (state.chatLoading ? 'Loading conversation…' : 'No messages found') : 'No conversation yet',
+    hasChat ? 'Refresh to read the current browser transcript.' : 'After submission, Patchwork reads the hidden browser and renders the conversation here.',
+  );
 }
 
 async function refreshTaskChat(taskId = state.activeTask?.taskId) {
@@ -1426,11 +1490,12 @@ async function sendTaskChatMessage(event) {
   const task = state.activeTask;
   const text = elements['task-chat-input'].value.trim();
   if (!task || !taskHasChat(task) || !text || state.chatSending) return;
+  const configuration = updateTaskChatConfigurationStatus(task);
   state.chatSending = true;
   state.chatError = null;
   renderTaskChat(task);
   try {
-    const result = await window.patchwork.sendTaskChatMessage(task.taskId, text);
+    const result = await window.patchwork.sendTaskChatMessage(task.taskId, text, configuration);
     elements['task-chat-input'].value = '';
     if (result?.task) upsertTask(result.task);
     if (state.activeTask?.taskId === task.taskId) {
@@ -1472,8 +1537,113 @@ async function stopTaskChat() {
   }
 }
 
+function renderSessionChat() {
+  const snapshot = state.sessionSnapshot;
+  const runStatus = snapshot?.run?.status || 'unknown';
+  const streaming = runStatus === 'streaming';
+  const hasChat = Boolean(snapshot?.id);
+  const message = state.sessionError
+    || (state.sessionLoading ? 'Reading the shared ChatGPT session…'
+      : state.sessionSending ? 'Sending through the shared ChatGPT session…'
+        : streaming ? 'ChatGPT is responding…'
+          : hasChat ? 'Patchwork chat is connected to the shared ChatGPT session.'
+            : 'Open the sign-in browser once, then start chatting here.');
+  elements['session-chat-status'].textContent = message;
+  elements['session-chat-refresh-button'].disabled = state.sessionLoading || state.sessionSending;
+  elements['session-chat-input'].disabled = state.sessionSending || streaming;
+  elements['session-chat-send-button'].disabled = state.sessionSending || streaming;
+  elements['session-chat-stop-button'].classList.toggle('hidden', !streaming);
+  elements['session-chat-stop-button'].disabled = state.sessionSending;
+  elements['session-chat-model-select'].disabled = state.sessionSending || streaming;
+  elements['session-chat-reasoning-select'].disabled = state.sessionSending || streaming;
+  const thinking = String(snapshot?.thinkingSummary || '').trim();
+  elements['session-chat-thinking'].classList.toggle('hidden', !thinking);
+  elements['session-chat-thinking'].textContent = thinking ? `Reasoning summary: ${thinking}` : '';
+  renderChatTranscript(
+    elements['session-chat-messages'],
+    snapshot,
+    'native-chat',
+    state.sessionLoading ? 'Loading conversation…' : 'Your Patchwork chat is ready',
+    hasChat ? 'No messages found. Send a message or refresh the shared session.' : 'Messages stay in the shared authenticated ChatGPT session while Patchwork keeps the conversation in this screen.',
+  );
+}
+
+async function refreshSessionChat() {
+  if (state.sessionLoading) return;
+  state.sessionLoading = true;
+  state.sessionError = null;
+  renderSessionChat();
+  try {
+    const result = await window.patchwork.getSessionChat();
+    state.sessionSnapshot = result?.snapshot || null;
+    state.sessionConfiguration = setChatConfigurationSelects('session', result?.configuration || state.sessionConfiguration);
+  } catch (error) {
+    state.sessionError = error.message;
+  } finally {
+    state.sessionLoading = false;
+    renderSessionChat();
+  }
+}
+
+async function sendSessionChatMessage(event) {
+  event.preventDefault();
+  const text = elements['session-chat-input'].value.trim();
+  if (!text || state.sessionSending) return;
+  state.sessionSending = true;
+  state.sessionError = null;
+  renderSessionChat();
+  try {
+    const result = await window.patchwork.sendSessionChatMessage(text, {
+      model: elements['session-chat-model-select'].value,
+      reasoning: elements['session-chat-reasoning-select'].value,
+    });
+    elements['session-chat-input'].value = '';
+    state.sessionSnapshot = result?.snapshot || null;
+    state.sessionConfiguration = setChatConfigurationSelects('session', result?.configuration || state.sessionConfiguration);
+  } catch (error) {
+    state.sessionError = error.message;
+    showToast(error.message, true);
+  } finally {
+    state.sessionSending = false;
+    renderSessionChat();
+  }
+}
+
+async function stopSessionChat() {
+  if (state.sessionSending) return;
+  state.sessionSending = true;
+  state.sessionError = null;
+  renderSessionChat();
+  try {
+    const result = await window.patchwork.stopSessionChat();
+    state.sessionSnapshot = result?.snapshot || state.sessionSnapshot;
+    state.sessionConfiguration = setChatConfigurationSelects('session', result?.configuration || state.sessionConfiguration);
+  } catch (error) {
+    state.sessionError = error.message;
+    showToast(error.message, true);
+  } finally {
+    state.sessionSending = false;
+    renderSessionChat();
+  }
+}
+
+async function startNewSessionChat() {
+  try {
+    const result = await window.patchwork.newSessionChat();
+    state.sessionSnapshot = result?.snapshot || null;
+    state.sessionConfiguration = setChatConfigurationSelects('session', result?.configuration || { model: 'default', reasoning: 'default' });
+    state.sessionError = null;
+    closeSessionBrowser();
+    renderSessionChat();
+  } catch (error) {
+    state.sessionError = error.message;
+    showToast(error.message, true);
+  }
+}
+
 function showTask(task) {
   closeConflictResolutionModal();
+  closeSessionBrowser();
   const changedTask = state.chatTaskId !== task.taskId;
   state.activeTask = task;
   if (changedTask) {
@@ -1523,6 +1693,7 @@ function showTask(task) {
 
 function showComposer() {
   closeConflictResolutionModal();
+  closeSessionBrowser();
   closeSkillDrawer();
   closePromptManager();
   closePromptLibraryMenu();
@@ -1566,12 +1737,27 @@ function showSession() {
   elements['source-control-button'].classList.remove('active');
   elements['trees-button'].classList.remove('active');
   elements['task-history-button'].classList.remove('active');
-  window.patchwork.setBrowserVisible(true);
-  requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
+  closeSessionBrowser();
+  renderSessionChat();
+  refreshSessionChat().catch(() => {});
   renderTaskList();
 }
 
+function openSessionBrowser() {
+  state.sessionBrowserOpen = true;
+  elements['session-browser-overlay'].classList.remove('hidden');
+  window.patchwork.setBrowserVisible(true);
+  requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
+}
+
+function closeSessionBrowser() {
+  state.sessionBrowserOpen = false;
+  elements['session-browser-overlay']?.classList.add('hidden');
+  window.patchwork.setBrowserVisible(false);
+}
+
 async function showSourceControl() {
+  closeSessionBrowser();
   elements['composer-view'].classList.add('hidden');
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
@@ -1589,6 +1775,7 @@ async function showSourceControl() {
 }
 
 function showTrees() {
+  closeSessionBrowser();
   elements['composer-view'].classList.add('hidden');
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
@@ -1609,6 +1796,7 @@ function showTrees() {
 
 function showTaskHistory() {
   state.activeTask = null;
+  closeSessionBrowser();
   elements['composer-view'].classList.add('hidden');
   elements['task-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
@@ -2308,17 +2496,37 @@ elements['conflict-resolution-modal'].addEventListener('click', (event) => {
   if (event.target === elements['conflict-resolution-modal']) closeConflictResolutionModal();
 });
 elements['rollback-button'].addEventListener('click', () => runTaskAction(window.patchwork.rollbackTask, 'Changes rolled back.'));
-elements['session-new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
+elements['session-new-chat-button'].addEventListener('click', startNewSessionChat);
+elements['session-open-browser-button'].addEventListener('click', openSessionBrowser);
+elements['session-close-browser-button'].addEventListener('click', closeSessionBrowser);
+elements['session-browser-new-chat-button'].addEventListener('click', startNewSessionChat);
 elements['session-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));
 elements['session-back-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserBack));
 elements['session-forward-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserForward));
 elements['task-chat-form'].addEventListener('submit', sendTaskChatMessage);
 elements['task-chat-refresh-button'].addEventListener('click', () => refreshTaskChat());
 elements['task-chat-stop-button'].addEventListener('click', stopTaskChat);
+elements['task-chat-model-select'].addEventListener('change', () => updateTaskChatConfigurationStatus(state.activeTask));
+elements['task-chat-reasoning-select'].addEventListener('change', () => updateTaskChatConfigurationStatus(state.activeTask));
+elements['session-chat-form'].addEventListener('submit', sendSessionChatMessage);
+elements['session-chat-refresh-button'].addEventListener('click', refreshSessionChat);
+elements['session-chat-stop-button'].addEventListener('click', stopSessionChat);
+elements['session-chat-model-select'].addEventListener('change', () => {
+  state.sessionConfiguration.model = elements['session-chat-model-select'].value;
+});
+elements['session-chat-reasoning-select'].addEventListener('change', () => {
+  state.sessionConfiguration.reasoning = elements['session-chat-reasoning-select'].value;
+});
 elements['task-chat-input'].addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
     elements['task-chat-form'].requestSubmit();
+  }
+});
+elements['session-chat-input'].addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    elements['session-chat-form'].requestSubmit();
   }
 });
 let diffScrollSyncing = false;
@@ -2377,6 +2585,17 @@ window.addEventListener('resize', syncBrowserBounds);
 window.addEventListener('scroll', syncBrowserBounds, true);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
 setInterval(updateTaskElapsedTimes, 1_000);
+
+function refreshStreamingChats() {
+  const activeTaskStreaming = state.activeTask && taskHasChat(state.activeTask)
+    && (state.chatSnapshot?.run?.status === 'streaming' || state.activeTask.chatStatus === 'streaming');
+  if (activeTaskStreaming && !state.chatLoading && !state.chatSending) refreshTaskChat(state.activeTask.taskId).catch(() => {});
+  const sessionStreaming = !elements['session-view'].classList.contains('hidden')
+    && state.sessionSnapshot?.run?.status === 'streaming';
+  if (sessionStreaming && !state.sessionLoading && !state.sessionSending) refreshSessionChat().catch(() => {});
+}
+
+setInterval(refreshStreamingChats, 1_500);
 
 window.patchwork.onTaskEvent((event) => {
   if (event.task) upsertTask(event.task);

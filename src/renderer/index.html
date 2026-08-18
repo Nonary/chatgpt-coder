@@ -52,24 +52,83 @@
         </header>
 
         <section id="session-view" class="session-view hidden">
-          <div class="session-browser-frame browser-frame">
-            <div class="browser-toolbar">
-              <div class="browser-controls">
-                <button id="session-back-button" title="Back" aria-label="Back">←</button>
-                <button id="session-forward-button" title="Forward" aria-label="Forward">→</button>
-                <button id="session-reload-button" title="Reload" aria-label="Reload">↻</button>
+          <div class="native-chat-screen">
+            <header class="native-chat-header">
+              <div>
+                <p class="eyebrow">PATCHWORK CHAT</p>
+                <h2>AI workspace</h2>
+                <p id="session-chat-status">Start a conversation in the persistent ChatGPT session.</p>
               </div>
-              <div class="browser-location">
-                <span id="session-status-dot"></span>
-                <strong id="session-browser-title">ChatGPT</strong>
-                <small id="session-browser-status">Sign in here before creating a task</small>
+              <div class="native-chat-header-actions">
+                <button id="session-open-browser-button" class="secondary" type="button">Open sign-in browser</button>
+                <button id="session-new-chat-button" class="primary" type="button">＋ New chat</button>
               </div>
-              <button id="session-new-chat-button" class="secondary browser-new-chat">＋ New chat</button>
+            </header>
+            <div class="native-chat-toolbar">
+              <div class="native-chat-config">
+                <label>Model
+                  <select id="session-chat-model-select" class="field-control">
+                    <option value="default">ChatGPT default</option>
+                    <option value="sol">GPT-5.6 Sol</option>
+                    <option value="luna">GPT-5.6 Luna</option>
+                  </select>
+                </label>
+                <label>Reasoning
+                  <select id="session-chat-reasoning-select" class="field-control">
+                    <option value="default">Model default</option>
+                    <option value="instant">Instant</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="extra-high">Extra High</option>
+                  </select>
+                </label>
+              </div>
+              <div class="native-chat-toolbar-actions">
+                <button id="session-chat-refresh-button" class="secondary" type="button">Refresh</button>
+                <button id="session-chat-stop-button" class="secondary hidden" type="button">Stop</button>
+              </div>
             </div>
-            <div id="session-chatgpt-surface" class="chatgpt-surface">
-              <div class="browser-placeholder">
-                <strong>Loading ChatGPT…</strong>
-                <span>Sign in here once; Patchwork will reuse this session for every task.</span>
+            <div id="session-chat-thinking" class="native-chat-thinking hidden"></div>
+            <div id="session-chat-messages" class="native-chat-messages" role="log" aria-live="polite">
+              <div class="native-chat-empty">
+                <strong>Your Patchwork chat is ready</strong>
+                <span>Messages stay in the shared authenticated ChatGPT session while Patchwork keeps the conversation in this screen.</span>
+              </div>
+            </div>
+            <form id="session-chat-form" class="native-chat-composer">
+              <label class="sr-only" for="session-chat-input">Message ChatGPT</label>
+              <textarea id="session-chat-input" rows="3" placeholder="Ask ChatGPT anything about your code…"></textarea>
+              <div class="native-chat-composer-footer">
+                <small>Patchwork applies the selected model and reasoning to each request.</small>
+                <button id="session-chat-send-button" class="primary" type="submit">Send</button>
+              </div>
+            </form>
+          </div>
+
+          <div id="session-browser-overlay" class="session-browser-overlay hidden">
+            <div class="session-browser-frame browser-frame">
+              <div class="browser-toolbar">
+                <div class="browser-controls">
+                  <button id="session-back-button" title="Back" aria-label="Back">←</button>
+                  <button id="session-forward-button" title="Forward" aria-label="Forward">→</button>
+                  <button id="session-reload-button" title="Reload" aria-label="Reload">↻</button>
+                </div>
+                <div class="browser-location">
+                  <span id="session-status-dot"></span>
+                  <strong id="session-browser-title">ChatGPT</strong>
+                  <small id="session-browser-status">Sign in here before creating a task</small>
+                </div>
+                <div class="browser-overlay-actions">
+                  <button id="session-browser-new-chat-button" class="secondary browser-new-chat" type="button">＋ New chat</button>
+                  <button id="session-close-browser-button" class="icon-button" title="Close browser" aria-label="Close browser" type="button">×</button>
+                </div>
+              </div>
+              <div id="session-chatgpt-surface" class="chatgpt-surface">
+                <div class="browser-placeholder">
+                  <strong>Loading ChatGPT…</strong>
+                  <span>Sign in here once; Patchwork will reuse this session for every task.</span>
+                </div>
               </div>
             </div>
           </div>
@@ -445,12 +504,32 @@
             <section class="task-chat-panel" aria-labelledby="task-chat-heading">
               <header class="task-chat-header">
                 <div>
-                  <p class="eyebrow">CHATGPT CONVERSATION</p>
-                  <h2 id="task-chat-heading">Task chat</h2>
+                  <p class="eyebrow">PATCHWORK TASK CHAT</p>
+                  <h2 id="task-chat-heading">Task conversation</h2>
                   <p id="task-chat-status">Submit this task to start a ChatGPT conversation.</p>
                 </div>
                 <button id="task-chat-refresh-button" class="secondary" type="button">Refresh</button>
               </header>
+              <div class="task-chat-toolbar">
+                <label>Model
+                  <select id="task-chat-model-select" class="field-control">
+                    <option value="default">ChatGPT default</option>
+                    <option value="sol">GPT-5.6 Sol</option>
+                    <option value="luna">GPT-5.6 Luna</option>
+                  </select>
+                </label>
+                <label>Reasoning
+                  <select id="task-chat-reasoning-select" class="field-control">
+                    <option value="default">Model default</option>
+                    <option value="instant">Instant</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="extra-high">Extra High</option>
+                  </select>
+                </label>
+                <small id="task-chat-configuration-status">Uses the task’s saved configuration.</small>
+              </div>
               <div id="task-chat-thinking" class="task-chat-thinking hidden"></div>
               <div id="task-chat-messages" class="task-chat-messages" role="log" aria-live="polite">
                 <div class="task-chat-empty">

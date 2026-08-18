@@ -483,13 +483,18 @@ class PatchworkAIChatController {
     return snapshot;
   }
 
-  async sendTaskMessage(task, text) {
+  async sendTaskMessage(task, text, configuration = {}) {
     const message = String(text || '').trim();
     if (!message) throw new Error('Enter a chat message.');
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
     const chat = await this.ensureTaskChat(task);
+    const selectedConfiguration = {
+      model: String(configuration?.model || task.model || 'default'),
+      reasoning: String(configuration?.reasoning || configuration?.reasoningMode || task.reasoningMode || 'default'),
+    };
+    await chat.configure(selectedConfiguration);
     const run = await chat.send({ text: message });
     let currentTask = this.knownTasks.get(task.taskId.toLowerCase()) || task;
     if (currentTask.state === 'submitted') {
@@ -497,6 +502,8 @@ class PatchworkAIChatController {
         chatStatus: run.status,
         chatStatusRaw: null,
         chatFinishedAt: null,
+        model: run.configuration?.model || selectedConfiguration.model,
+        reasoningMode: run.configuration?.reasoning || selectedConfiguration.reasoning,
       });
       this.activeTask = currentTask;
       this.knownTasks.set(task.taskId.toLowerCase(), currentTask);
@@ -513,6 +520,45 @@ class PatchworkAIChatController {
     await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
     this.requestMonitor();
     return { task: currentTask, snapshot };
+  }
+
+  async readSessionChat() {
+    if (!this.activeChat) this.activeChat = await this.chatService.createChat();
+    const snapshot = await this.activeChat.current();
+    return { snapshot, configuration: this.activeChat.configuration };
+  }
+
+  async sendSessionMessage(text, configuration = {}) {
+    const message = String(text || '').trim();
+    if (!message) throw new Error('Enter a chat message.');
+    if (!this.activeChat) this.activeChat = await this.chatService.createChat();
+    const selectedConfiguration = {
+      model: String(configuration?.model || this.activeChat.configuration.model || 'default'),
+      reasoning: String(configuration?.reasoning || configuration?.reasoningMode || this.activeChat.configuration.reasoning || 'default'),
+    };
+    await this.activeChat.configure(selectedConfiguration);
+    const run = await this.activeChat.send({ text: message });
+    const snapshot = await this.activeChat.current();
+    return { snapshot, configuration: run.configuration || selectedConfiguration };
+  }
+
+  async stopSessionChat() {
+    if (!this.activeChat) return { snapshot: null, configuration: null };
+    await this.activeChat.stop();
+    return {
+      snapshot: await this.activeChat.current(),
+      configuration: this.activeChat.configuration,
+    };
+  }
+
+  async newSessionChat() {
+    this.activeTask = null;
+    this.activeMerge = null;
+    this.activeChat = await this.chatService.createChat();
+    return {
+      snapshot: await this.activeChat.current(),
+      configuration: this.activeChat.configuration,
+    };
   }
 
   async stopTaskChat(task) {

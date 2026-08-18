@@ -650,11 +650,53 @@ function readChatSnapshotAction() {
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  const messages = [...document.querySelectorAll('[data-message-author-role]')].map((element, index) => {
-    const role = element.getAttribute('data-message-author-role');
-    const content = readableText(element);
-    return { id: element.getAttribute('data-message-id') || `${role}-${index}`, role, content };
-  }).filter((message) => message.content && ['user', 'assistant', 'system'].includes(message.role));
+  const roleFromValue = (value) => {
+    const normalized = String(value || '').toLowerCase();
+    if (/\b(?:assistant|chatgpt|model|completion|response)\b/.test(normalized)) return 'assistant';
+    if (/\b(?:user|human|prompt|you)\b/.test(normalized)) return 'user';
+    if (/\bsystem\b/.test(normalized)) return 'system';
+    return null;
+  };
+  const roleFromElement = (element) => roleFromValue([
+    element.getAttribute?.('data-message-author-role'),
+    element.getAttribute?.('data-role'),
+    element.getAttribute?.('data-author'),
+    element.getAttribute?.('aria-label'),
+    element.getAttribute?.('data-testid'),
+  ].filter(Boolean).join(' '));
+  const roots = [document];
+  const visitedRoots = new Set();
+  while (roots.length) {
+    const root = roots.shift();
+    if (!root || visitedRoots.has(root)) continue;
+    visitedRoots.add(root);
+    for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
+  }
+  const queryAll = (selector) => [...visitedRoots].flatMap((root) => [...root.querySelectorAll(selector)]);
+  const primary = queryAll('[data-message-author-role]');
+  const fallback = queryAll(
+    '[data-message-id], [data-testid*="conversation-turn" i], article[data-testid*="turn" i], [data-role], [data-author]',
+  );
+  const collect = (candidates) => {
+    const messages = [];
+    const seen = new Set();
+    for (const [index, element] of candidates.entries()) {
+      const role = roleFromElement(element)
+        || roleFromElement(element.querySelector?.('[data-message-author-role], [data-role], [data-author]'));
+      if (!role || element.parentElement?.closest?.('[data-message-author-role]')) continue;
+      const content = readableText(element);
+      if (!content) continue;
+      const id = element.getAttribute('data-message-id')
+        || element.getAttribute('data-testid')
+        || `${role}-${index}`;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      messages.push({ id, role, content });
+    }
+    return messages;
+  };
+  const messages = collect(primary);
+  if (messages.length === 0) messages.push(...collect(fallback));
   const thinking = [...document.querySelectorAll('[data-testid*="reasoning" i], details')]
     .map(readableText)
     .find(Boolean) || null;

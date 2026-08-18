@@ -422,10 +422,43 @@ textarea::placeholder { color: #606659; }
 .browser-location strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .browser-location small { margin-left: auto; color: #6d7467; font-size: 9px; }
 .browser-new-chat { padding: 7px 10px; font-size: 10px; }
+.browser-overlay-actions { display: flex; align-items: center; gap: 5px; }
 .chatgpt-surface { position: relative; flex: 1 1 auto; min-height: 0; background: #151714; }
 .browser-placeholder { position: absolute; inset: 0; display: grid; place-items: center; align-content: center; gap: 5px; color: #8c9385; }
 .browser-placeholder strong { font-size: 12px; }
 .browser-placeholder span { font-size: 10px; }
+.native-chat-screen { position: relative; min-height: calc(100vh - 96px - 64px); max-width: 1040px; margin: 0 auto; padding: 28px 32px 32px; display: flex; flex-direction: column; }
+.native-chat-header { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 22px 24px 18px; border: 1px solid var(--line); border-bottom: 0; border-radius: 16px 16px 0 0; background: linear-gradient(135deg, #1b2117, #171b15); }
+.native-chat-header .eyebrow { margin-bottom: 6px; }
+.native-chat-header h2 { font-size: 21px; }
+.native-chat-header p:last-child { max-width: 590px; margin: 7px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.native-chat-header-actions { display: flex; flex: 0 0 auto; gap: 8px; }
+.native-chat-toolbar { flex: 0 0 auto; display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; padding: 12px 18px; border: 1px solid var(--line); background: #141811; }
+.native-chat-config { display: grid; grid-template-columns: repeat(2, minmax(130px, 190px)); gap: 9px; }
+.native-chat-config label, .task-chat-toolbar label { display: grid; gap: 5px; color: #7e8776; font-size: 9px; font-weight: 750; }
+.native-chat-config .field-control, .task-chat-toolbar .field-control { min-width: 0; padding: 8px 9px; font-size: 10px; }
+.native-chat-toolbar-actions { display: flex; gap: 7px; }
+.native-chat-thinking { flex: 0 0 auto; margin: 12px 18px 0; padding: 10px 12px; border: 1px solid #343b2d; border-radius: 9px; color: #b6c1a9; background: #1b2118; font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
+.native-chat-messages { flex: 1 1 auto; min-height: 360px; max-height: calc(100vh - 390px); overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 22px 24px 28px; border: 1px solid var(--line); border-top: 0; background: #0f120e; overscroll-behavior: contain; }
+.native-chat-empty { min-height: 100%; display: grid; place-items: center; align-content: center; gap: 8px; color: #71786b; text-align: center; }
+.native-chat-empty strong { color: #c8d0bd; font-size: 13px; }
+.native-chat-empty span { max-width: 470px; font-size: 10px; line-height: 1.55; }
+.native-chat-message { width: min(84%, 790px); padding: 13px 15px; border: 1px solid #2a3027; border-radius: 13px; background: #171b15; box-shadow: 0 8px 20px rgba(0, 0, 0, .1); }
+.native-chat-message.user { align-self: flex-end; background: #28341d; border-color: #40532d; }
+.native-chat-message.assistant, .native-chat-message.system { align-self: flex-start; }
+.native-chat-message.system { opacity: .8; }
+.native-chat-message-label { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; color: #7d8874; font-size: 8px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.native-chat-message.user .native-chat-message-label { color: var(--accent); }
+.native-chat-message-label::before { content: '✦'; color: #92ab70; font-size: 10px; }
+.native-chat-message.user .native-chat-message-label::before { content: '↗'; color: var(--accent); }
+.native-chat-message pre { margin: 0; color: #dce3d5; font: 11px/1.65 Inter, ui-sans-serif, system-ui, sans-serif; white-space: pre-wrap; overflow-wrap: anywhere; }
+.native-chat-composer { flex: 0 0 auto; padding: 14px 16px 16px; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 16px 16px; background: #181d16; }
+.native-chat-composer textarea { min-height: 76px; max-height: 190px; resize: vertical; }
+.native-chat-composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; }
+.native-chat-composer-footer small { color: #717b6c; font-size: 9px; line-height: 1.4; }
+.native-chat-composer-footer button { min-width: 78px; }
+.session-browser-overlay { position: absolute; z-index: 15; inset: 18px 24px 24px; padding: 0; border-radius: 16px; background: rgba(7, 9, 6, .72); box-shadow: 0 24px 80px rgba(0, 0, 0, .48); }
+.session-browser-overlay .browser-frame { width: 100%; height: 100%; }
 @media (prefers-reduced-motion: reduce) {
   .task-title-viewport:hover .task-title-scroll.is-overflowing { animation: none; }
 }
@@ -509,11 +542,14 @@ textarea::placeholder { color: #606659; }
 /* Coding-tree task history controls retained across the UX merge. */
 .task-list-more { border: 0; border-top: 1px solid var(--line-soft); background: transparent; color: #8e9686; padding: 10px; text-align: left; font-size: 10px; font-weight: 750; }
 .task-list-more:hover { color: var(--accent); }
-.task-chat-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: #10120e; border: 1px solid var(--line); border-radius: 14px; }
+.task-chat-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: #10120e; border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 14px 34px rgba(0,0,0,.12); }
 .task-chat-header { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 17px 18px 15px; border-bottom: 1px solid var(--line); background: #181b16; }
 .task-chat-header .eyebrow { margin: 0 0 5px; }
 .task-chat-header h2 { margin: 0; font-size: 17px; }
 .task-chat-header p:last-child { margin: 6px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+.task-chat-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 9px; padding: 11px 14px 12px; border-bottom: 1px solid var(--line-soft); background: #141711; }
+.task-chat-toolbar > small { grid-column: 1 / -1; color: #737d6d; font-size: 9px; line-height: 1.35; }
+.task-chat-toolbar > small.is-custom { color: var(--accent); }
 .task-chat-thinking { flex: 0 0 auto; margin: 12px 18px 0; padding: 10px 12px; border: 1px solid #2b3027; border-radius: 9px; color: #8f9788; background: #151812; font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
 .task-chat-messages { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 20px 18px 24px; overscroll-behavior: contain; }
 .task-chat-empty { min-height: 100%; display: grid; place-items: center; align-content: center; gap: 6px; color: #71786b; text-align: center; }
@@ -532,3 +568,23 @@ textarea::placeholder { color: #606659; }
 .task-chat-composer-footer small { color: #6f766a; font-size: 9px; line-height: 1.4; }
 .task-chat-actions { flex: 0 0 auto; display: flex; gap: 7px; }
 .task-chat-actions button { min-width: 68px; }
+
+@media (max-width: 1050px) {
+  .native-chat-screen { min-height: calc(100vh - 96px - 24px); padding: 18px 18px 24px; }
+  .native-chat-header { flex-direction: column; }
+  .native-chat-header-actions { width: 100%; justify-content: flex-end; }
+  .session-browser-overlay { inset: 12px; }
+}
+
+@media (max-width: 650px) {
+  .native-chat-screen { padding: 12px; }
+  .native-chat-toolbar { align-items: stretch; flex-direction: column; }
+  .native-chat-config { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .native-chat-toolbar-actions { justify-content: flex-end; }
+  .native-chat-messages { min-height: 300px; max-height: none; padding: 18px 14px 22px; }
+  .native-chat-message, .task-chat-message { width: 94%; }
+  .native-chat-composer-footer { align-items: stretch; flex-direction: column; }
+  .native-chat-composer-footer button { align-self: flex-end; }
+  .native-chat-header-actions { flex-direction: column-reverse; width: 100%; }
+  .native-chat-header-actions button { width: 100%; }
+}

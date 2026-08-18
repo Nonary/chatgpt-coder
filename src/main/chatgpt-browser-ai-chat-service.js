@@ -374,7 +374,7 @@ class ChatGPTBrowserAIChatService extends AIChatService {
     const messages = (content.messages || []).map((message) => ({
       id: String(message.id),
       role: Object.values(AI_CHAT_MESSAGE_ROLE).includes(message.role) ? message.role : AI_CHAT_MESSAGE_ROLE.ASSISTANT,
-      text: String(message.content || ''),
+      text: String(message.text ?? message.content ?? ''),
     }));
     const rememberedRunStatus = this.#runStatusByChat.get(descriptor.id);
     const runStatus = rememberedRunStatus === AI_CHAT_RUN_STATUS.STOPPED && run.status === AI_CHAT_RUN_STATUS.COMPLETED
@@ -405,6 +405,7 @@ class ChatGPTBrowserAIChatService extends AIChatService {
         error: runStatus === AI_CHAT_RUN_STATUS.FAILED
           ? { code: AI_CHAT_ERROR_CODE.PROVIDER_ERROR, message: 'The AI provider reported an error.' }
           : null,
+        configuration: { ...descriptor.configuration },
       },
     };
   }

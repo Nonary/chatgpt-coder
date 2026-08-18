@@ -1676,7 +1676,11 @@ test('AIChat exposes chat, attachment, message, snapshot, and run operations as 
     messages: [{ id: 'm1', role: 'assistant', text: 'Done.' }],
     thinkingSummary: 'Checked the repository.',
     attachments: [{ name: 'task.zip', status: 'ready' }],
-    run: { status: 'completed', error: null },
+    run: {
+      status: 'completed',
+      error: null,
+      configuration: { model: 'luna', reasoning: 'high' },
+    },
   });
   await Promise.all([chat.current(), chat.current()]);
   assert.equal(maximumConcurrentSnapshotReads, 1);
@@ -1699,6 +1703,30 @@ test('AIChat maps its owned Sol and Luna choices to provider request configurati
     () => normalizeConfiguration({ model: 'terra', reasoning: 'medium' }),
     /unsupported AI chat model/i,
   );
+});
+
+test('native Patchwork chat surfaces stream transcript responses and preserve model controls', async () => {
+  const [renderer, markup, driver, view, main, preload] = await Promise.all([
+    fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-driver.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
+  ]);
+  assert.match(renderer, /message\?\.text \?\? message\?\.content/);
+  assert.match(renderer, /setInterval\(refreshStreamingChats, 1_500\)/);
+  assert.match(renderer, /sendTaskChatMessage\(task\.taskId, text, configuration\)/);
+  assert.match(renderer, /sendSessionChatMessage\(text, \{/);
+  assert.match(markup, /id="session-chat-model-select"/);
+  assert.match(markup, /id="session-chat-reasoning-select"/);
+  assert.match(markup, /id="task-chat-model-select"/);
+  assert.match(driver, /data-testid\*="conversation-turn"/);
+  assert.match(driver, /const messages = collect\(primary\)/);
+  assert.match(view, /await chat\.configure\(selectedConfiguration\)/);
+  assert.match(view, /async readSessionChat\(\)/);
+  assert.match(main, /ipcMain\.handle\('session:chat-send'/);
+  assert.match(preload, /sendSessionChatMessage:/);
 });
 
 test('AIChat keeps project automation on the same persistent browser context', async () => {
