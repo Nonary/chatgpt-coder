@@ -566,7 +566,7 @@ function renderRepositories() {
   }
   if (state.repositories.length === 0) {
     container.className = 'repository-list empty-state';
-    container.innerHTML = '<div class="empty-icon">⌘</div><strong>No repository selected</strong><span>Add one Git repository to begin.</span>';
+    container.innerHTML = '<div class="empty-icon">⌘</div><strong>No repositories selected</strong><span>Add one or more Git repositories to begin.</span>';
     return;
   }
   container.className = 'repository-list';
@@ -2024,8 +2024,10 @@ function syncBrowserBounds() {
 async function chooseRepositories() {
   try {
     const repositories = await window.patchwork.chooseRepositories();
-    if (repositories[0]) {
-      state.repositories = [repositories[0]];
+    if (repositories.length > 0) {
+      const selected = new Map(state.repositories.map((repository) => [repository.path, repository]));
+      repositories.forEach((repository) => selected.set(repository.path, repository));
+      state.repositories = [...selected.values()];
       resetTaskSkills();
     }
     const workspace = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));

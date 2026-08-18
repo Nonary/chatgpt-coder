@@ -77,6 +77,30 @@ async function matchesPackagedState(repository, current) {
   return current.baseCommit === repository.baseCommit && current.isClean;
 }
 
+async function reverseAppliedChanges(applied, committed = []) {
+  for (const item of [...committed].reverse()) {
+    try {
+      await runGit(item.repository.path, ['reset', '--hard', `${item.commit}^`]);
+    } catch {
+      // Preserve the original error and the worktree for manual recovery.
+    }
+  }
+  const committedPaths = new Set(committed.map((item) => item.repository.path));
+  for (const item of [...applied].reverse()) {
+    if (committedPaths.has(item.repository.path)) continue;
+    try {
+      if (item.wasClean && item.headBefore) {
+        await runGit(item.repository.path, ['reset', '--hard', item.headBefore]);
+      } else {
+        await runGit(item.repository.path, ['reset', '--mixed', '--quiet', 'HEAD']).catch(() => {});
+        await applyPatch(item.repository.path, item.patch.localPath, { reverse: true });
+      }
+    } catch {
+      // Preserve the original error; the UI will point the user to the saved patch.
+    }
+  }
+}
+
 class ResultService {
   constructor(taskService, onEvent = () => {}) {
     this.taskService = taskService;
@@ -284,6 +308,7 @@ class ResultService {
         const exactState = await matchesPackagedState(repository, current);
         if (!exactState && !current.isClean) {
           const previousConflict = task.result.conflicts?.find((item) => item.repositoryId === repository.id);
+          await reverseAppliedChanges(applied, committed);
           return this.markConflicted(task, repository, new Error(
             `${repository.name} has new uncommitted or unmerged changes since this task was packaged.`,
           ), previousConflict?.applyAttempted === true);
@@ -303,6 +328,7 @@ class ResultService {
             ? { threeWay: true, index: true }
             : {});
         } catch (error) {
+          await reverseAppliedChanges(applied, committed);
           return this.markConflicted(task, repository, error, true);
         }
         applied.push({ repository, patch, applyMode, wasClean: current.isClean, headBefore: current.baseCommit });
@@ -317,26 +343,7 @@ class ResultService {
         }
       }
     } catch (error) {
-      for (const item of committed.reverse()) {
-        try {
-          await runGit(item.repository.path, ['reset', '--hard', `${item.commit}^`]);
-        } catch {
-          // Preserve the original error and the worktree for manual recovery.
-        }
-      }
-      for (const item of applied.reverse()) {
-        if (committed.some((commit) => commit.repository.path === item.repository.path)) continue;
-        try {
-          if (item.wasClean && item.headBefore) {
-            await runGit(item.repository.path, ['reset', '--hard', item.headBefore]);
-          } else {
-            await runGit(item.repository.path, ['reset', '--mixed', '--quiet', 'HEAD']).catch(() => {});
-            await applyPatch(item.repository.path, item.patch.localPath, { reverse: true });
-          }
-        } catch {
-          // Preserve the original error; the UI will point the user to the saved patch.
-        }
-      }
+      await reverseAppliedChanges(applied, committed);
       task = await this.taskService.updateTask(taskId, { state: 'failed', error: error.message });
       await this.onEvent({ type: 'task-failed', task, message: error.message });
       throw error;

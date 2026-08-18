@@ -190,6 +190,97 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
 });
 
+test('task packages preserve multiple writable repositories', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-package-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(path.join(root, 'first'));
+  const secondRepositoryPath = await createRepository(path.join(root, 'second'));
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+
+  const repositories = await tasks.inspectRepositories([firstRepositoryPath, secondRepositoryPath]);
+  const task = await tasks.createTask({
+    taskText: 'Change both repositories.',
+    repositories,
+    autoApply: false,
+  });
+
+  assert.equal(task.repositories.length, 2);
+  assert.equal(task.repositories.every((repository) => !repository.readOnly), true);
+  const zip = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(zip.getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.repositories.length, 2);
+  for (const repository of task.repositories) {
+    assert.ok(zip.getEntry(`repositories/${repository.id}.bundle`));
+    assert.equal(manifest.repositories.some((entry) => entry.id === repository.id), true);
+  }
+});
+
+test('a multi-repository conflict reverses patches already applied to earlier repositories', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-conflict-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(path.join(root, 'first'));
+  const secondRepositoryPath = await createRepository(path.join(root, 'second'));
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repositories = await tasks.inspectRepositories([firstRepositoryPath, secondRepositoryPath]);
+  const task = await tasks.createTask({
+    taskText: 'Change both repositories.',
+    repositories,
+    autoApply: false,
+  });
+
+  const patchBodies = [];
+  for (const [index, repository] of task.repositories.entries()) {
+    await fs.writeFile(path.join(repository.path, 'hello.txt'), `ChatGPT change ${index + 1}\n`);
+    const { stdout } = await runGit(repository.path, [
+      'diff', '--binary', repository.baseCommit, '--', '.',
+    ]);
+    patchBodies.push(stdout);
+    await runGit(repository.path, ['restore', 'hello.txt']);
+  }
+
+  const resultText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Changed both repositories.',
+    repositories: task.repositories.map((repository, index) => ({
+      id: repository.id,
+      baseCommit: repository.baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patchBodies[index]).toString('base64'),
+    })),
+  })}\nPATCHWORK_RESULT_END`;
+
+  const results = new ResultService(tasks);
+  let current = await ingestDownloadedText(results, tasks, task, resultText);
+  assert.equal(current.state, 'ready');
+  await fs.writeFile(path.join(secondRepositoryPath, 'hello.txt'), 'local conflicting change\n');
+
+  current = await results.apply(task.taskId);
+  assert.equal(current.state, 'conflicted');
+  assert.equal(await fs.readFile(path.join(firstRepositoryPath, 'hello.txt'), 'utf8'), 'hello\n');
+  assert.equal(await fs.readFile(path.join(secondRepositoryPath, 'hello.txt'), 'utf8'), 'local conflicting change\n');
+});
+
+test('task repository picker remains additive and accepts multiple directories', async () => {
+  const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
+  const chooseRepositoriesSource = renderer.slice(
+    renderer.indexOf('async function chooseRepositories()'),
+    renderer.indexOf('async function chooseAttachments()'),
+  );
+
+  assert.match(appSource, /title: 'Choose Git repositories',[\s\S]*properties: \['openDirectory', 'multiSelections'\]/);
+  assert.match(chooseRepositoriesSource, /new Map\(state\.repositories\.map\(\(repository\) => \[repository\.path, repository\]\)\)/);
+  assert.match(chooseRepositoriesSource, /state\.repositories = \[\.\.\.selected\.values\(\)\]/);
+  assert.doesNotMatch(chooseRepositoriesSource, /state\.repositories = \[repositories\[0\]\]/);
+  assert.match(markup, /Current-working-change tasks can include one or more selected repositories/);
+});
+
 test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-attachments-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
