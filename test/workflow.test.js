@@ -1700,6 +1700,454 @@ test('AIChat maps its owned Sol and Luna choices to provider request configurati
   );
 });
 
+test('AIChat keeps project automation in its isolated workspace browser context', async () => {
+  const chatBrowser = {
+    listWorkspaces: async () => { throw new Error('active chat browser used for projects'); },
+    createWorkspace: async () => { throw new Error('active chat browser used for projects'); },
+  };
+  const workspaceCalls = [];
+  const workspaceBrowser = {
+    listWorkspaces: async () => {
+      workspaceCalls.push('list');
+      return {
+        ok: true,
+        workspaces: [{ id: 'g-p-1234567890abcdef1234567890abcdef', name: 'Patchwork' }],
+        authenticationRequired: false,
+      };
+    },
+    createWorkspace: async (name) => {
+      workspaceCalls.push(`create:${name}`);
+      return {
+        ok: true,
+        workspace: { id: 'g-p-fedcba0987654321fedcba0987654321', name },
+        authenticationRequired: false,
+      };
+    },
+  };
+  const service = new ChatGPTBrowserAIChatService({}, chatBrowser, workspaceBrowser);
+  assert.deepEqual(await service.listWorkspaces(), [{
+    id: 'g-p-1234567890abcdef1234567890abcdef',
+    name: 'Patchwork',
+  }]);
+  assert.deepEqual(await service.createWorkspace({ name: 'New Patchwork Project' }), {
+    id: 'g-p-fedcba0987654321fedcba0987654321',
+    name: 'New Patchwork Project',
+  });
+  assert.deepEqual(workspaceCalls, ['list', 'create:New Patchwork Project']);
+});
+
+test('workspace loading is not blocked by a pending active-chat browser operation', async () => {
+  let releaseChatOperation;
+  const chatBrowser = {
+    readSessionState: () => new Promise((resolve) => { releaseChatOperation = resolve; }),
+  };
+  const workspaceBrowser = {
+    listWorkspaces: async () => ({
+      ok: true,
+      workspaces: [{ id: 'g-p-22222222222222222222222222222222', name: 'Independent' }],
+      authenticationRequired: false,
+    }),
+  };
+  const service = new ChatGPTBrowserAIChatService({}, chatBrowser, workspaceBrowser);
+  const pendingChat = service.currentSession();
+  const projects = await Promise.race([
+    service.listWorkspaces(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('workspace queue was blocked')), 100)),
+  ]);
+  assert.deepEqual(projects, [{
+    id: 'g-p-22222222222222222222222222222222',
+    name: 'Independent',
+  }]);
+  releaseChatOperation({ authenticated: true });
+  await pendingChat;
+
+  const main = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(main, /projects:list[^\n]+chatController\.listProjects\(\)/);
+  assert.doesNotMatch(main, /projects:list[^\n]+chatController\.enqueue/);
+});
+
+test('the browser provider opens Projects through ChatGPT in-app navigation without a hard refresh', async () => {
+  const projectLink = {
+    textContent: 'Patchwork',
+    href: 'https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-patchwork/project',
+    getAttribute: (name) => (name === 'href'
+      ? '/g/g-p-1234567890abcdef1234567890abcdef-patchwork/project'
+      : null),
+    closest: () => null,
+  };
+  const projectsControl = {
+    textContent: 'Projects',
+    disabled: false,
+    getAttribute: () => null,
+    matches: () => false,
+    click: () => { projectsControl.clicked += 1; },
+    clicked: 0,
+  };
+  const document = {
+    body: { textContent: 'Projects Patchwork' },
+    documentElement: { scrollHeight: 600, scrollTop: 0, clientHeight: 600 },
+    scrollingElement: { scrollHeight: 600, scrollTop: 0, clientHeight: 600 },
+    querySelectorAll: (selector) => {
+      if (selector === 'a[href]') return [projectLink];
+      if (selector === 'button, a, [role="button"], [role="alert"]') return [projectsControl];
+      if (selector === 'button, [role="button"], a') return [projectsControl];
+      if (selector === 'a[href], button, [role="button"]') return [projectsControl];
+      return [];
+    },
+  };
+  const navigations = [];
+  const driver = new ChatGPTBrowserDriver({
+    loadURL: async (url) => { navigations.push(url); },
+    executeJavaScript: async (source) => vm.runInNewContext(source, {
+      URL,
+      document,
+      location: {
+        href: 'https://chatgpt.com/',
+        pathname: '/',
+        search: '',
+      },
+    }),
+  });
+
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-1234567890abcdef1234567890abcdef',
+    name: 'Patchwork',
+  }]);
+  assert.deepEqual(navigations, ['https://chatgpt.com/']);
+  assert.equal(projectsControl.clicked, 1);
+});
+
+test('the browser provider creates a project through visible browser controls and confirms it by scraping', async () => {
+  const navigations = [];
+  const pageActions = [];
+  let submitted = false;
+  let currentUrl = 'about:blank';
+  const driver = new ChatGPTBrowserDriver({
+    getURL: () => currentUrl,
+    loadURL: async (url) => {
+      currentUrl = url;
+      navigations.push(url);
+    },
+    executeJavaScript: async (source) => {
+      if (source.includes('function openCreateWorkspaceAction')) {
+        pageActions.push('open-create');
+        return true;
+      }
+      if (source.includes('function submitCreateWorkspaceAction')) {
+        pageActions.push('submit-create');
+        submitted = true;
+        return { ready: true, submitted: true, authenticationRequired: false, error: null };
+      }
+      if (source.includes('function readWorkspaceIndexAction')) {
+        return {
+          ready: true,
+          empty: !submitted,
+          authenticationRequired: false,
+          error: null,
+          projectsPage: true,
+          workspaces: submitted ? [{
+            id: 'g-p-fedcba0987654321fedcba0987654321',
+            name: 'New Patchwork Project',
+          }] : [],
+        };
+      }
+      if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
+      return null;
+    },
+  });
+
+  const result = await driver.createWorkspace('New Patchwork Project');
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.workspace, {
+    id: 'g-p-fedcba0987654321fedcba0987654321',
+    name: 'New Patchwork Project',
+  });
+  assert.deepEqual(pageActions, ['open-create', 'submit-create']);
+  assert.deepEqual(navigations, ['https://chatgpt.com/library?tab=projects']);
+});
+
+test('the browser provider detects project authentication requirements from rendered controls', async () => {
+  const driver = new ChatGPTBrowserDriver({
+    loadURL: async () => {},
+    executeJavaScript: async (source) => {
+      assert.match(source, /readWorkspaceIndexAction/);
+      return {
+        ready: false,
+        workspaces: [],
+        authenticationRequired: true,
+        error: null,
+      };
+    },
+  });
+
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, false);
+  assert.equal(result.authenticationRequired, true);
+});
+
+test('the project browser waits for ChatGPT-owned project data after the page shell renders', async () => {
+  let reads = 0;
+  const driver = new ChatGPTBrowserDriver({
+    loadURL: async () => {},
+    executeJavaScript: async (source) => {
+      if (source.includes('function openWorkspaceIndexAction')) return { activated: true };
+      if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
+      reads += 1;
+      return {
+        ready: true,
+        empty: false,
+        authenticationRequired: false,
+        error: null,
+        workspaces: reads >= 4 ? [{
+          id: 'g-p-11111111111111111111111111111111',
+          name: 'Eventually rendered',
+        }] : [],
+      };
+    },
+  });
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.equal(reads >= 4, true);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-11111111111111111111111111111111',
+    name: 'Eventually rendered',
+  }]);
+});
+
+test('project browser automation cannot read credentials or call authenticated ChatGPT APIs', async () => {
+  const source = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-driver.js'), 'utf8');
+  const pageActions = source.slice(
+    source.indexOf('function readWorkspaceIndexAction'),
+    source.indexOf('async function installConfigurationPickerAction'),
+  );
+  const workspaceMethods = source.slice(
+    source.indexOf('async listWorkspaces()'),
+    source.indexOf('installConfigurationPicker(configuration)'),
+  ) + source.slice(
+    source.indexOf('async #startWorkspaceNetworkCapture()'),
+    source.indexOf('async #loadBrowserSurface(url)'),
+  );
+  const projectAutomation = `${pageActions}\n${workspaceMethods}`;
+  assert.doesNotMatch(projectAutomation, /fetch\s*\(/);
+  assert.doesNotMatch(projectAutomation, /api\/auth|backend-api|authorization|access.?token|document\.cookie|localStorage/i);
+  assert.match(projectAutomation, /Project name|unable to load projects/i);
+  assert.match(projectAutomation, /Network\.getResponseBody/);
+  assert.match(projectAutomation, /history\.pushState/);
+  const listMethod = source.slice(
+    source.indexOf('async listWorkspaces()'),
+    source.indexOf('async createWorkspace(name)'),
+  );
+  assert.doesNotMatch(listMethod, /#loadBrowserSurface\(CHATGPT_PROJECTS_URL\)/);
+});
+
+test('project discovery changes the local ChatGPT route when no Projects control is rendered', async () => {
+  const navigations = [];
+  const routeChanges = [];
+  let localRouteActivated = false;
+  const driver = new ChatGPTBrowserDriver({
+    loadURL: async (url) => { navigations.push(url); },
+    executeJavaScript: async (source) => {
+      if (source.includes('function openWorkspaceIndexAction')) {
+        const location = { href: 'https://chatgpt.com/', pathname: '/', search: '' };
+        const history = {
+          state: { existing: true },
+          pushState: (_state, _title, route) => {
+            routeChanges.push(route);
+            localRouteActivated = true;
+          },
+        };
+        return vm.runInNewContext(source, {
+          URL,
+          document: { querySelectorAll: () => [] },
+          history,
+          location,
+          PopStateEvent: class PopStateEvent { constructor(type, options) { this.type = type; this.state = options.state; } },
+          window: { dispatchEvent: () => true },
+        });
+      }
+      if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
+      return {
+        ready: localRouteActivated,
+        projectsPage: localRouteActivated,
+        empty: false,
+        authenticationRequired: false,
+        error: null,
+        workspaces: localRouteActivated ? [{
+          id: 'g-p-00112233445566778899aabbccddeeff',
+          name: 'Local Route Project',
+        }] : [],
+      };
+    },
+  });
+
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-00112233445566778899aabbccddeeff',
+    name: 'Local Route Project',
+  }]);
+  assert.deepEqual(navigations, ['https://chatgpt.com/']);
+  assert.deepEqual(routeChanges, ['/library?tab=projects']);
+});
+
+test('project discovery blocks a Projects control from starting a document navigation', async () => {
+  const webContents = new EventEmitter();
+  let localRouteActivated = false;
+  let preventedDocumentNavigations = 0;
+  let documentLoads = 0;
+  webContents.getURL = () => 'https://chatgpt.com/';
+  webContents.loadURL = async () => { documentLoads += 1; };
+  webContents.executeJavaScript = async (source) => {
+    if (source.includes('function openWorkspaceIndexAction')) {
+      if (source.includes('"localRouteOnly":true')) {
+        localRouteActivated = true;
+        return { activated: true, renderedControl: false };
+      }
+      webContents.emit('will-navigate', {
+        preventDefault: () => { preventedDocumentNavigations += 1; },
+      }, 'https://chatgpt.com/library?tab=projects');
+      return { activated: true, renderedControl: true };
+    }
+    if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
+    return {
+      ready: localRouteActivated,
+      projectsPage: localRouteActivated,
+      empty: false,
+      authenticationRequired: false,
+      error: null,
+      workspaces: localRouteActivated ? [{
+        id: 'g-p-ffeeddccbbaa99887766554433221100',
+        name: 'Preserved Browser Project',
+      }] : [],
+    };
+  };
+
+  const result = await new ChatGPTBrowserDriver(webContents).listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.equal(preventedDocumentNavigations, 1);
+  assert.equal(documentLoads, 0);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-ffeeddccbbaa99887766554433221100',
+    name: 'Preserved Browser Project',
+  }]);
+});
+
+test('the project browser reads ChatGPT-initiated project responses from Chromium cache', async () => {
+  let attached = false;
+  const commands = [];
+  const navigations = [];
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => attached;
+  debuggerApi.attach = () => { attached = true; };
+  debuggerApi.detach = () => { attached = false; };
+  debuggerApi.sendCommand = async (method, parameters = {}) => {
+    commands.push({ method, parameters });
+    if (method === 'Network.getResponseBody') {
+      return {
+        base64Encoded: false,
+        body: JSON.stringify({
+          items: [{
+            gizmo: {
+              gizmo: {
+                id: 'g-p-abcdef1234567890abcdef1234567890',
+                display: { name: 'HAR Project' },
+              },
+            },
+          }],
+        }),
+      };
+    }
+    return {};
+  };
+  const driver = new ChatGPTBrowserDriver({
+    debugger: debuggerApi,
+    loadURL: async (url) => {
+      navigations.push(url);
+      debuggerApi.emit('message', {}, 'Network.responseReceived', {
+        requestId: 'project-response',
+        response: {
+          mimeType: 'application/json',
+          url: 'https://chatgpt.com/backend-api/gizmos/snorlax/sidebar?owned_only=true',
+        },
+      });
+      debuggerApi.emit('message', {}, 'Network.loadingFinished', { requestId: 'project-response' });
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    executeJavaScript: async (source) => {
+      if (source.includes('function openWorkspaceIndexAction')) {
+        debuggerApi.emit('message', {}, 'Network.responseReceived', {
+          requestId: 'project-response',
+          response: {
+            mimeType: 'application/json',
+            url: 'https://chatgpt.com/backend-api/gizmos/snorlax/sidebar?owned_only=true',
+          },
+        });
+        debuggerApi.emit('message', {}, 'Network.loadingFinished', { requestId: 'project-response' });
+        await new Promise((resolve) => setImmediate(resolve));
+        return { activated: true };
+      }
+      return source.includes('function advanceWorkspaceIndexAction')
+        ? { acted: false, action: null }
+        : {
+        ready: false,
+        workspaces: [],
+        authenticationRequired: false,
+        error: null,
+      };
+    },
+  });
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-abcdef1234567890abcdef1234567890',
+    name: 'HAR Project',
+  }]);
+  assert.ok(commands.some(({ method }) => method === 'Network.enable'));
+  assert.ok(commands.some(({ method }) => method === 'Network.getResponseBody'));
+  assert.ok(commands.some(({ method }) => method === 'Network.disable'));
+  assert.deepEqual(navigations, [
+    'https://chatgpt.com/',
+  ]);
+});
+
+test('project discovery falls back to the rendered library when Chromium observation is unavailable', async () => {
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (method) => {
+    if (method === 'Network.enable') throw new Error('observer unavailable');
+    return {};
+  };
+  let reads = 0;
+  const driver = new ChatGPTBrowserDriver({
+    debugger: debuggerApi,
+    loadURL: async () => {},
+    executeJavaScript: async (source) => {
+      if (source.includes('function openWorkspaceIndexAction')) return { activated: true };
+      if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
+      reads += 1;
+      return {
+        ready: reads > 1,
+        empty: false,
+        authenticationRequired: false,
+        error: null,
+        workspaces: reads > 1 ? [{
+          id: 'g-p-0123456789abcdef0123456789abcdef',
+          name: 'Rendered Project',
+        }] : [],
+      };
+    },
+  });
+
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-0123456789abcdef0123456789abcdef',
+    name: 'Rendered Project',
+  }]);
+});
+
 test('the browser provider dismisses only the known blocking usage notice', async () => {
   let clicked = false;
   const button = {

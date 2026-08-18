@@ -10,6 +10,52 @@ const COMPOSER_SELECTOR = [
 
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|excess usage|extra usage|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
+const CHATGPT_HOME_URL = 'https://chatgpt.com/';
+const CHATGPT_PROJECTS_URL = 'https://chatgpt.com/library?tab=projects';
+const BROWSER_NAVIGATION_TIMEOUT_MILLISECONDS = 15_000;
+const BROWSER_ACTION_TIMEOUT_MILLISECONDS = 5_000;
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function projectsFromBrowserResponse(body, base64Encoded = false) {
+  try {
+    const text = base64Encoded ? Buffer.from(String(body || ''), 'base64').toString('utf8') : String(body || '');
+    const data = JSON.parse(text);
+    if (!Array.isArray(data?.items)) return [];
+    const projects = [];
+    for (const item of data.items) {
+      const project = item?.gizmo?.gizmo || item?.gizmo;
+      const id = String(project?.id || '');
+      const name = String(project?.display?.name || '').trim();
+      if (/^g-p-[A-Za-z0-9_-]+$/.test(id) && name) projects.push({ id, name });
+    }
+    return projects;
+  } catch {
+    return [];
+  }
+}
+
+function isWorkspaceIndexResponse(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:'
+      && url.hostname === 'chatgpt.com'
+      && url.pathname.endsWith('/gizmos/snorlax/sidebar');
+  } catch {
+    return false;
+  }
+}
+
+function isChatGPTBrowserUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:' && url.hostname === 'chatgpt.com';
+  } catch {
+    return false;
+  }
+}
 
 function hasComposerAction(input) {
   return Boolean(document.querySelector(input.composerSelector));
@@ -58,8 +104,8 @@ function dismissBlockingNoticeAction(input) {
   return { resolved: false, notice: null, action: null };
 }
 
-function listWorkspacesAction() {
-  const workspaces = new Map();
+function readWorkspaceIndexAction() {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const roots = [document];
   const visited = new Set();
   const links = [];
@@ -69,96 +115,186 @@ function listWorkspacesAction() {
     if (!root || visited.has(root)) continue;
     visited.add(root);
     links.push(...root.querySelectorAll('a[href]'));
-    controls.push(...root.querySelectorAll('button, a, [role="button"]'));
+    controls.push(...root.querySelectorAll('button, a, [role="button"], [role="alert"]'));
     for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
   }
+  const workspaces = new Map();
   for (const link of links) {
     let routeId = null;
     try {
       const pathname = new URL(link.getAttribute('href') || link.href || '', location.href).pathname;
-      routeId = /^\/g\/(g-p-[A-Za-z0-9_-]+)(?:\/|$)/i.exec(pathname)?.[1] || null;
+      routeId = /^\/g\/(g-p-[A-Za-z0-9_-]+)(?:\/project)?\/?$/i.exec(pathname)?.[1] || null;
     } catch {}
     if (!routeId) continue;
-    const parts = routeId.split('-');
-    const id = parts.length > 2 && parts[0] === 'g' && parts[1] === 'p'
-      ? `g-p-${parts[2]}`
-      : routeId;
-    const name = String(link.textContent || link.getAttribute('aria-label') || link.getAttribute('title') || '')
-      .replace(/\s+/g, ' ').trim();
-    if (name && !workspaces.has(id)) workspaces.set(id, { id, routeId, name });
+    const id = /^(g-p-[a-f0-9]{32})(?:-|$)/i.exec(routeId)?.[1] || routeId;
+    const row = link.closest('tr, li, article, [role="row"], [data-testid*="project" i]');
+    const optionsLabel = [...(row?.querySelectorAll?.('button, [role="button"]') || [])]
+      .map((node) => normalize(node.getAttribute('aria-label')))
+      .find((label) => /^open project options for .+/i.test(label));
+    const name = normalize(link.textContent)
+      || optionsLabel?.replace(/^open project options for /i, '')
+      || normalize(link.getAttribute('title'));
+    if (name && !workspaces.has(id)) workspaces.set(id, { id, name });
   }
-  const authenticationRequired = controls.some((node) => /log in|sign in/i.test(String(
-    node.textContent || node.getAttribute('aria-label') || '',
-  )));
-  return { workspaces: [...workspaces.values()], authenticationRequired };
+  const labels = controls.map((node) => normalize([
+    node.textContent,
+    node.getAttribute?.('aria-label'),
+    node.getAttribute?.('title'),
+  ].filter(Boolean).join(' ')));
+  const pageText = normalize(document.body?.textContent);
+  const authenticationRequired = labels.some((label) => /^(?:log in|sign in)(?:\s|$)/i.test(label));
+  const error = labels.find((label) => /unable to load projects/i.test(label))
+    || (/unable to load projects/i.test(pageText) ? 'Unable to load projects' : null);
+  const empty = /no projects yet|no projects$/i.test(pageText);
+  const projectsPage = location.pathname === '/library' && /(?:^|[?&])tab=projects(?:&|$)/.test(location.search);
+  // The library shell and its labels render before its project data. Only an
+  // actual project or ChatGPT's explicit empty state means loading has ended.
+  const ready = workspaces.size > 0 || (projectsPage && empty);
+  return {
+    workspaces: [...workspaces.values()],
+    authenticationRequired,
+    ready,
+    empty,
+    error,
+    projectsPage,
+  };
 }
 
-function revealWorkspacesAction() {
+function openWorkspaceIndexAction(input) {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const roots = [document];
+  const visited = new Set();
+  const controls = [];
+  while (roots.length) {
+    const root = roots.shift();
+    if (!root || visited.has(root)) continue;
+    visited.add(root);
+    controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
+    for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
+  }
+  const projectControl = input.localRouteOnly ? null : controls.find((node) => {
+    try {
+      if (node.matches('a[href]')) {
+        const url = new URL(node.getAttribute('href') || node.href || '', location.href);
+        if (url.pathname === '/library' && url.searchParams.get('tab') === 'projects') return true;
+      }
+    } catch {}
+    const label = normalize([
+      node.textContent,
+      node.getAttribute?.('aria-label'),
+      node.getAttribute?.('title'),
+    ].filter(Boolean).join(' '));
+    return /^projects$/i.test(label);
+  });
+  if (projectControl && !projectControl.disabled && projectControl.getAttribute('aria-disabled') !== 'true') {
+    projectControl.click();
+    return { activated: true, renderedControl: true };
+  }
+  // ChatGPT's router observes same-document history transitions. This changes
+  // only the local route; it neither reloads the document nor issues a request.
+  const route = '/library?tab=projects';
+  try {
+    history.pushState(history.state, '', route);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    return { activated: true, renderedControl: false };
+  } catch {
+    return { activated: false, renderedControl: false };
+  }
+}
+
+function advanceWorkspaceIndexAction() {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const visible = (node) => {
     const bounds = node?.getBoundingClientRect?.();
-    return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
+    return !bounds || (bounds.width > 0 && bounds.height > 0);
   };
-  const controls = [...document.querySelectorAll('button, a, [role="button"]')];
-  const control = controls.find((node) => visible(node) && /^(?:projects|view all projects|show more projects|more projects)$/i.test(
-    normalize([node.textContent, node.getAttribute('aria-label'), node.getAttribute('title')].filter(Boolean).join(' ')),
-  ));
-  if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') return false;
-  control.click();
-  return true;
+  const controls = [...document.querySelectorAll('button, [role="button"], a')];
+  const retry = controls.find((node) => visible(node) && /^retry$/i.test(normalize([
+    node.textContent, node.getAttribute('aria-label'), node.getAttribute('title'),
+  ].filter(Boolean).join(' '))));
+  if (retry && !retry.disabled && retry.getAttribute('aria-disabled') !== 'true') {
+    retry.click();
+    return { acted: true, action: 'retry' };
+  }
+  const more = controls.find((node) => visible(node) && /^(?:show more|load more|more projects)$/i.test(normalize([
+    node.textContent, node.getAttribute('aria-label'), node.getAttribute('title'),
+  ].filter(Boolean).join(' '))));
+  if (more && !more.disabled && more.getAttribute('aria-disabled') !== 'true') {
+    more.click();
+    return { acted: true, action: 'more' };
+  }
+  const scroller = document.scrollingElement || document.documentElement;
+  if (scroller && scroller.scrollHeight > scroller.scrollTop + scroller.clientHeight + 2) {
+    scroller.scrollTo?.({ top: scroller.scrollHeight, behavior: 'instant' });
+    if (!scroller.scrollTo) scroller.scrollTop = scroller.scrollHeight;
+    return { acted: true, action: 'scroll' };
+  }
+  return { acted: false, action: null };
 }
 
 function openCreateWorkspaceAction() {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const visible = (node) => {
     const bounds = node?.getBoundingClientRect?.();
-    return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
+    return !bounds || (bounds.width > 0 && bounds.height > 0);
   };
   const controls = [...document.querySelectorAll('button, a, [role="button"], [role="menuitem"]')];
-  const exact = controls.find((node) => visible(node) && /^(?:new project|create project)$/i.test(normalize([
+  const label = (node) => normalize([
     node.textContent, node.getAttribute('aria-label'), node.getAttribute('title'),
-  ].filter(Boolean).join(' '))));
-  const projectsPageNew = controls.find((node) => visible(node) && /^new$/i.test(normalize(node.textContent))
-    && /project/i.test(normalize(node.closest('main, [role="main"], section')?.textContent)));
-  const menuProject = controls.find((node) => visible(node) && /^project$/i.test(normalize(node.textContent))
+  ].filter(Boolean).join(' '));
+  const exact = controls.find((node) => visible(node) && /^(?:new project|create project)$/i.test(label(node)));
+  const menuProject = controls.find((node) => visible(node) && /^project$/i.test(label(node))
     && Boolean(node.closest('[role="menu"], [data-radix-menu-content], [data-headlessui-state]')));
+  const projectsPageNew = controls.find((node) => visible(node) && /^new$/i.test(label(node))
+    && /projects/i.test(normalize(node.closest('main, [role="main"]')?.textContent || document.body?.textContent)));
   const control = exact || menuProject || projectsPageNew;
   if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') return false;
   control.click();
   return true;
 }
 
-function submitCreateWorkspaceAction(args) {
-  const { name } = args;
+function submitCreateWorkspaceAction(input) {
+  const name = String(input.name || '').trim();
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const visible = (node) => {
     const bounds = node?.getBoundingClientRect?.();
-    return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
+    return !bounds || (bounds.width > 0 && bounds.height > 0);
   };
-  const dialog = [...document.querySelectorAll('[role="dialog"], dialog')].find((node) => visible(node)) || document;
+  const signIn = [...document.querySelectorAll('button, a')].some((node) => (
+    /^(?:log in|sign in)(?:\s|$)/i.test(normalize(node.textContent || node.getAttribute('aria-label')))
+  ));
+  if (signIn) return { ready: false, submitted: false, authenticationRequired: true, error: null };
+  const dialog = [...document.querySelectorAll('[role="dialog"], dialog')].find((node) => visible(node));
+  if (!dialog) return { ready: false, submitted: false, authenticationRequired: false, error: null };
   const labels = [...dialog.querySelectorAll('label')];
-  const projectNameLabel = labels.find((label) => /project name/i.test(normalize(label.textContent)));
-  let input = null;
-  if (projectNameLabel?.htmlFor) input = document.getElementById(projectNameLabel.htmlFor);
-  input ||= projectNameLabel?.querySelector('input, textarea') || null;
-  input ||= [...dialog.querySelectorAll('input, textarea')].find((node) => /project name/i.test(normalize([
+  const nameLabel = labels.find((label) => /project name/i.test(normalize(label.textContent)));
+  let inputElement = nameLabel?.htmlFor ? document.getElementById(nameLabel.htmlFor) : null;
+  inputElement ||= nameLabel?.querySelector('input, textarea') || null;
+  inputElement ||= [...dialog.querySelectorAll('input, textarea')].find((node) => /project name/i.test(normalize([
     node.getAttribute('aria-label'), node.name, node.id,
   ].filter(Boolean).join(' ')))) || null;
-  input ||= [...dialog.querySelectorAll('input, textarea')].find((node) => visible(node) && !node.disabled) || null;
-  if (!input) return { ready: false, submitted: false };
-  if (input.value !== name) {
-    input.focus();
-    const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(input, name);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
+  inputElement ||= [...dialog.querySelectorAll('input, textarea')].find((node) => visible(node) && !node.disabled) || null;
+  if (!inputElement) return { ready: false, submitted: false, authenticationRequired: false, error: null };
+  if (inputElement.value !== name) {
+    inputElement.focus();
+    const prototype = inputElement instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(inputElement, name);
+    inputElement.dispatchEvent(new Event('input', { bubbles: true }));
+    inputElement.dispatchEvent(new Event('change', { bubbles: true }));
   }
+  const error = [...dialog.querySelectorAll('[role="alert"], [data-testid*="error" i]')]
+    .map((node) => normalize(node.textContent)).find(Boolean) || null;
   const submit = [...dialog.querySelectorAll('button, [role="button"]')].find((node) => (
-    /^(?:create|save)$/i.test(normalize(node.textContent))
+    /^(?:create|create project|save)$/i.test(normalize(node.textContent || node.getAttribute('aria-label')))
       && visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true'
   ));
   submit?.click();
-  return { ready: true, submitted: Boolean(submit) };
+  return {
+    ready: true,
+    submitted: Boolean(submit),
+    authenticationRequired: false,
+    error,
+  };
 }
 
 async function installConfigurationPickerAction(input) {
@@ -535,13 +671,235 @@ class ChatGPTBrowserDriver {
     });
   }
 
-  listWorkspaces() { return this.#execute(listWorkspacesAction); }
+  async listWorkspaces() {
+    let browserCapture = null;
+    let captureError = null;
+    let initialState = null;
+    try {
+      // Keep the browser's current ChatGPT document and authenticated session
+      // whenever possible. A newly-created hidden browser starts at about:blank
+      // and needs one real document before Chromium observation is available.
+      const currentUrl = String(this.webContents.getURL?.() || '');
+      if (!currentUrl || currentUrl === 'about:blank') {
+        await this.#loadBrowserSurface(CHATGPT_HOME_URL);
+      } else if (!isChatGPTBrowserUrl(currentUrl)) {
+        return {
+          ok: false,
+          workspaces: [],
+          authenticationRequired: false,
+          message: 'The project browser is outside ChatGPT. Patchwork did not reload it; retry after restoring the ChatGPT session.',
+        };
+      }
+      initialState = await this.#executeWorkspaceAction(readWorkspaceIndexAction, {}, 'reading projects');
+    } catch (error) {
+      return {
+        ok: false,
+        workspaces: [],
+        authenticationRequired: false,
+        message: String(error?.message || error || 'The projects page could not be opened.').slice(0, 240),
+      };
+    }
+    if (initialState?.authenticationRequired) {
+      return { ok: false, workspaces: [], authenticationRequired: true, message: null };
+    }
+    if (!(initialState?.projectsPage && initialState?.ready)) {
+      try {
+        browserCapture = await this.#startWorkspaceNetworkCapture();
+      } catch (error) {
+        // Response observation is an enhancement, never a prerequisite. The
+        // rendered Projects library remains the browser-only fallback.
+        captureError = error;
+        await browserCapture?.dispose().catch(() => {});
+        browserCapture = null;
+      }
+      if (!initialState?.projectsPage) {
+        let activated = false;
+        let documentNavigationBlocked = false;
+        const preventDocumentNavigation = (event) => {
+          documentNavigationBlocked = true;
+          event.preventDefault?.();
+        };
+        this.webContents.on?.('will-navigate', preventDocumentNavigation);
+        try {
+          const navigation = await this.#executeWorkspaceAction(
+            openWorkspaceIndexAction,
+            { localRouteOnly: false },
+            'opening projects',
+          );
+          activated = Boolean(navigation?.activated);
+          // Keep the guard through the browser's default-navigation turn. If
+          // ChatGPT did not intercept its own control as an SPA transition,
+          // cancel the document load and apply the same-document route.
+          await delay(50);
+        } catch (error) {
+          captureError ||= error;
+        } finally {
+          this.webContents.removeListener?.('will-navigate', preventDocumentNavigation);
+        }
+        if (documentNavigationBlocked) {
+          try {
+            const localNavigation = await this.#executeWorkspaceAction(
+              openWorkspaceIndexAction,
+              { localRouteOnly: true },
+              'changing the local Projects route',
+            );
+            activated = Boolean(localNavigation?.activated);
+          } catch (error) {
+            captureError ||= error;
+            activated = false;
+          }
+        }
+        if (activated) {
+          // ChatGPT handles this as its normal in-app route transition.
+          await delay(100);
+        } else {
+          await browserCapture?.dispose().catch(() => {});
+          return {
+            ok: false,
+            workspaces: [],
+            authenticationRequired: false,
+            message: 'ChatGPT did not expose in-app Projects navigation. Patchwork did not reload the browser.',
+          };
+        }
+      }
+    }
+    const workspaces = new Map();
+    let ready = false;
+    let unchangedReads = 0;
+    let previousCount = -1;
+    try {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const state = await this.#executeWorkspaceAction(readWorkspaceIndexAction, {}, 'reading projects');
+        if (state?.authenticationRequired) {
+          return { ok: false, workspaces: [], authenticationRequired: true, message: null };
+        }
+        for (const workspace of [
+          ...(browserCapture?.workspaces.values() || []),
+          ...(state?.workspaces || []),
+        ]) {
+          const id = String(workspace?.id || '');
+          const name = String(workspace?.name || '').trim();
+          if (/^g-p-[A-Za-z0-9_-]+$/.test(id) && name) workspaces.set(id, { id, name });
+        }
+        ready ||= Boolean(state?.ready) || workspaces.size > 0;
+        if (state?.error) {
+          const recovery = await this.#executeWorkspaceAction(
+            advanceWorkspaceIndexAction,
+            {},
+            'recovering the projects page',
+          );
+          if (!recovery?.acted) {
+            return {
+              ok: false,
+              workspaces: [...workspaces.values()],
+              authenticationRequired: false,
+              message: state.error,
+            };
+          }
+          await delay(300);
+          continue;
+        }
+        const advance = await this.#executeWorkspaceAction(
+          advanceWorkspaceIndexAction,
+          {},
+          'advancing the projects page',
+        );
+        unchangedReads = workspaces.size === previousCount ? unchangedReads + 1 : 0;
+        previousCount = workspaces.size;
+        const requiredUnchangedReads = workspaces.size === 0 && !state?.empty ? 8 : 2;
+        if (ready && !advance?.acted && unchangedReads >= requiredUnchangedReads) {
+          return {
+            ok: true,
+            workspaces: [...workspaces.values()],
+            authenticationRequired: false,
+            message: null,
+          };
+        }
+        await delay(advance?.acted || requiredUnchangedReads > 2 ? 250 : 100);
+      }
+      return ready
+        ? { ok: true, workspaces: [...workspaces.values()], authenticationRequired: false, message: null }
+        : {
+          ok: false,
+          workspaces: [],
+          authenticationRequired: false,
+          message: captureError
+            ? `ChatGPT did not render Projects after in-app navigation. Patchwork did not reload the browser. ${String(captureError?.message || captureError).slice(0, 120)}`
+            : 'ChatGPT did not render Projects after in-app navigation. Patchwork did not reload the browser.',
+        };
+    } finally {
+      await browserCapture?.dispose().catch(() => {});
+    }
+  }
 
-  revealWorkspaces() { return this.#execute(revealWorkspacesAction); }
-
-  openCreateWorkspace() { return this.#execute(openCreateWorkspaceAction); }
-
-  submitCreateWorkspace(name) { return this.#execute(submitCreateWorkspaceAction, { name }); }
+  async createWorkspace(name) {
+    const projectName = String(name || '').trim();
+    if (!projectName) {
+      return {
+        ok: false,
+        workspace: null,
+        authenticationRequired: false,
+        message: 'Enter a project name.',
+      };
+    }
+    try {
+      await this.#loadBrowserSurface(CHATGPT_PROJECTS_URL);
+    } catch (error) {
+      return {
+        ok: false,
+        workspace: null,
+        authenticationRequired: false,
+        message: String(error?.message || error || 'The projects page could not be opened.').slice(0, 240),
+      };
+    }
+    let submitted = false;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const index = await this.#executeWorkspaceAction(readWorkspaceIndexAction, {}, 'reading projects');
+      if (index?.authenticationRequired) {
+        return { ok: false, workspace: null, authenticationRequired: true, message: null };
+      }
+      await this.#executeWorkspaceAction(openCreateWorkspaceAction, {}, 'opening project creation');
+      const form = await this.#executeWorkspaceAction(
+        submitCreateWorkspaceAction,
+        { name: projectName },
+        'submitting project creation',
+      );
+      if (form?.authenticationRequired) {
+        return { ok: false, workspace: null, authenticationRequired: true, message: null };
+      }
+      if (form?.error) {
+        return {
+          ok: false,
+          workspace: null,
+          authenticationRequired: false,
+          message: form.error,
+        };
+      }
+      if (form?.submitted) {
+        submitted = true;
+        break;
+      }
+      await delay(250);
+    }
+    if (!submitted) {
+      return {
+        ok: false,
+        workspace: null,
+        authenticationRequired: false,
+        message: 'The projects page did not expose project creation.',
+      };
+    }
+    await delay(400);
+    const listed = await this.listWorkspaces();
+    const workspace = listed.workspaces?.find((item) => item.name === projectName) || null;
+    if (workspace) return { ok: true, workspace, authenticationRequired: false, message: null };
+    return {
+      ok: false,
+      workspace: null,
+      authenticationRequired: Boolean(listed.authenticationRequired),
+      message: listed.message || 'The projects page did not confirm project creation.',
+    };
+  }
 
   installConfigurationPicker(configuration) {
     return this.#execute(installConfigurationPickerAction, configuration);
@@ -751,6 +1109,104 @@ class ChatGPTBrowserDriver {
       selector,
     });
     return query.nodeId || 0;
+  }
+
+  async #startWorkspaceNetworkCapture() {
+    const debuggerApi = this.webContents.debugger;
+    if (!debuggerApi?.sendCommand || !debuggerApi?.on) return null;
+    let attachedHere = false;
+    const candidateResponses = new Set();
+    const pendingReads = new Set();
+    const workspaces = new Map();
+    const readResponse = (requestId) => {
+      const pending = this.#withTimeout(
+        debuggerApi.sendCommand('Network.getResponseBody', { requestId }),
+        BROWSER_ACTION_TIMEOUT_MILLISECONDS,
+        'The project browser timed out while reading its response cache.',
+      ).then((response) => {
+        for (const workspace of projectsFromBrowserResponse(response?.body, response?.base64Encoded)) {
+          workspaces.set(workspace.id, workspace);
+        }
+      }).catch(() => {}).finally(() => pendingReads.delete(pending));
+      pendingReads.add(pending);
+    };
+    const onDebuggerMessage = (_event, method, parameters) => {
+      if (method === 'Network.responseReceived') {
+        const response = parameters?.response;
+        const mimeType = String(response?.mimeType || '');
+        if (/json/i.test(mimeType)
+          && isWorkspaceIndexResponse(response?.url)
+          && parameters?.requestId) candidateResponses.add(parameters.requestId);
+        return;
+      }
+      if (method === 'Network.loadingFinished' && candidateResponses.delete(parameters?.requestId)) {
+        readResponse(parameters.requestId);
+      }
+    };
+    try {
+      if (!debuggerApi.isAttached()) {
+        debuggerApi.attach('1.3');
+        attachedHere = true;
+      }
+      debuggerApi.on('message', onDebuggerMessage);
+      await this.#withTimeout(
+        debuggerApi.sendCommand('Network.enable'),
+        BROWSER_ACTION_TIMEOUT_MILLISECONDS,
+        'The project browser timed out while enabling its response cache observer.',
+      );
+      return {
+        workspaces,
+        dispose: async () => {
+          debuggerApi.removeListener?.('message', onDebuggerMessage);
+          await Promise.allSettled([...pendingReads]);
+          if (debuggerApi.isAttached()) {
+            await this.#withTimeout(
+              debuggerApi.sendCommand('Network.disable'),
+              BROWSER_ACTION_TIMEOUT_MILLISECONDS,
+              'The project browser timed out while closing its response observer.',
+            ).catch(() => {});
+          }
+          if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
+        },
+      };
+    } catch (error) {
+      debuggerApi.removeListener?.('message', onDebuggerMessage);
+      if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
+      throw error;
+    }
+  }
+
+  async #loadBrowserSurface(url) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error('The ChatGPT browser did not finish loading.'));
+      }, BROWSER_NAVIGATION_TIMEOUT_MILLISECONDS);
+    });
+    try {
+      await Promise.race([this.webContents.loadURL(url), timeout]);
+    } catch (error) {
+      this.webContents.stop?.();
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  #executeWorkspaceAction(action, input, description) {
+    return this.#withTimeout(
+      this.#execute(action, input),
+      BROWSER_ACTION_TIMEOUT_MILLISECONDS,
+      `The project browser timed out while ${description}.`,
+    );
+  }
+
+  #withTimeout(promise, milliseconds, message) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(message)), milliseconds);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
   }
 
   #execute(action, input = {}) {

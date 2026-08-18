@@ -118,8 +118,8 @@ function registerIpc() {
     return gitService.addRepositories(response.filePaths);
   });
 
-  ipcMain.handle('projects:list', async () => chatController.enqueue(() => chatController.listProjects()));
-  ipcMain.handle('projects:create', async (_event, name) => chatController.enqueue(() => chatController.createProject(name)));
+  ipcMain.handle('projects:list', async () => chatController.listProjects());
+  ipcMain.handle('projects:create', async (_event, name) => chatController.createProject(name));
   ipcMain.handle('skills:list', async (_event, repositoryPaths) => {
     const skills = await skillService.discover(Array.isArray(repositoryPaths) ? repositoryPaths : []);
     return skills.map(({ sourcePath, skillFile, ...skill }) => skill);

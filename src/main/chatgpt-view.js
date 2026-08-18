@@ -1,9 +1,10 @@
 const fsSync = require('node:fs');
 const path = require('node:path');
-const { WebContentsView, clipboard, dialog, shell } = require('electron');
+const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('electron');
 const { mergeResultFilename } = require('./worktree-service');
 const { AI_CHAT_ERROR_CODE, AI_CHAT_RUN_STATUS } = require('./ai-chat-service');
 const { ChatGPTBrowserAIChatService } = require('./chatgpt-browser-ai-chat-service');
+const { ChatGPTBrowserDriver } = require('./chatgpt-browser-driver');
 const { SerialOperationQueue } = require('./serial-operation-queue');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
@@ -135,7 +136,21 @@ class PatchworkAIChatController {
     this.mainWindow.contentView.addChildView(this.view);
     this.view.setBackgroundColor('#11130f');
     this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
-    this.chatService = new ChatGPTBrowserAIChatService(this.view.webContents);
+    this.workspaceWindow = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        partition: PARTITION,
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+      },
+    });
+    this.workspaceWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    this.chatService = new ChatGPTBrowserAIChatService(
+      this.view.webContents,
+      new ChatGPTBrowserDriver(this.view.webContents),
+      new ChatGPTBrowserDriver(this.workspaceWindow.webContents),
+    );
     this.operations = new SerialOperationQueue();
     this.installNavigationHandlers();
     this.installDownloadListener();
@@ -144,6 +159,7 @@ class PatchworkAIChatController {
     this.resultMonitor.unref?.();
     this.mainWindow.once('closed', () => {
       clearInterval(this.resultMonitor);
+      if (!this.workspaceWindow.isDestroyed()) this.workspaceWindow.destroy();
     });
     const legacyConversationUrl = this.activeMerge?.mergeConversationUrl || this.activeTask?.conversationUrl || null;
     this.ready = Promise.resolve(this.view.webContents.loadURL(legacyConversationUrl || CHATGPT_URL)).then(async () => {

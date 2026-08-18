@@ -31,6 +31,7 @@ const PROMPT_LIBRARY_STORAGE_KEY = 'patchwork.prompt-library';
 const TASK_NEW_TREE_VALUE = '__new__';
 const MAX_PROMPTS = 100;
 const MAX_PROMPT_CONTENT_LENGTH = 12_000;
+const PROJECT_REFRESH_TIMEOUT_MILLISECONDS = 30_000;
 
 const elements = Object.fromEntries(
   [
@@ -793,15 +794,28 @@ async function refreshChatGPTProjects(showErrors = false) {
   elements['refresh-projects-button'].disabled = true;
   elements['trees-refresh-projects-button'].disabled = true;
   elements['project-list-status'].classList.remove('error');
-  elements['project-list-status'].textContent = 'Loading ChatGPT projects…';
+  elements['project-list-status'].textContent = 'Loading ChatGPT projects through the existing browser session…';
   try {
-    state.chatgptProjects = await window.patchwork.listChatGPTProjects();
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error(
+        'Project loading timed out before the main process returned a result.',
+      )), PROJECT_REFRESH_TIMEOUT_MILLISECONDS);
+    });
+    try {
+      state.chatgptProjects = await Promise.race([
+        window.patchwork.listChatGPTProjects(),
+        timeout,
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
     restoreTaskProjectSelection();
     renderChatGPTProjects();
     renderTreesProjectSelection();
     elements['project-list-status'].textContent = state.chatgptProjects.length
-      ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available.`
-      : 'No ChatGPT projects found. You can create one below.';
+      ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available · no page refresh used.`
+      : 'No ChatGPT projects found. No page refresh was used; you can create one below.';
   } catch (error) {
     state.chatgptProjects = [];
     renderChatGPTProjects();

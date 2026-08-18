@@ -38,20 +38,6 @@ function conversationId(value) {
   }
 }
 
-function workspaceId(value) {
-  try {
-    const routeId = /^\/g\/(g-p-[A-Za-z0-9_-]+)(?:\/|$)/i.exec(new URL(value).pathname)?.[1] || null;
-    if (!routeId) return null;
-    const parts = routeId.split('-');
-    const id = parts.length > 2 && parts[0] === 'g' && parts[1] === 'p'
-      ? `g-p-${parts[2]}`
-      : routeId;
-    return WORKSPACE_ID_PATTERN.test(id) ? id : null;
-  } catch {
-    return null;
-  }
-}
-
 function workspaceUrl(workspaceId) {
   if (!WORKSPACE_ID_PATTERN.test(String(workspaceId || ''))) {
     throw new AIChatError(AI_CHAT_ERROR_CODE.INVALID_INPUT, 'The AI workspace ID is invalid.');
@@ -91,66 +77,81 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   #operations = new SerialOperationQueue();
   #runStatusByChat = new Map();
   #webContents;
+  #workspaceBrowser;
+  #workspaceOperations = new SerialOperationQueue();
 
-  constructor(webContents, browserDriver = new ChatGPTBrowserDriver(webContents)) {
+  constructor(
+    webContents,
+    browserDriver = new ChatGPTBrowserDriver(webContents),
+    workspaceBrowserDriver = browserDriver,
+  ) {
     super();
     this.#webContents = webContents;
     this.#browser = browserDriver;
+    this.#workspaceBrowser = workspaceBrowserDriver;
   }
 
   listWorkspaces() {
-    return this.#operations.run(() => this.#listWorkspaces());
+    return this.#workspaceOperations.run(() => this.#listWorkspaces());
   }
 
   async #listWorkspaces() {
-    let lastResult = { workspaces: [], authenticationRequired: false };
-    for (let attempt = 0; attempt < 8; attempt += 1) {
-      lastResult = await this.#browser.listWorkspaces();
-      if (lastResult.authenticationRequired && lastResult.workspaces.length === 0) {
-        throw new AIChatError(
-          AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
-          'Sign in to the AI session before loading workspaces.',
-        );
-      }
-      if (lastResult.workspaces.length > 0) break;
-      if (attempt === 0) await this.#browser.revealWorkspaces?.().catch(() => false);
-      await delay(250);
+    const result = await this.#workspaceBrowser.listWorkspaces();
+    if (result?.authenticationRequired) {
+      throw new AIChatError(
+        AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
+        'Sign in to the AI session before loading workspaces.',
+      );
     }
-    return lastResult.workspaces
-      .map(({ id, name }) => ({ id, name }))
-      .sort((left, right) => left.name.localeCompare(right.name));
+    if (!result?.ok) {
+      const suffix = result?.status ? ` (${result.status})` : '';
+      const detail = result?.message ? ` ${result.message}` : '';
+      throw new AIChatError(
+        AI_CHAT_ERROR_CODE.PROVIDER_ERROR,
+        `Could not load AI workspaces${suffix}.${detail}`,
+      );
+    }
+    const unique = new Map();
+    for (const workspace of result.workspaces || []) {
+      const id = String(workspace?.id || '');
+      const name = String(workspace?.name || '').trim();
+      if (WORKSPACE_ID_PATTERN.test(id) && name) unique.set(id, { id, name });
+    }
+    return [...unique.values()].sort((left, right) => left.name.localeCompare(right.name));
   }
 
   createWorkspace(input) {
-    return this.#operations.run(() => this.#createWorkspace(input));
+    return this.#workspaceOperations.run(() => this.#createWorkspace(input));
   }
 
   async #createWorkspace(input) {
     const name = String(input?.name || input || '').trim();
     if (!name) throw new AIChatError(AI_CHAT_ERROR_CODE.INVALID_INPUT, 'Enter a workspace name.');
-    await this.#browser.revealWorkspaces?.().catch(() => false);
-    let submitted = false;
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < 10_000) {
-      await this.#browser.openCreateWorkspace().catch(() => false);
-      const result = await this.#browser.submitCreateWorkspace(name).catch(() => ({ ready: false, submitted: false }));
-      if (result.submitted) {
-        submitted = true;
-        break;
-      }
-      await delay(250);
+    const result = await this.#workspaceBrowser.createWorkspace(name);
+    if (result?.authenticationRequired) {
+      throw new AIChatError(
+        AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
+        'Sign in to the AI session before creating a workspace.',
+      );
     }
-    if (!submitted) {
-      throw new AIChatError(AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE, 'The AI session does not expose workspace creation.');
+    if (!result?.ok) {
+      const suffix = result?.status ? ` (${result.status})` : '';
+      const detail = result?.message ? ` ${result.message}` : '';
+      throw new AIChatError(
+        AI_CHAT_ERROR_CODE.PROVIDER_ERROR,
+        `Could not create the AI workspace${suffix}.${detail}`,
+      );
     }
-    for (let attempt = 0; attempt < 24; attempt += 1) {
-      const id = workspaceId(this.#webContents.getURL());
-      if (id) return { id, name };
-      const workspace = (await this.#listWorkspaces()).find((item) => item.name === name);
-      if (workspace) return workspace;
-      await delay(300);
+    const id = String(result.workspace?.id || '');
+    if (WORKSPACE_ID_PATTERN.test(id)) {
+      return { id, name: String(result.workspace?.name || name).trim() || name };
     }
-    throw new AIChatError(AI_CHAT_ERROR_CODE.TIMED_OUT, 'The AI session did not confirm workspace creation.');
+    const workspace = (await this.#listWorkspaces()).find((item) => item.name === name);
+    if (workspace) return workspace;
+    throw new AIChatError(
+      AI_CHAT_ERROR_CODE.PROVIDER_ERROR,
+      'The AI session created the workspace, but did not return its identifier.',
+    );
   }
 
   createChat(input = {}) {
