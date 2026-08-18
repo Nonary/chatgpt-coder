@@ -1,5 +1,6 @@
 const { AI_CHAT_RUN_STATUS } = require('./ai-chat-service');
 const { ipcMain } = require('electron');
+const { chatSnapshotSource, readRunStatusAction } = require('./chatgpt-transcript');
 
 const COMPOSER_SELECTOR = [
   '.wcDTda_prosemirror-parent .ProseMirror[contenteditable="true"]',
@@ -441,6 +442,11 @@ async function installConfigurationPickerAction(input) {
   const selection = state?.chatKey === input.chatKey
     ? state
     : { chatKey: input.chatKey, model: input.model, reasoning: input.reasoning };
+  // The renderer can change the selection after the picker was installed for
+  // a fresh (pending) chat. Keep that explicit configuration authoritative
+  // rather than leaving the initial Sol/default values in the page picker.
+  selection.model = input.model;
+  selection.reasoning = input.reasoning;
   globalThis.__patchworkAIChatConfiguration = selection;
   const currentSelection = () => globalThis.__patchworkAIChatConfiguration;
 
@@ -715,87 +721,6 @@ function stopRunAction() {
   return Boolean(control);
 }
 
-function readRunStatusAction() {
-  const controls = [...document.querySelectorAll('button, [role="button"]')];
-  const streaming = controls.some((element) => /stop(?: generating| streaming| response)?/i.test([
-    element.getAttribute('aria-label'), element.getAttribute('title'), element.textContent, element.dataset?.testid,
-  ].filter(Boolean).join(' ')));
-  if (streaming) return { status: 'streaming', evidence: 'stop-control' };
-  const alerts = [...document.querySelectorAll('[role="alert"], [role="alertdialog"], [data-testid*="error" i]')]
-    .map((element) => String(element.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).join(' ');
-  if (/(?:something went wrong|generation failed|error generating|unable to generate|network error)/i.test(alerts)) {
-    return { status: 'failed', evidence: 'error-notice' };
-  }
-  const responses = document.querySelectorAll('[data-message-author-role="assistant"], article [data-testid*="conversation-turn" i]');
-  return responses.length > 0
-    ? { status: 'completed', evidence: 'assistant-turn' }
-    : { status: 'unknown', evidence: 'empty-transcript' };
-}
-
-function readChatSnapshotAction() {
-  const readableText = (element) => String(element?.innerText || element?.textContent || '')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-  const roleFromValue = (value) => {
-    const normalized = String(value || '').toLowerCase();
-    if (/\b(?:assistant|chatgpt|model|completion|response)\b/.test(normalized)) return 'assistant';
-    if (/\b(?:user|human|prompt|you)\b/.test(normalized)) return 'user';
-    if (/\bsystem\b/.test(normalized)) return 'system';
-    return null;
-  };
-  const roleFromElement = (element) => roleFromValue([
-    element.getAttribute?.('data-message-author-role'),
-    element.getAttribute?.('data-role'),
-    element.getAttribute?.('data-author'),
-    element.getAttribute?.('aria-label'),
-    element.getAttribute?.('data-testid'),
-  ].filter(Boolean).join(' '));
-  const roots = [document];
-  const visitedRoots = new Set();
-  while (roots.length) {
-    const root = roots.shift();
-    if (!root || visitedRoots.has(root)) continue;
-    visitedRoots.add(root);
-    for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
-  }
-  const queryAll = (selector) => [...visitedRoots].flatMap((root) => [...root.querySelectorAll(selector)]);
-  const primary = queryAll('[data-message-author-role]');
-  const fallback = queryAll(
-    '[data-message-id], [data-testid*="conversation-turn" i], article[data-testid*="turn" i], [data-role], [data-author]',
-  );
-  const collect = (candidates) => {
-    const messages = [];
-    const seen = new Set();
-    for (const [index, element] of candidates.entries()) {
-      const role = roleFromElement(element)
-        || roleFromElement(element.querySelector?.('[data-message-author-role], [data-role], [data-author]'));
-      if (!role || element.parentElement?.closest?.('[data-message-author-role]')) continue;
-      const content = readableText(element);
-      if (!content) continue;
-      const id = element.getAttribute('data-message-id')
-        || element.getAttribute('data-testid')
-        || `${role}-${index}`;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      messages.push({ id, role, content });
-    }
-    return messages;
-  };
-  const messages = collect(primary);
-  if (messages.length === 0) messages.push(...collect(fallback));
-  const thinking = [...document.querySelectorAll('[data-testid*="reasoning" i], details')]
-    .map(readableText)
-    .find(Boolean) || null;
-  const attachments = [...document.querySelectorAll('[data-testid*="attachment" i], [class*="attachment" i]')]
-    .map((element) => readableText(element) || String(element.getAttribute('aria-label') || '').trim())
-    .filter(Boolean)
-    .map((name) => ({ name, status: 'ready' }));
-  return { messages, thinkingSummary: thinking, attachments };
-}
-
 function downloadAttachmentAction(input) {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const matches = [...document.querySelectorAll('a, button, [role="button"], [data-testid*="attachment" i]')]
@@ -825,18 +750,50 @@ class ChatGPTBrowserDriver {
     this.onChatSnapshot = typeof options.onChatSnapshot === 'function'
       ? options.onChatSnapshot
       : null;
+    this.pendingChatSignal = null;
+    this.chatSignalBusy = false;
     if (this.onChatSnapshot) {
       this.chatSnapshotHandler = (_event, payload) => {
         if (_event?.sender !== this.webContents || !payload || typeof payload !== 'object') return;
-        try {
-          this.onChatSnapshot(payload);
-        } catch {}
+        this.pendingChatSignal = payload;
+        this.#drainChatSignal();
       };
       ipcMain.on(CHAT_DOM_SNAPSHOT_CHANNEL, this.chatSnapshotHandler);
       this.webContents.once?.('destroyed', () => {
         ipcMain.removeListener(CHAT_DOM_SNAPSHOT_CHANNEL, this.chatSnapshotHandler);
       });
     }
+  }
+
+  // The page reports that its transcript changed; reading it is this side's
+  // job. Only one read is ever in flight, and a signal that arrives during a
+  // read replaces any earlier one, so a fast stream collapses into a steady
+  // sequence of complete snapshots instead of a backlog of stale ones.
+  #drainChatSignal() {
+    if (this.chatSignalBusy || !this.pendingChatSignal) return;
+    const signal = this.pendingChatSignal;
+    this.pendingChatSignal = null;
+    this.chatSignalBusy = true;
+    Promise.resolve()
+      .then(async () => {
+        if (this.webContents.isDestroyed?.()) return;
+        const url = String(this.webContents.getURL?.() || signal.url || '');
+        if (String(signal.url || url) !== url) return;
+        const snapshot = await this.readChatSnapshot();
+        if (!snapshot || this.webContents.isDestroyed?.()) return;
+        if (String(this.webContents.getURL?.() || url) !== url) return;
+        this.onChatSnapshot({
+          url,
+          title: signal.title || this.webContents.getTitle?.() || null,
+          sequence: signal.sequence,
+          snapshot,
+        });
+      })
+      .catch(() => {})
+      .finally(() => {
+        this.chatSignalBusy = false;
+        if (this.pendingChatSignal) this.#drainChatSignal();
+      });
   }
 
   hasComposer() { return this.#execute(hasComposerAction, { composerSelector: COMPOSER_SELECTOR }); }
@@ -1436,7 +1393,9 @@ class ChatGPTBrowserDriver {
     return result;
   }
 
-  readChatSnapshot() { return this.#execute(readChatSnapshotAction); }
+  readChatSnapshot() {
+    return this.webContents.executeJavaScript(chatSnapshotSource(), true);
+  }
 
   downloadAttachment(name) { return this.#execute(downloadAttachmentAction, { name }); }
 

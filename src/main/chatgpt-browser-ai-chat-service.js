@@ -396,11 +396,22 @@ class ChatGPTBrowserAIChatService extends AIChatService {
       id: String(message.id),
       role: Object.values(AI_CHAT_MESSAGE_ROLE).includes(message.role) ? message.role : AI_CHAT_MESSAGE_ROLE.ASSISTANT,
       text: String(message.text ?? message.content ?? ''),
+      // Rendered structure scraped alongside the text, so the native
+      // transcript can show headings, lists, tables, and fenced code the way
+      // ChatGPT rendered them instead of flattening everything to plain text.
+      ...(Array.isArray(message.parts) ? { parts: message.parts } : {}),
     }));
     const rememberedRunStatus = this.#runStatusByChat.get(descriptor.id);
+    // ChatGPT can accept a message before its streaming controls have rendered.
+    // In that short window the DOM reports "unknown", which previously replaced
+    // the streaming state set by #send and prevented the native transcript from
+    // starting its live update loop. Keep the known streaming state until the
+    // page provides a definitive run status.
     const runStatus = rememberedRunStatus === AI_CHAT_RUN_STATUS.STOPPED && run.status === AI_CHAT_RUN_STATUS.COMPLETED
       ? AI_CHAT_RUN_STATUS.STOPPED
-      : run.status;
+      : rememberedRunStatus === AI_CHAT_RUN_STATUS.STREAMING && run.status === AI_CHAT_RUN_STATUS.UNKNOWN
+        ? AI_CHAT_RUN_STATUS.STREAMING
+        : run.status;
     this.#runStatusByChat.set(descriptor.id, runStatus);
     descriptor.title = this.#webContents.getTitle?.() || descriptor.title || null;
     const attachments = new Map();

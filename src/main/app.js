@@ -1,6 +1,6 @@
 const path = require('node:path');
 const fs = require('node:fs/promises');
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, shell } = require('electron');
 const { PatchworkAIChatController, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
 const { ResultService } = require('./result-service');
@@ -537,6 +537,18 @@ function registerIpc() {
   ipcMain.handle('task:rollback', async (_event, taskId) => publicTask(await resultService.rollback(taskId)));
   ipcMain.handle('path:reveal', async (_event, targetPath) => {
     shell.showItemInFolder(targetPath);
+    return true;
+  });
+  ipcMain.handle('clipboard:write', async (_event, text) => {
+    clipboard.writeText(String(text ?? ''));
+    return true;
+  });
+  // Links inside a mirrored transcript belong in the user's own browser, not
+  // in Patchwork's window and not in the authenticated ChatGPT session.
+  ipcMain.handle('link:open-external', async (_event, url) => {
+    const target = String(url || '');
+    if (!/^https?:\/\//i.test(target)) return false;
+    await shell.openExternal(target);
     return true;
   });
 }

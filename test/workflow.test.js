@@ -1705,6 +1705,34 @@ test('AIChat maps its owned Sol and Luna choices to provider request configurati
   );
 });
 
+test('AIChat keeps a newly sent chat streaming until ChatGPT renders a run status', async () => {
+  const conversationId = '0a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  let url = CHATGPT_URL;
+  const browser = {
+    navigate: async (next) => { url = next; },
+    dismissBlockingNotice: async () => ({ resolved: false }),
+    hasComposer: async () => true,
+    installConfigurationPicker: async ({ model, reasoning }) => ({ model, reasoning }),
+    readConfigurationPicker: async () => null,
+    insertPrompt: async () => ({ present: true }),
+    promptState: async () => ({ present: true }),
+    interceptNextConversationRequest: async () => ({ wait: async () => {}, dispose: async () => {} }),
+    sendState: async () => ({ enabled: true }),
+    clickSend: async () => { url = `${CHATGPT_URL}c/${conversationId}`; return { enabled: true }; },
+    readChatSnapshot: async () => ({ messages: [], attachments: [] }),
+    readRunStatus: async () => ({ status: 'unknown' }),
+  };
+  const service = new ChatGPTBrowserAIChatService({
+    getURL: () => url,
+    getTitle: () => 'New chat',
+    navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+  }, browser);
+  const chat = await service.createChat({ model: 'luna' });
+  await chat.send({ text: 'Start working.' });
+
+  assert.equal((await chat.current()).run.status, 'streaming');
+});
+
 test('new browser chats activate ChatGPT’s semantic New chat control before sending', async () => {
   const previousId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
   let url = `https://chatgpt.com/c/${previousId}`;
@@ -1742,7 +1770,7 @@ test('new browser chats activate ChatGPT’s semantic New chat control before se
 });
 
 test('native Patchwork chat surfaces stream transcript responses and preserve model controls', async () => {
-  const [renderer, markup, driver, view, main, preload, browserPreload] = await Promise.all([
+  const [renderer, markup, driver, view, main, preload, browserPreload, transcript] = await Promise.all([
     fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-driver.js'), 'utf8'),
@@ -1750,27 +1778,38 @@ test('native Patchwork chat surfaces stream transcript responses and preserve mo
     fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-preload.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-transcript.js'), 'utf8'),
   ]);
   assert.match(renderer, /message\?\.text \?\? message\?\.content/);
   assert.doesNotMatch(renderer, /refreshStreamingChats/);
   assert.match(renderer, /container\.replaceChildren\(\.\.\.next\)/);
+  assert.match(renderer, /function chatBlockNode\(block\)/);
+  assert.match(renderer, /chatCodeBlockNode|chat-md-code/);
+  assert.match(renderer, /pinnedToBottom/);
+  assert.doesNotMatch(renderer, /textNode\.textContent = text/);
   assert.match(renderer, /sendTaskChatMessage\(task\.taskId, text, configuration\)/);
   assert.match(renderer, /sendSessionChatMessage\(text, \{/);
   assert.match(markup, /id="session-chat-model-select"/);
   assert.match(markup, /id="session-chat-reasoning-select"/);
   assert.match(markup, /id="task-chat-model-select"/);
-  assert.match(driver, /data-testid\*="conversation-turn"/);
+  assert.match(transcript, /data-testid\*="conversation-turn"/);
   assert.match(driver, /startNewChatAction/);
-  assert.match(driver, /const messages = collect\(primary\)/);
+  assert.match(transcript, /const messages = collect\(primary\)/);
+  // One transcript reader serves both the live path and the polling fallback.
+  assert.doesNotMatch(driver, /const messages = collect\(primary\)/);
+  assert.doesNotMatch(browserPreload, /const messages = collect\(primary\)/);
   assert.match(browserPreload, /MutationObserver/);
   assert.match(browserPreload, /patchwork:chat-dom-snapshot/);
   assert.doesNotMatch(browserPreload, /fetch\s*\(|backend-api|document\.cookie|localStorage/i);
+  assert.doesNotMatch(transcript, /fetch\s*\(|backend-api|document\.cookie|localStorage/i);
   assert.match(view, /await chat\.configure\(selectedConfiguration\)/);
   assert.match(view, /sessionChat/);
   assert.match(view, /TASK_CHAT_DOM_POLL_INTERVAL_MILLISECONDS/);
   assert.match(view, /this\.activeChat\.current\(\)/);
   assert.match(view, /emitTaskChatSnapshot/);
   assert.match(view, /emitSessionChatSnapshot/);
+  assert.match(driver, /selection\.model = input\.model/);
+  assert.match(driver, /selection\.reasoning = input\.reasoning/);
   assert.match(renderer, /session-chat-snapshot/);
   assert.match(view, /async readSessionChat\(\)/);
   assert.match(main, /ipcMain\.handle\('session:chat-send'/);
@@ -2619,7 +2658,7 @@ test('a completed AI chat run stops the task timer and persists the completion s
       current: async () => ({ id: task.conversationId, run: { status: 'completed', error: null } }),
     },
   };
-  view.ensureTaskChat = async () => view.activeChat;
+  view.backgroundChat = (target) => ChatGPTView.prototype.backgroundChat.call(view, target);
   view.updateTaskFromChatSnapshot = (target, snapshot) => (
     ChatGPTView.prototype.updateTaskFromChatSnapshot.call(view, target, snapshot)
   );
@@ -2634,6 +2673,119 @@ test('a completed AI chat run stops the task timer and persists the completion s
   const statusEvent = events.findLast((event) => event.type === 'task-chat-status');
   assert.equal(statusEvent?.chatStatus, 'completed');
   assert.equal(events.at(-1).type, 'task-chat-snapshot');
+});
+
+test('live browser snapshots preserve ChatGPT progress updates', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const snapshots = [];
+  const view = {
+    view: { webContents: { getURL: () => `${CHATGPT_URL}c/${conversationId}` } },
+    liveChatFingerprints: new Map(),
+    knownTasks: new Map(),
+    activeTask: null,
+    activeChat: { configuration: { model: 'sol', reasoning: 'medium' } },
+    sessionChat: { id: conversationId },
+    emitSessionChatSnapshot: async (snapshot) => snapshots.push(snapshot),
+    updateSessionChatPolling: () => {},
+  };
+
+  await ChatGPTView.prototype.processBrowserChatSnapshot.call(view, {
+    url: `${CHATGPT_URL}c/${conversationId}`,
+    title: 'Implement the task',
+    snapshot: {
+      messages: [{ id: 'user-1', role: 'user', text: 'Implement the task.' }],
+      thinkingSummary: 'Inspecting the repository and planning the change.',
+      run: { status: 'streaming', error: null },
+    },
+  });
+
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].thinkingSummary, 'Inspecting the repository and planning the change.');
+  assert.equal(snapshots[0].run.status, 'streaming');
+});
+
+test('background result monitoring never takes the shared browser from a live stream', async () => {
+  const focusedId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const otherId = '7b91fbd0-2761-4bfb-9710-bec522c925cd';
+  const focusedTask = {
+    taskId: '11111111-1111-4111-8111-111111111111',
+    state: 'submitted',
+    conversationId: focusedId,
+    chatStatus: 'streaming',
+    submittedAt: '2026-08-15T23:00:00.000Z',
+  };
+  const backgroundTask = {
+    taskId: '22222222-2222-4222-8222-222222222222',
+    state: 'submitted',
+    conversationId: otherId,
+    chatStatus: 'completed',
+    submittedAt: '2026-08-15T22:00:00.000Z',
+  };
+  const checked = [];
+  const restored = [];
+  const view = {
+    visible: false,
+    activeMerge: null,
+    activeChatMode: 'task',
+    activeTask: focusedTask,
+    activeChat: { id: focusedId },
+    sessionChat: null,
+    sessionChatPollTimer: null,
+    pendingDownload: null,
+    dismissedNoticeEvents: new Map(),
+    knownTasks: new Map([
+      [focusedTask.taskId, focusedTask],
+      [backgroundTask.taskId, backgroundTask],
+    ]),
+    view: { webContents: { isDestroyed: () => false, getURL: () => `${CHATGPT_URL}c/${focusedId}` } },
+    chatService: { recoverSession: async () => ({ resolved: false, notice: null }) },
+    onEvent: async () => {},
+    checkConversationStatus: async (task) => { checked.push(task.conversationId); },
+    checkForResult: async () => false,
+    restoreFocusedConversation: async (id) => { restored.push(id); },
+  };
+  view.focusedConversationId = () => ChatGPTView.prototype.focusedConversationId.call(view);
+  view.focusedConversationIsStreaming = () => ChatGPTView.prototype.focusedConversationIsStreaming.call(view);
+
+  await ChatGPTView.prototype.monitorPage.call(view);
+  assert.deepEqual(checked, [focusedId], 'a streaming conversation keeps the one browser to itself');
+  assert.deepEqual(restored, []);
+
+  focusedTask.chatStatus = 'completed';
+  checked.length = 0;
+  await ChatGPTView.prototype.monitorPage.call(view);
+  assert.deepEqual(checked, [focusedId, otherId], 'an idle conversation lets background tasks take a turn');
+  assert.deepEqual(restored, [focusedId], 'a borrowed browser route is handed back');
+});
+
+test('live snapshots carry ChatGPT’s rendered structure into the native transcript', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const snapshots = [];
+  const view = {
+    view: { webContents: { getURL: () => `${CHATGPT_URL}c/${conversationId}` } },
+    liveChatFingerprints: new Map(),
+    knownTasks: new Map(),
+    activeTask: null,
+    activeChat: { configuration: { model: 'sol', reasoning: 'medium' } },
+    sessionChat: { id: conversationId },
+    emitSessionChatSnapshot: async (snapshot) => snapshots.push(snapshot),
+    updateSessionChatPolling: () => {},
+  };
+  const parts = [
+    { type: 'heading', level: 2, inline: [{ text: 'Plan', bold: false, italic: false, code: false, strike: false, href: '' }] },
+    { type: 'code', language: 'javascript', code: 'const x = 1;' },
+  ];
+
+  await ChatGPTView.prototype.processBrowserChatSnapshot.call(view, {
+    url: `${CHATGPT_URL}c/${conversationId}`,
+    title: 'Implement the task',
+    snapshot: {
+      messages: [{ id: 'a1', role: 'assistant', text: '## Plan\n\n```javascript\nconst x = 1;\n```', parts }],
+      run: { status: 'streaming', error: null },
+    },
+  });
+
+  assert.deepEqual(snapshots[0].messages[0].parts, parts);
 });
 
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {

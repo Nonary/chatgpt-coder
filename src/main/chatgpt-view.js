@@ -279,7 +279,8 @@ class PatchworkAIChatController {
     this.taskChatPollQueued = true;
     this.enqueue(async () => {
       if (this.visible || this.activeTask?.taskId !== taskId || !this.activeChat) return;
-      if (conversationIdFromRouteUrl(this.view.webContents.getURL()) !== this.activeChat.id) return;
+      // Reading through the chat re-opens its route on the shared browser when
+      // something else borrowed it, instead of silently dropping the stream.
       const currentTask = this.knownTasks.get(taskId.toLowerCase()) || this.activeTask;
       const snapshot = await this.activeChat.current();
       const savedTask = await this.updateTaskFromChatSnapshot(currentTask, snapshot);
@@ -346,8 +347,7 @@ class PatchworkAIChatController {
     this.sessionChatPollQueued = true;
     this.enqueue(async () => {
       if (this.visible || this.activeChatMode !== 'session' || !this.activeChat
-        || this.activeChat.id !== chatId
-        || conversationIdFromRouteUrl(this.view.webContents.getURL()) !== chatId) return;
+        || this.activeChat.id !== chatId) return;
       const snapshot = await this.activeChat.current();
       await this.emitSessionChatSnapshot(snapshot);
       this.updateSessionChatPolling(snapshot);
@@ -590,7 +590,12 @@ class PatchworkAIChatController {
           ? message.role
           : 'assistant',
         text: String(message?.text ?? message?.content ?? ''),
+        ...(Array.isArray(message?.parts) ? { parts: message.parts } : {}),
       })),
+      // ChatGPT's own progress line, read alongside the turns. Keeping it on
+      // the normalized snapshot lets the native transcript show movement
+      // instead of waiting for the finished assistant turn.
+      thinkingSummary: String(payload.snapshot.thinkingSummary || '').trim() || null,
       run: {
         status: Object.values(AI_CHAT_RUN_STATUS).includes(payload.snapshot.run?.status)
           ? payload.snapshot.run.status
@@ -680,6 +685,61 @@ class PatchworkAIChatController {
       reasoning: task?.reasoningMode || 'default',
     });
     this.installResultWatcher();
+  }
+
+  // The conversation the native UI is showing right now. Background work runs
+  // on the same single browser session, so it has to know whose route it would
+  // be taking before it navigates.
+  focusedConversationId() {
+    if (this.activeChatMode === 'session') return this.sessionChat?.id || null;
+    const task = this.activeTask;
+    return task?.conversationId
+      || conversationIdFromRouteUrl(task?.conversationUrl)
+      || (this.activeChatMode === 'task' ? this.activeChat?.id || null : null);
+  }
+
+  focusedConversationIsStreaming() {
+    if (this.activeChatMode === 'session') return Boolean(this.sessionChatPollTimer);
+    const task = this.activeTask;
+    if (!task) return false;
+    const current = this.knownTasks.get(task.taskId.toLowerCase()) || task;
+    return current.chatStatus === AI_CHAT_RUN_STATUS.STREAMING;
+  }
+
+  // A chat handle for background reads. It deliberately does not become the
+  // active chat: the monitor borrows the browser, it does not take ownership of
+  // what the native transcript is pointed at.
+  async backgroundChat(task) {
+    const id = task?.conversationId || conversationIdFromRouteUrl(task?.conversationUrl);
+    if (!id) throw new Error('This task has no saved AI chat.');
+    if (this.activeChat?.id === id) return this.activeChat;
+    return this.chatService.openChat({
+      id,
+      workspaceId: task.chatgptProject?.id || null,
+      title: task.conversationTitle || null,
+      model: task.model || 'default',
+      reasoning: task.reasoningMode || 'default',
+    });
+  }
+
+  // Hand the shared browser back to the conversation on screen and give the
+  // native transcript whatever it missed while the route was borrowed.
+  async restoreFocusedConversation(conversationId) {
+    if (!conversationId || this.visible || this.view.webContents.isDestroyed()) return;
+    if (conversationIdFromRouteUrl(this.view.webContents.getURL()) === conversationId) return;
+    const chat = this.activeChat?.id === conversationId ? this.activeChat : null;
+    if (!chat) return;
+    const snapshot = await chat.current();
+    if (this.activeChatMode === 'session') {
+      await this.emitSessionChatSnapshot(snapshot);
+      this.updateSessionChatPolling(snapshot);
+      return;
+    }
+    const task = this.activeTask;
+    if (!task) return;
+    const currentTask = await this.updateTaskFromChatSnapshot(task, snapshot);
+    await this.emitTaskChatSnapshot(currentTask || task, snapshot);
+    this.updateTaskChatPolling(currentTask || task, snapshot);
   }
 
   async ensureTaskChat(task) {
@@ -1049,19 +1109,39 @@ class PatchworkAIChatController {
 
     if (this.activeMerge?.mergeState === 'submitted' && await this.checkForMerge()) return true;
 
+    // Every submitted task shares the one authenticated browser, so this sweep
+    // is the only place that decides whose turn it is. The conversation on
+    // screen goes first, a live stream is never interrupted for a background
+    // check, and a borrowed route is always handed back.
+    const focusedId = this.focusedConversationId();
+    const streamingFocus = this.focusedConversationIsStreaming();
+    const conversationOf = (task) => task.conversationId || conversationIdFromRouteUrl(task.conversationUrl);
     const tasks = [...this.knownTasks.values()]
       .filter((task) => task.state === 'submitted' && (
         task.conversationId || isChatGPTConversationUrl(task.conversationUrl)
       ))
       .sort((left, right) => String(left.submittedAt || left.createdAt || '')
-        .localeCompare(String(right.submittedAt || right.createdAt || '')));
-    for (const task of tasks) {
-      if (this.visible) break;
-      await this.checkConversationStatus(task);
-      const currentTask = this.knownTasks.get(task.taskId.toLowerCase()) || task;
-      if (await this.checkForResult({ task: currentTask })) return true;
+        .localeCompare(String(right.submittedAt || right.createdAt || '')))
+      .sort((left, right) => Number(conversationOf(right) === focusedId)
+        - Number(conversationOf(left) === focusedId));
+    let borrowedRoute = false;
+    try {
+      for (const task of tasks) {
+        if (this.visible) break;
+        if (focusedId && conversationOf(task) !== focusedId) {
+          if (streamingFocus) continue;
+          borrowedRoute = true;
+        }
+        await this.checkConversationStatus(task);
+        const currentTask = this.knownTasks.get(task.taskId.toLowerCase()) || task;
+        if (await this.checkForResult({ task: currentTask })) return true;
+      }
+      return false;
+    } finally {
+      if (borrowedRoute && !this.pendingDownload) {
+        await this.restoreFocusedConversation(focusedId).catch(() => {});
+      }
     }
-    return false;
   }
 
   async discoverConversationId(task) {
@@ -1121,9 +1201,7 @@ class PatchworkAIChatController {
     try {
       const conversationId = task.conversationId || await this.discoverConversationId(task);
       if (!conversationId) return null;
-      const chat = this.activeChat?.id === conversationId
-        ? this.activeChat
-        : await this.ensureTaskChat({ ...task, conversationId });
+      const chat = await this.backgroundChat({ ...task, conversationId });
       const current = await chat.current();
       const currentTask = await this.updateTaskFromChatSnapshot(task, current);
       if (typeof this.emitTaskChatSnapshot === 'function') {
@@ -1152,9 +1230,7 @@ class PatchworkAIChatController {
     this.monitorBusy = true;
     try {
       const expectedName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
-      const chat = this.activeChat?.id === task.conversationId
-        ? this.activeChat
-        : await this.ensureTaskChat(task);
+      const chat = await this.backgroundChat(task);
       const current = await chat.current();
       if (typeof this.emitTaskChatSnapshot === 'function') {
         await this.emitTaskChatSnapshot(task, current);
@@ -1246,14 +1322,17 @@ class PatchworkAIChatController {
     try {
       this.pendingDownload = { kind: 'merge', treeId: tree.id, startedAt: Date.now() };
       const expectedName = mergeResultFilename(tree.id);
-      if ((!this.activeChat || this.activeChat.id !== tree.mergeConversationId) && tree.mergeConversationId) {
-        this.activeChat = await this.chatService.openChat({
-          id: tree.mergeConversationId,
-          workspaceId: tree.chatgptProject?.id || null,
-        });
-      }
-      const started = this.activeChat
-        && await this.activeChat.downloadAttachment(expectedName).catch(() => false);
+      // Merge polling borrows the shared browser too, so it uses its own chat
+      // handle rather than repointing whatever the native transcript shows.
+      const chat = this.activeChat?.id === tree.mergeConversationId
+        ? this.activeChat
+        : tree.mergeConversationId
+          ? await this.chatService.openChat({
+            id: tree.mergeConversationId,
+            workspaceId: tree.chatgptProject?.id || null,
+          })
+          : null;
+      const started = chat && await chat.downloadAttachment(expectedName).catch(() => false);
       if (!started) {
         if (this.pendingDownload?.kind === 'merge' && this.pendingDownload.treeId === tree.id) {
           this.pendingDownload = null;

@@ -1349,6 +1349,157 @@ function normalizedChatMessageText(message) {
   return String(message?.text ?? message?.content ?? '').trim();
 }
 
+// ChatGPT renders Markdown; the transcript reader keeps that structure, so the
+// native chat rebuilds it as real elements instead of flattening a response
+// into one preformatted block. Every node is built from text, never markup, so
+// nothing scraped from the page can be injected into this window.
+function appendInlineRuns(target, runs) {
+  for (const run of Array.isArray(runs) ? runs : []) {
+    const text = String(run?.text ?? '');
+    if (!text) continue;
+    const fragment = document.createDocumentFragment();
+    text.split('\n').forEach((segment, index) => {
+      if (index) fragment.appendChild(document.createElement('br'));
+      if (segment) fragment.appendChild(document.createTextNode(segment));
+    });
+    let node = fragment;
+    const wrap = (tag, className) => {
+      const element = document.createElement(tag);
+      if (className) element.className = className;
+      element.appendChild(node);
+      node = element;
+    };
+    if (run.code) wrap('code', 'chat-md-inline-code');
+    if (run.strike) wrap('s');
+    if (run.italic) wrap('em');
+    if (run.bold) wrap('strong');
+    const href = String(run.href || '');
+    if (/^https?:\/\//i.test(href)) {
+      wrap('a', 'chat-md-link');
+      node.href = href;
+      node.title = href;
+      node.addEventListener('click', (event) => {
+        event.preventDefault();
+        window.patchwork.openExternal(href);
+      });
+    }
+    target.appendChild(node);
+  }
+}
+
+function chatCodeBlockNode(block) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'chat-md-code';
+  const head = document.createElement('div');
+  head.className = 'chat-md-code-head';
+  const language = document.createElement('span');
+  language.textContent = String(block.language || 'code');
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'chat-md-copy';
+  copy.textContent = 'Copy';
+  copy.addEventListener('click', async () => {
+    await window.patchwork.copyText(String(block.code || ''));
+    copy.textContent = 'Copied';
+    setTimeout(() => { copy.textContent = 'Copy'; }, 1200);
+  });
+  head.append(language, copy);
+  const pre = document.createElement('pre');
+  const code = document.createElement('code');
+  code.textContent = String(block.code || '');
+  pre.appendChild(code);
+  wrapper.append(head, pre);
+  return wrapper;
+}
+
+function chatListNode(block) {
+  const list = document.createElement(block.ordered ? 'ol' : 'ul');
+  list.className = 'chat-md-list';
+  const start = Number(block.start);
+  if (block.ordered && Number.isFinite(start) && start > 1) list.start = start;
+  for (const item of Array.isArray(block.items) ? block.items : []) {
+    const entry = document.createElement('li');
+    const line = document.createElement('span');
+    appendInlineRuns(line, item?.inline);
+    entry.appendChild(line);
+    for (const nested of Array.isArray(item?.blocks) ? item.blocks : []) {
+      entry.appendChild(chatBlockNode(nested));
+    }
+    list.appendChild(entry);
+  }
+  return list;
+}
+
+function chatTableNode(block) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'chat-md-table';
+  const table = document.createElement('table');
+  const header = Array.isArray(block.header) ? block.header : [];
+  if (header.length) {
+    const head = document.createElement('thead');
+    const row = document.createElement('tr');
+    for (const cell of header) {
+      const heading = document.createElement('th');
+      appendInlineRuns(heading, cell);
+      row.appendChild(heading);
+    }
+    head.appendChild(row);
+    table.appendChild(head);
+  }
+  const body = document.createElement('tbody');
+  for (const cells of Array.isArray(block.rows) ? block.rows : []) {
+    const row = document.createElement('tr');
+    for (const cell of cells) {
+      const value = document.createElement('td');
+      appendInlineRuns(value, cell);
+      row.appendChild(value);
+    }
+    body.appendChild(row);
+  }
+  table.appendChild(body);
+  wrapper.appendChild(table);
+  return wrapper;
+}
+
+function chatBlockNode(block) {
+  if (block?.type === 'heading') {
+    const level = Math.min(6, Math.max(1, Number(block.level) || 3));
+    const heading = document.createElement(`h${level}`);
+    heading.className = 'chat-md-heading';
+    appendInlineRuns(heading, block.inline);
+    return heading;
+  }
+  if (block?.type === 'code') return chatCodeBlockNode(block);
+  if (block?.type === 'list') return chatListNode(block);
+  if (block?.type === 'table') return chatTableNode(block);
+  if (block?.type === 'rule') {
+    const rule = document.createElement('hr');
+    rule.className = 'chat-md-rule';
+    return rule;
+  }
+  if (block?.type === 'quote') {
+    const quote = document.createElement('blockquote');
+    quote.className = 'chat-md-quote';
+    for (const nested of Array.isArray(block.blocks) ? block.blocks : []) {
+      quote.appendChild(chatBlockNode(nested));
+    }
+    return quote;
+  }
+  const paragraph = document.createElement('p');
+  paragraph.className = 'chat-md-paragraph';
+  if (block?.type === 'text') {
+    paragraph.classList.add('is-plain');
+    paragraph.textContent = String(block.text || '');
+  } else {
+    appendInlineRuns(paragraph, block?.inline);
+  }
+  return paragraph;
+}
+
+// Rebuilding a message costs real work, and a streaming response arrives many
+// times a second. Only the turn whose content actually changed is rebuilt.
+const chatMessageSignatures = new WeakMap();
+
 function renderChatTranscript(container, snapshot, prefix, emptyTitle, emptyCopy) {
   const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
   if (messages.length === 0) {
@@ -1364,6 +1515,11 @@ function renderChatTranscript(container, snapshot, prefix, emptyTitle, emptyCopy
     }
     return;
   }
+  // Following a stream should not fight a reader who scrolled up to re-read
+  // something. Only a transcript already sitting at the bottom keeps itself
+  // there.
+  const pinnedToBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 72;
+  const streaming = snapshot?.run?.status === 'streaming';
   const existing = new Map([...container.querySelectorAll(`article.${prefix}-message`)]
     .map((article) => [article.dataset.messageId, article]));
   const next = [];
@@ -1371,7 +1527,8 @@ function renderChatTranscript(container, snapshot, prefix, emptyTitle, emptyCopy
     const role = ['user', 'assistant', 'system'].includes(message?.role) ? message.role : 'assistant';
     const label = role === 'user' ? 'You' : role === 'system' ? 'System' : 'ChatGPT';
     const text = normalizedChatMessageText(message);
-    if (!text) return;
+    const parts = Array.isArray(message?.parts) ? message.parts : null;
+    if (!text && !parts?.length) return;
     const messageId = String(message?.id || `${role}-${index}`);
     const article = existing.get(messageId) || document.createElement('article');
     article.className = `${prefix}-message ${role}`;
@@ -1383,18 +1540,29 @@ function renderChatTranscript(container, snapshot, prefix, emptyTitle, emptyCopy
     }
     labelNode.className = `${prefix}-message-label`;
     labelNode.textContent = label;
-    let textNode = article.querySelector('pre');
-    if (!textNode) {
-      textNode = document.createElement('pre');
-      article.appendChild(textNode);
+    let body = article.querySelector(`.${prefix}-message-body`);
+    if (!body) {
+      body = document.createElement('div');
+      body.className = `${prefix}-message-body chat-markdown`;
+      article.appendChild(body);
     }
-    textNode.textContent = text;
+    const signature = `${parts ? 'parts' : 'text'}:${text}`;
+    if (chatMessageSignatures.get(article) !== signature) {
+      chatMessageSignatures.set(article, signature);
+      if (parts?.length) {
+        body.replaceChildren(...parts.map((block) => chatBlockNode(block)));
+      } else {
+        body.replaceChildren(chatBlockNode({ type: 'text', text }));
+      }
+    }
     next.push(article);
   });
+  next.forEach((article, index) => article.classList.toggle(
+    'is-streaming',
+    streaming && index === next.length - 1 && article.classList.contains('assistant'),
+  ));
   container.replaceChildren(...next);
-  requestAnimationFrame(() => {
-    container.scrollTop = container.scrollHeight;
-  });
+  if (pinnedToBottom) container.scrollTop = container.scrollHeight;
 }
 
 function setChatConfigurationSelects(prefix, configuration = {}) {

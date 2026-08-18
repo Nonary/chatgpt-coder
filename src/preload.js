@@ -44,6 +44,8 @@ contextBridge.exposeInMainWorld('patchwork', {
   retryApplyTask: (taskId) => ipcRenderer.invoke('task:retry-apply', taskId),
   rollbackTask: (taskId) => ipcRenderer.invoke('task:rollback', taskId),
   revealPath: (targetPath) => ipcRenderer.invoke('path:reveal', targetPath),
+  copyText: (text) => ipcRenderer.invoke('clipboard:write', text),
+  openExternal: (url) => ipcRenderer.invoke('link:open-external', url),
   setBrowserBounds: (bounds) => ipcRenderer.invoke('browser:set-bounds', bounds),
   setBrowserVisible: (visible) => ipcRenderer.invoke('browser:set-visible', visible),
   newChat: () => ipcRenderer.invoke('browser:new-chat'),

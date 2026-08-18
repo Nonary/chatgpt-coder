@@ -1,151 +1,87 @@
+// The page-side half of the live transcript feed.
+//
+// This preload deliberately does not read the transcript. Scraping every
+// mutation inside the page was the single largest cost of the old live path:
+// each notification walked the whole document, rebuilt every message, and
+// serialized the result. All this file does now is tell Patchwork that the
+// rendered conversation changed. The main process then reads the page once,
+// through the same transcript reader the slower poll uses.
+//
+// It talks to ChatGPT's rendered DOM and to Patchwork. It never calls
+// ChatGPT's backend and never reads stored credentials.
 const { ipcRenderer } = require('electron');
 
 const CHAT_DOM_SNAPSHOT_CHANNEL = 'patchwork:chat-dom-snapshot';
-const MESSAGE_SELECTOR = [
-  '[data-message-author-role]',
-  '[data-message-id]',
-  '[data-testid*="conversation-turn" i]',
-  'article[data-testid*="turn" i]',
-  '[data-role]',
-  '[data-author]',
-].join(',');
+const MESSAGE_SELECTOR = '[data-message-author-role], [data-message-id]';
+const MINIMUM_SIGNAL_INTERVAL_MILLISECONDS = 90;
 
-function normalize(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function readableText(element) {
-  return String(element?.innerText || element?.textContent || '')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function roleFromValue(value) {
-  const normalized = String(value || '').toLowerCase();
-  if (/\b(?:assistant|chatgpt|model|completion|response)\b/.test(normalized)) return 'assistant';
-  if (/\b(?:user|human|prompt|you)\b/.test(normalized)) return 'user';
-  if (/\bsystem\b/.test(normalized)) return 'system';
-  return null;
-}
-
-function roleFromElement(element) {
-  return roleFromValue([
-    element?.getAttribute?.('data-message-author-role'),
-    element?.getAttribute?.('data-role'),
-    element?.getAttribute?.('data-author'),
-    element?.getAttribute?.('aria-label'),
-    element?.getAttribute?.('data-testid'),
-  ].filter(Boolean).join(' '));
-}
-
-function pageRoots() {
-  const roots = [document];
-  const visited = new Set();
-  while (roots.length) {
-    const root = roots.shift();
-    if (!root || visited.has(root)) continue;
-    visited.add(root);
-    for (const element of root.querySelectorAll?.('*') || []) {
-      if (element.shadowRoot) roots.push(element.shadowRoot);
-    }
-  }
-  return [...visited];
-}
-
-function queryAll(selector) {
-  return pageRoots().flatMap((root) => [...(root.querySelectorAll?.(selector) || [])]);
-}
-
-function readChatSnapshot() {
-  const candidates = queryAll(MESSAGE_SELECTOR);
-  const messages = [];
-  const seen = new Set();
-  for (const [index, element] of candidates.entries()) {
-    const role = roleFromElement(element)
-      || roleFromElement(element.querySelector?.('[data-message-author-role], [data-role], [data-author]'));
-    if (!role || element.parentElement?.closest?.('[data-message-author-role]')) continue;
-    const text = readableText(element);
-    if (!text) continue;
-    const id = element.getAttribute?.('data-message-id')
-      || element.getAttribute?.('data-testid')
-      || `${role}-${index}`;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    messages.push({ id, role, text });
-  }
-
-  const controls = queryAll('button, [role="button"]');
-  const streaming = controls.some((element) => /stop(?: generating| streaming| response)?/i.test([
-    element.getAttribute?.('aria-label'),
-    element.getAttribute?.('title'),
-    element.textContent,
-    element.dataset?.testid,
-  ].filter(Boolean).join(' ')));
-  const alerts = queryAll('[role="alert"], [role="alertdialog"], [data-testid*="error" i]')
-    .map((element) => readableText(element)).filter(Boolean).join(' ');
-  const failed = !streaming && /(?:something went wrong|generation failed|error generating|unable to generate|network error)/i.test(alerts);
-  const run = {
-    status: streaming ? 'streaming' : failed ? 'failed' : messages.some(({ role }) => role === 'assistant') ? 'completed' : 'unknown',
-    error: failed ? { message: alerts.slice(0, 240) } : null,
-  };
-  const thinkingSummary = queryAll('[data-testid*="reasoning" i], details')
-    .map((element) => readableText(element)).find(Boolean) || null;
-  const attachments = queryAll('[data-testid*="attachment" i], [class*="attachment" i]')
-    .map((element) => readableText(element) || normalize(element.getAttribute?.('aria-label')))
-    .filter(Boolean)
-    .map((name) => ({ name, status: 'ready' }));
-  return { messages, thinkingSummary, attachments, run };
-}
-
-let lastFingerprint = '';
+let lastSignal = '';
 let lastUrl = '';
 let sequence = 0;
 let scheduled = false;
+let lastSentAt = 0;
 
-function publishSnapshot() {
+// A cheap stand-in for the transcript itself. Streaming only grows the last
+// turn, so the last turn's length plus the turn count plus the streaming flag
+// changes exactly when there is something new to read, without touching the
+// rest of the conversation.
+function transcriptSignal() {
+  const messages = document.querySelectorAll(MESSAGE_SELECTOR);
+  const last = messages[messages.length - 1];
+  const streaming = Boolean(document.querySelector('[data-testid="stop-button"], .result-streaming'));
+  return [
+    location.href,
+    messages.length,
+    String(last?.getAttribute('data-message-id') || ''),
+    String(last?.textContent || '').length,
+    streaming ? 'streaming' : 'idle',
+    document.title || '',
+  ].join('|');
+}
+
+function publishSignal() {
   scheduled = false;
   if (location.hostname !== 'chatgpt.com') return;
-  const snapshot = readChatSnapshot();
-  const url = location.href;
-  const fingerprint = JSON.stringify({ url, snapshot });
-  if (fingerprint === lastFingerprint) return;
-  lastFingerprint = fingerprint;
-  lastUrl = url;
+  const signal = transcriptSignal();
+  if (signal === lastSignal) return;
+  lastSignal = signal;
+  lastUrl = location.href;
+  lastSentAt = Date.now();
   try {
     ipcRenderer.send(CHAT_DOM_SNAPSHOT_CHANNEL, {
-      url,
+      url: location.href,
       title: document.title || null,
       sequence: ++sequence,
-      snapshot,
+      signal,
     });
   } catch {}
 }
 
-function scheduleSnapshot() {
+function scheduleSignal() {
   if (scheduled) return;
   scheduled = true;
-  setTimeout(publishSnapshot, 40);
+  const elapsed = Date.now() - lastSentAt;
+  setTimeout(publishSignal, Math.max(0, MINIMUM_SIGNAL_INTERVAL_MILLISECONDS - elapsed));
 }
 
 function installObserver() {
   if (!document.documentElement) return;
-  const observer = new MutationObserver(scheduleSnapshot);
+  // Attribute mutations are intentionally excluded. ChatGPT rewrites class
+  // names constantly while streaming, and the transcript signal already covers
+  // the one attribute change that matters through the stop control.
+  const observer = new MutationObserver(scheduleSignal);
   observer.observe(document.documentElement, {
     subtree: true,
     childList: true,
     characterData: true,
-    attributes: true,
   });
-  window.addEventListener('popstate', scheduleSnapshot);
-  window.addEventListener('hashchange', scheduleSnapshot);
+  window.addEventListener('popstate', scheduleSignal);
+  window.addEventListener('hashchange', scheduleSignal);
   setInterval(() => {
-    if (location.href !== lastUrl) scheduleSnapshot();
+    if (location.href !== lastUrl) scheduleSignal();
   }, 250);
-  scheduleSnapshot();
-  setTimeout(scheduleSnapshot, 250);
+  scheduleSignal();
+  setTimeout(scheduleSignal, 250);
 }
 
 if (document.readyState === 'loading') {
