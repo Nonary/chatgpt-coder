@@ -1640,6 +1640,7 @@ test('AIChat exposes chat, attachment, message, snapshot, and run operations as 
       };
     },
     downloadAttachment: async (name) => name === 'result.txt',
+    navigate: async (next) => { navigations += 1; url = next; },
   };
   const webContents = {
     getURL: () => url,
@@ -1700,15 +1701,11 @@ test('AIChat maps its owned Sol and Luna choices to provider request configurati
   );
 });
 
-test('AIChat keeps project automation in its isolated workspace browser context', async () => {
-  const chatBrowser = {
-    listWorkspaces: async () => { throw new Error('active chat browser used for projects'); },
-    createWorkspace: async () => { throw new Error('active chat browser used for projects'); },
-  };
-  const workspaceCalls = [];
-  const workspaceBrowser = {
+test('AIChat keeps project automation on the same persistent browser context', async () => {
+  const calls = [];
+  const browser = {
     listWorkspaces: async () => {
-      workspaceCalls.push('list');
+      calls.push('list');
       return {
         ok: true,
         workspaces: [{ id: 'g-p-1234567890abcdef1234567890abcdef', name: 'Patchwork' }],
@@ -1716,7 +1713,7 @@ test('AIChat keeps project automation in its isolated workspace browser context'
       };
     },
     createWorkspace: async (name) => {
-      workspaceCalls.push(`create:${name}`);
+      calls.push(`create:${name}`);
       return {
         ok: true,
         workspace: { id: 'g-p-fedcba0987654321fedcba0987654321', name },
@@ -1724,7 +1721,7 @@ test('AIChat keeps project automation in its isolated workspace browser context'
       };
     },
   };
-  const service = new ChatGPTBrowserAIChatService({}, chatBrowser, workspaceBrowser);
+  const service = new ChatGPTBrowserAIChatService({}, browser);
   assert.deepEqual(await service.listWorkspaces(), [{
     id: 'g-p-1234567890abcdef1234567890abcdef',
     name: 'Patchwork',
@@ -1733,37 +1730,35 @@ test('AIChat keeps project automation in its isolated workspace browser context'
     id: 'g-p-fedcba0987654321fedcba0987654321',
     name: 'New Patchwork Project',
   });
-  assert.deepEqual(workspaceCalls, ['list', 'create:New Patchwork Project']);
+  assert.deepEqual(calls, ['list', 'create:New Patchwork Project']);
 });
 
-test('workspace loading is not blocked by a pending active-chat browser operation', async () => {
+test('workspace automation serializes behind active chat work on the persistent browser', async () => {
   let releaseChatOperation;
-  const chatBrowser = {
+  let workspaceRead = false;
+  const browser = {
     readSessionState: () => new Promise((resolve) => { releaseChatOperation = resolve; }),
+    listWorkspaces: async () => {
+      workspaceRead = true;
+      return {
+        ok: true,
+        workspaces: [{ id: 'g-p-22222222222222222222222222222222', name: 'Same session' }],
+        authenticationRequired: false,
+      };
+    },
   };
-  const workspaceBrowser = {
-    listWorkspaces: async () => ({
-      ok: true,
-      workspaces: [{ id: 'g-p-22222222222222222222222222222222', name: 'Independent' }],
-      authenticationRequired: false,
-    }),
-  };
-  const service = new ChatGPTBrowserAIChatService({}, chatBrowser, workspaceBrowser);
+  const service = new ChatGPTBrowserAIChatService({}, browser);
   const pendingChat = service.currentSession();
-  const projects = await Promise.race([
-    service.listWorkspaces(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('workspace queue was blocked')), 100)),
-  ]);
-  assert.deepEqual(projects, [{
-    id: 'g-p-22222222222222222222222222222222',
-    name: 'Independent',
-  }]);
+  const pendingProjects = service.listWorkspaces();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(workspaceRead, false);
   releaseChatOperation({ authenticated: true });
   await pendingChat;
-
-  const main = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
-  assert.match(main, /projects:list[^\n]+chatController\.listProjects\(\)/);
-  assert.doesNotMatch(main, /projects:list[^\n]+chatController\.enqueue/);
+  assert.deepEqual(await pendingProjects, [{
+    id: 'g-p-22222222222222222222222222222222',
+    name: 'Same session',
+  }]);
+  assert.equal(workspaceRead, true);
 });
 
 test('the browser provider opens Projects through ChatGPT in-app navigation without a hard refresh', async () => {
@@ -1865,7 +1860,7 @@ test('the browser provider creates a project through visible browser controls an
     name: 'New Patchwork Project',
   });
   assert.deepEqual(pageActions, ['open-create', 'submit-create']);
-  assert.deepEqual(navigations, ['https://chatgpt.com/library?tab=projects']);
+  assert.deepEqual(navigations, ['https://chatgpt.com/']);
 });
 
 test('the browser provider detects project authentication requirements from rendered controls', async () => {
@@ -1940,6 +1935,14 @@ test('project browser automation cannot read credentials or call authenticated C
     source.indexOf('async createWorkspace(name)'),
   );
   assert.doesNotMatch(listMethod, /#loadBrowserSurface\(CHATGPT_PROJECTS_URL\)/);
+  const createMethod = source.slice(
+    source.indexOf('async createWorkspace(name)'),
+    source.indexOf('installConfigurationPicker(configuration)'),
+  );
+  assert.doesNotMatch(createMethod, /#loadBrowserSurface/);
+  const serviceSource = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-ai-chat-service.js'), 'utf8');
+  assert.doesNotMatch(serviceSource, /#webContents\.loadURL/);
+  assert.match(serviceSource, /#browser\.navigate/);
 });
 
 test('project discovery changes the local ChatGPT route when no Projects control is rendered', async () => {
@@ -2448,9 +2451,13 @@ test('a completed AI chat run stops the task timer and persists the completion s
     view: { webContents: { isDestroyed: () => false } },
     activeChat: {
       id: task.conversationId,
-      current: async () => ({ run: { status: 'completed', error: null } }),
+      current: async () => ({ id: task.conversationId, run: { status: 'completed', error: null } }),
     },
   };
+  view.ensureTaskChat = async () => view.activeChat;
+  view.updateTaskFromChatSnapshot = (target, snapshot) => (
+    ChatGPTView.prototype.updateTaskFromChatSnapshot.call(view, target, snapshot)
+  );
 
   const result = await ChatGPTView.prototype.checkConversationStatus.call(view);
   assert.equal(result.run.status, 'completed');

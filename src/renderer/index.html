@@ -442,27 +442,34 @@
               </article>
             </aside>
 
-            <div class="browser-frame">
-              <div class="browser-toolbar">
-                <div class="browser-controls">
-                  <button id="browser-back-button" title="Back" aria-label="Back">←</button>
-                  <button id="browser-forward-button" title="Forward" aria-label="Forward">→</button>
-                  <button id="browser-reload-button" title="Reload" aria-label="Reload">↻</button>
+            <section class="task-chat-panel" aria-labelledby="task-chat-heading">
+              <header class="task-chat-header">
+                <div>
+                  <p class="eyebrow">CHATGPT CONVERSATION</p>
+                  <h2 id="task-chat-heading">Task chat</h2>
+                  <p id="task-chat-status">Submit this task to start a ChatGPT conversation.</p>
                 </div>
-                <div class="browser-location">
-                  <span id="browser-status-dot"></span>
-                  <strong id="browser-title">ChatGPT</strong>
-                  <small id="browser-status">Embedded session</small>
-                </div>
-                <button id="new-chat-button" class="secondary browser-new-chat">＋ New chat</button>
-              </div>
-              <div id="chatgpt-surface" class="chatgpt-surface">
-                <div class="browser-placeholder">
-                  <strong>Loading ChatGPT…</strong>
-                  <span>Your ChatGPT session will appear here.</span>
+                <button id="task-chat-refresh-button" class="secondary" type="button">Refresh</button>
+              </header>
+              <div id="task-chat-thinking" class="task-chat-thinking hidden"></div>
+              <div id="task-chat-messages" class="task-chat-messages" role="log" aria-live="polite">
+                <div class="task-chat-empty">
+                  <strong>No conversation yet</strong>
+                  <span>After submission, Patchwork reads the hidden browser and renders the conversation here.</span>
                 </div>
               </div>
-            </div>
+              <form id="task-chat-form" class="task-chat-composer">
+                <label class="sr-only" for="task-chat-input">Message ChatGPT about this task</label>
+                <textarea id="task-chat-input" rows="3" placeholder="Message ChatGPT about this task…"></textarea>
+                <div class="task-chat-composer-footer">
+                  <small>Messages are sent through the same persistent hidden ChatGPT session.</small>
+                  <div class="task-chat-actions">
+                    <button id="task-chat-stop-button" class="secondary hidden" type="button">Stop</button>
+                    <button id="task-chat-send-button" class="primary" type="submit">Send</button>
+                  </div>
+                </div>
+              </form>
+            </section>
           </div>
         </section>
 

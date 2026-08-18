@@ -1,17 +1,16 @@
 const fsSync = require('node:fs');
 const path = require('node:path');
-const { BrowserWindow, WebContentsView, clipboard, dialog, shell } = require('electron');
+const { WebContentsView, clipboard, dialog, shell } = require('electron');
 const { mergeResultFilename } = require('./worktree-service');
 const { AI_CHAT_ERROR_CODE, AI_CHAT_RUN_STATUS } = require('./ai-chat-service');
 const { ChatGPTBrowserAIChatService } = require('./chatgpt-browser-ai-chat-service');
-const { ChatGPTBrowserDriver } = require('./chatgpt-browser-driver');
 const { SerialOperationQueue } = require('./serial-operation-queue');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
 const PARTITION = 'persist:patchwork-chatgpt';
 const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 const RESULT_RETRY_MILLISECONDS = 6_000;
-const TASK_MONITOR_INTERVAL_MILLISECONDS = 1_500;
+const TASK_MONITOR_INTERVAL_MILLISECONDS = 15_000;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
 const CHATGPT_CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -123,6 +122,7 @@ class PatchworkAIChatController {
     this.conversationStatusBusy = false;
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
+    this.monitorQueued = false;
     this.visible = false;
     this.view = new WebContentsView({
       webPreferences: {
@@ -136,31 +136,14 @@ class PatchworkAIChatController {
     this.mainWindow.contentView.addChildView(this.view);
     this.view.setBackgroundColor('#11130f');
     this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
-    this.workspaceWindow = new BrowserWindow({
-      show: false,
-      webPreferences: {
-        partition: PARTITION,
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-      },
-    });
-    this.workspaceWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-    this.chatService = new ChatGPTBrowserAIChatService(
-      this.view.webContents,
-      new ChatGPTBrowserDriver(this.view.webContents),
-      new ChatGPTBrowserDriver(this.workspaceWindow.webContents),
-    );
+    this.chatService = new ChatGPTBrowserAIChatService(this.view.webContents);
     this.operations = new SerialOperationQueue();
     this.installNavigationHandlers();
     this.installDownloadListener();
     this.installMergeDownloadListener();
-    this.resultMonitor = setInterval(() => this.enqueue(() => this.monitorPage()).catch(() => {}), TASK_MONITOR_INTERVAL_MILLISECONDS);
+    this.resultMonitor = setInterval(() => this.requestMonitor(), TASK_MONITOR_INTERVAL_MILLISECONDS);
     this.resultMonitor.unref?.();
-    this.mainWindow.once('closed', () => {
-      clearInterval(this.resultMonitor);
-      if (!this.workspaceWindow.isDestroyed()) this.workspaceWindow.destroy();
-    });
+    this.mainWindow.once('closed', () => clearInterval(this.resultMonitor));
     const legacyConversationUrl = this.activeMerge?.mergeConversationUrl || this.activeTask?.conversationUrl || null;
     this.ready = Promise.resolve(this.view.webContents.loadURL(legacyConversationUrl || CHATGPT_URL)).then(async () => {
       const id = this.activeTask?.conversationId || this.activeMerge?.mergeConversationId || null;
@@ -179,6 +162,14 @@ class PatchworkAIChatController {
       await this.ready;
       return operation();
     });
+  }
+
+  requestMonitor() {
+    if (this.monitorQueued || this.view.webContents.isDestroyed()) return;
+    this.monitorQueued = true;
+    this.enqueue(() => this.monitorPage())
+      .catch(() => {})
+      .finally(() => { this.monitorQueued = false; });
   }
 
   installNavigationHandlers() {
@@ -251,17 +242,12 @@ class PatchworkAIChatController {
     }
   }
 
-  async rememberConversationId(conversationId) {
-    const task = this.activeTask;
+  async rememberConversationId(conversationId, task = this.activeTask) {
     if (!task || task.state !== 'submitted' || task.conversationId === conversationId) return task;
     const taskRouteId = conversationIdFromRouteUrl(task.conversationUrl);
     if (taskRouteId && taskRouteId !== conversationId) return task;
-    if (!taskRouteId) {
-      const currentRouteId = conversationIdFromRouteUrl(this.view.webContents.getURL?.() || '');
-      if (currentRouteId && currentRouteId !== conversationId) return task;
-    }
     const next = { ...task, conversationId };
-    this.activeTask = next;
+    if (this.activeTask?.taskId === task.taskId) this.activeTask = next;
     this.knownTasks.set(task.taskId.toLowerCase(), next);
     try {
       const saved = await this.taskService.updateTask(task.taskId, { conversationId });
@@ -392,22 +378,12 @@ class PatchworkAIChatController {
   handleNavigation(url) {
     this.onEvent({ type: 'browser-navigated', url });
     const id = conversationIdFromRouteUrl(url);
-    if (this.activeMerge && id) {
-      if (this.activeMerge.mergeConversationId !== id && this.worktreeService) {
-        const treeId = this.activeMerge.id;
-        this.worktreeService.markMergeSubmitted(treeId, id).then((tree) => {
-          if (this.activeMerge?.id === treeId) this.activeMerge = tree;
-        }).catch(() => {});
-      }
-      return;
+    if (this.activeMerge?.mergeState === 'submitting' && id && this.worktreeService) {
+      const treeId = this.activeMerge.id;
+      this.worktreeService.markMergeSubmitted(treeId, id).then((tree) => {
+        if (this.activeMerge?.id === treeId) this.activeMerge = tree;
+      }).catch(() => {});
     }
-    if (!this.activeTask || !['prepared', 'submitted'].includes(this.activeTask.state)) return;
-    if (!id || this.activeTask.conversationId === id) return;
-    const taskId = this.activeTask.taskId;
-    this.taskService.updateTask(taskId, { conversationId: id, conversationUrl: null }).then((task) => {
-      if (this.activeTask?.taskId === taskId) this.activeTask = task;
-      this.knownTasks.set(taskId.toLowerCase(), task);
-    }).catch(() => {});
   }
 
   setBounds(bounds) {
@@ -441,7 +417,7 @@ class PatchworkAIChatController {
       taskId: task.taskId,
       message: task.chatgptProject?.name
         ? `A fresh chat in ChatGPT project “${task.chatgptProject.name}” is ready for automated submission.`
-        : 'A fresh embedded ChatGPT chat is ready for automated submission.',
+        : 'A fresh chat in the persistent ChatGPT session is ready for automated submission.',
     });
   }
 
@@ -456,28 +432,87 @@ class PatchworkAIChatController {
       id,
       workspaceId: task?.chatgptProject?.id || merge?.chatgptProject?.id || null,
       title: task?.conversationTitle || null,
+      model: task?.model || 'default',
+      reasoning: task?.reasoningMode || 'default',
     });
     this.installResultWatcher();
   }
 
-  async openTaskConversation(task) {
+  async ensureTaskChat(task) {
     const id = task?.conversationId || conversationIdFromRouteUrl(task?.conversationUrl);
     if (!id) throw new Error('This task has no saved AI chat.');
-    this.activeMerge = null;
-    this.activeTask = task;
-    this.knownTasks.set(task.taskId.toLowerCase(), task);
     this.activeChat = await this.chatService.openChat({
       id,
       workspaceId: task.chatgptProject?.id || null,
       title: task.conversationTitle || null,
+      model: task.model || 'default',
+      reasoning: task.reasoningMode || 'default',
     });
-    this.installResultWatcher();
+    return this.activeChat;
+  }
+
+  async openTaskConversation(task) {
+    this.activeMerge = null;
+    this.activeTask = task;
+    this.knownTasks.set(task.taskId.toLowerCase(), task);
+    await this.ensureTaskChat(task);
     await this.onEvent({
       type: 'task-chat-opened',
       taskId: task.taskId,
-      message: 'Opened this task’s saved ChatGPT conversation.',
+      message: 'Loaded this task’s saved ChatGPT conversation into the native chat view.',
     });
     return { opened: true, task };
+  }
+
+  async readTaskChat(task) {
+    const chat = await this.ensureTaskChat(task);
+    const snapshot = await chat.current();
+    await this.updateTaskFromChatSnapshot(task, snapshot);
+    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    return snapshot;
+  }
+
+  async sendTaskMessage(task, text) {
+    const message = String(text || '').trim();
+    if (!message) throw new Error('Enter a chat message.');
+    this.activeMerge = null;
+    this.activeTask = task;
+    this.knownTasks.set(task.taskId.toLowerCase(), task);
+    const chat = await this.ensureTaskChat(task);
+    const run = await chat.send({ text: message });
+    let currentTask = this.knownTasks.get(task.taskId.toLowerCase()) || task;
+    if (currentTask.state === 'submitted') {
+      currentTask = await this.taskService.updateTask(task.taskId, {
+        chatStatus: run.status,
+        chatStatusRaw: null,
+        chatFinishedAt: null,
+      });
+      this.activeTask = currentTask;
+      this.knownTasks.set(task.taskId.toLowerCase(), currentTask);
+      await this.onEvent({
+        type: 'task-chat-status',
+        task: currentTask,
+        taskId: task.taskId,
+        chatStatus: run.status,
+        chatStatusRaw: null,
+        message: 'Message sent through the hidden ChatGPT session.',
+      });
+    }
+    const snapshot = await chat.current();
+    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    this.requestMonitor();
+    return { task: currentTask, snapshot };
+  }
+
+  async stopTaskChat(task) {
+    this.activeTask = task;
+    this.knownTasks.set(task.taskId.toLowerCase(), task);
+    const chat = await this.ensureTaskChat(task);
+    await chat.stop();
+    const snapshot = await chat.current();
+    const currentTask = await this.updateTaskFromChatSnapshot(task, snapshot);
+    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    return { task: currentTask, snapshot };
   }
 
   async newChat(projectId = null, projectShortUrl = null, configuration = {}) {
@@ -522,8 +557,8 @@ class PatchworkAIChatController {
       type: 'automation-started',
       taskId: task.taskId,
       message: summaryOnly
-        ? 'Injecting the Git Summary request into the embedded ChatGPT composer…'
-        : 'Injecting the task into the embedded ChatGPT composer…',
+        ? 'Injecting the Git Summary request into the hidden ChatGPT composer…'
+        : 'Injecting the task into the hidden ChatGPT composer…',
     });
     if (!this.activeChat) {
       this.activeChat = await this.chatService.createChat({
@@ -546,7 +581,7 @@ class PatchworkAIChatController {
         ? {
           type: 'browser-login-required',
           taskId: task.taskId,
-          message: 'Sign in to ChatGPT in the embedded browser, then choose Submit automatically.',
+          message: 'Sign in on the ChatGPT session page, then choose Submit automatically.',
         }
         : {
           type: 'task-failed',
@@ -655,10 +690,11 @@ class PatchworkAIChatController {
 
   installResultWatcher() {
     if (this.view.webContents.isDestroyed()) return;
-    this.monitorPage().catch(() => {});
+    this.requestMonitor();
   }
 
   async monitorPage() {
+    if (this.visible || this.view.webContents.isDestroyed()) return false;
     const recovery = await this.chatService.recoverSession();
     if (recovery.resolved) {
       const eventKey = String(recovery.notice || 'blocking-notice').toLowerCase();
@@ -671,30 +707,74 @@ class PatchworkAIChatController {
         });
       }
     }
-    await this.checkConversationStatus();
-    return this.checkForResult();
+
+    if (this.activeMerge?.mergeState === 'submitted' && await this.checkForMerge()) return true;
+
+    const tasks = [...this.knownTasks.values()]
+      .filter((task) => task.state === 'submitted' && (
+        task.conversationId || isChatGPTConversationUrl(task.conversationUrl)
+      ))
+      .sort((left, right) => String(left.submittedAt || left.createdAt || '')
+        .localeCompare(String(right.submittedAt || right.createdAt || '')));
+    for (const task of tasks) {
+      if (this.visible) break;
+      await this.checkConversationStatus(task);
+      const currentTask = this.knownTasks.get(task.taskId.toLowerCase()) || task;
+      if (await this.checkForResult({ task: currentTask })) return true;
+    }
+    return false;
   }
 
   async discoverConversationId(task) {
     if (task.conversationId) return task.conversationId;
     const taskRouteId = conversationIdFromRouteUrl(task.conversationUrl);
     if (taskRouteId) {
-      const remembered = await this.rememberConversationId(taskRouteId);
+      const remembered = await this.rememberConversationId(taskRouteId, task);
       return remembered?.conversationId === taskRouteId ? taskRouteId : null;
-    }
-    const currentUrl = this.view.webContents.getURL?.() || '';
-    const currentRouteId = conversationIdFromRouteUrl(currentUrl);
-    if (currentRouteId && currentUrl === task.conversationUrl) {
-      const remembered = await this.rememberConversationId(currentRouteId);
-      return remembered?.conversationId === currentRouteId ? currentRouteId : null;
     }
     return null;
   }
 
-  async checkConversationStatus() {
-    const task = this.activeTask;
+  async updateTaskFromChatSnapshot(task, current) {
+    if (!task || task.state !== 'submitted') return task;
+    const nextChatStatus = current?.run?.status;
+    if (!nextChatStatus || nextChatStatus === AI_CHAT_RUN_STATUS.UNKNOWN) return task;
+    const key = task.taskId.toLowerCase();
+    const currentTask = this.knownTasks.get(key) || task;
+    const changed = currentTask.chatStatus !== nextChatStatus || currentTask.chatStatusRaw !== null;
+    if (!changed) return currentTask;
+
+    const saved = await this.taskService.updateTask(task.taskId, {
+      conversationId: current?.id || currentTask.conversationId,
+      chatStatus: nextChatStatus,
+      chatStatusRaw: null,
+      chatFinishedAt: nextChatStatus === AI_CHAT_RUN_STATUS.STREAMING
+        ? null
+        : currentTask.chatFinishedAt || new Date().toISOString(),
+    });
+    if (this.activeTask?.taskId === task.taskId) this.activeTask = saved;
+    this.knownTasks.set(key, saved);
+    const message = nextChatStatus === AI_CHAT_RUN_STATUS.STREAMING
+      ? 'ChatGPT is still generating the task result.'
+      : nextChatStatus === AI_CHAT_RUN_STATUS.FAILED
+        ? 'ChatGPT reported a generation failure for this task.'
+        : nextChatStatus === AI_CHAT_RUN_STATUS.STOPPED
+          ? 'ChatGPT generation was stopped for this task.'
+          : 'ChatGPT finished generating; Patchwork is checking for the result file.';
+    await this.onEvent({
+      type: 'task-chat-status',
+      task: saved,
+      taskId: task.taskId,
+      chatStatus: nextChatStatus,
+      chatStatusRaw: null,
+      message,
+    });
+    return saved;
+  }
+
+  async checkConversationStatus(task = this.activeTask) {
     if (this.conversationStatusBusy || !task || task.state !== 'submitted'
-      || task.chatStatus === 'completed' || task.chatStatus === 'failed'
+      || task.chatStatus === AI_CHAT_RUN_STATUS.COMPLETED || task.chatStatus === AI_CHAT_RUN_STATUS.FAILED
       || this.view.webContents.isDestroyed()) {
       return null;
     }
@@ -702,70 +782,39 @@ class PatchworkAIChatController {
     try {
       const conversationId = task.conversationId || await this.discoverConversationId(task);
       if (!conversationId) return null;
-      if (!this.activeChat || this.activeChat.id !== conversationId) {
-        this.activeChat = await this.chatService.openChat({
-          id: conversationId,
-          workspaceId: task.chatgptProject?.id || null,
-          title: task.conversationTitle || null,
-        });
+      const chat = await this.ensureTaskChat({ ...task, conversationId });
+      const current = await chat.current();
+      await this.updateTaskFromChatSnapshot(task, current);
+      if (this.activeTask?.taskId === task.taskId) {
+        await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot: current });
       }
-      const current = await this.activeChat.current();
-      const nextChatStatus = current.run.status;
-      if (nextChatStatus === AI_CHAT_RUN_STATUS.UNKNOWN) return current;
-      const currentTask = this.activeTask?.taskId === task.taskId ? this.activeTask : task;
-      const changed = currentTask.chatStatus !== nextChatStatus || currentTask.chatStatusRaw !== null;
-      if (!changed) return current;
-
-      const update = {
-        conversationId,
-        chatStatus: nextChatStatus,
-        chatStatusRaw: null,
-        chatFinishedAt: nextChatStatus === AI_CHAT_RUN_STATUS.STREAMING
-          ? null
-          : currentTask.chatFinishedAt || new Date().toISOString(),
-      };
-      const saved = await this.taskService.updateTask(task.taskId, update);
-      if (this.activeTask?.taskId === task.taskId) this.activeTask = saved;
-      this.knownTasks.set(task.taskId.toLowerCase(), saved);
-      await this.onEvent({
-        type: 'task-chat-status',
-        task: saved,
-        taskId: task.taskId,
-        chatStatus: nextChatStatus,
-        chatStatusRaw: null,
-        message: nextChatStatus === AI_CHAT_RUN_STATUS.STREAMING
-          ? 'ChatGPT is still generating the task result.'
-          : nextChatStatus === AI_CHAT_RUN_STATUS.FAILED
-            ? 'ChatGPT reported a generation failure for this task.'
-            : 'ChatGPT finished generating; Patchwork is checking for the result file.',
-      });
       return current;
     } finally {
       this.conversationStatusBusy = false;
     }
   }
 
-
-  async checkForResult({ force = false } = {}) {
-    if (this.activeMerge) return this.checkForMerge();
-    const task = this.activeTask;
+  async checkForResult({ force = false, task = this.activeTask } = {}) {
     const allowedState = force ? ['submitted', 'conflicted'] : ['submitted'];
     if (this.monitorBusy || !task || !allowedState.includes(task.state)) return false;
-    if (task.chatStatus === 'failed') return false;
+    if (task.chatStatus === AI_CHAT_RUN_STATUS.FAILED) return false;
     if (this.processingTasks.has(task.taskId) || this.view.webContents.isDestroyed()) return false;
+    if (this.pendingDownload && Date.now() - this.pendingDownload.startedAt < 20_000) return false;
     const attemptedAt = this.resultAttempts.get(task.taskId) || 0;
     if (!force && Date.now() - attemptedAt < RESULT_RETRY_MILLISECONDS) return false;
 
     this.monitorBusy = true;
     try {
       const expectedName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
-      this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
-      if (!this.activeChat || this.activeChat.id !== task.conversationId) {
-        await this.openTaskConversation(task);
+      const chat = await this.ensureTaskChat(task);
+      const current = await chat.current();
+      if (this.activeTask?.taskId === task.taskId) {
+        await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot: current });
       }
-      const current = await this.activeChat.current();
       const ready = force || current.run.status !== AI_CHAT_RUN_STATUS.STREAMING;
-      const started = ready && await this.activeChat.downloadAttachment(expectedName).catch(() => false);
+      if (!ready) return false;
+      this.pendingDownload = { kind: 'task', taskId: task.taskId, startedAt: Date.now() };
+      const started = await chat.downloadAttachment(expectedName).catch(() => false);
       if (!started) {
         if (this.pendingDownload?.kind === 'task' && this.pendingDownload.taskId === task.taskId) {
           this.pendingDownload = null;
@@ -841,12 +890,12 @@ class PatchworkAIChatController {
   async checkForMerge() {
     const tree = this.activeMerge;
     if (this.monitorBusy || !tree || tree.mergeState !== 'submitted') return false;
-    if (this.pendingDownload?.kind === 'merge' && this.pendingDownload.treeId === tree.id) return false;
+    if (this.pendingDownload && Date.now() - this.pendingDownload.startedAt < 20_000) return false;
     this.monitorBusy = true;
     try {
       this.pendingDownload = { kind: 'merge', treeId: tree.id, startedAt: Date.now() };
       const expectedName = mergeResultFilename(tree.id);
-      if (!this.activeChat && tree.mergeConversationId) {
+      if ((!this.activeChat || this.activeChat.id !== tree.mergeConversationId) && tree.mergeConversationId) {
         this.activeChat = await this.chatService.openChat({
           id: tree.mergeConversationId,
           workspaceId: tree.chatgptProject?.id || null,

@@ -11,7 +11,6 @@ const COMPOSER_SELECTOR = [
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|excess usage|extra usage|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_HOME_URL = 'https://chatgpt.com/';
-const CHATGPT_PROJECTS_URL = 'https://chatgpt.com/library?tab=projects';
 const BROWSER_NAVIGATION_TIMEOUT_MILLISECONDS = 15_000;
 const BROWSER_ACTION_TIMEOUT_MILLISECONDS = 5_000;
 
@@ -199,6 +198,46 @@ function openWorkspaceIndexAction(input) {
     return { activated: true, renderedControl: false };
   } catch {
     return { activated: false, renderedControl: false };
+  }
+}
+
+function navigateChatGPTRouteAction(input) {
+  const target = new URL(input.url, location.href);
+  if (target.origin !== location.origin) return { activated: false, renderedControl: false };
+  const route = `${target.pathname}${target.search}${target.hash}`;
+  if (`${location.pathname}${location.search}${location.hash}` === route) {
+    return { activated: true, renderedControl: false, unchanged: true };
+  }
+
+  if (!input.localRouteOnly) {
+    const roots = [document];
+    const visited = new Set();
+    while (roots.length) {
+      const root = roots.shift();
+      if (!root || visited.has(root)) continue;
+      visited.add(root);
+      for (const link of root.querySelectorAll('a[href]')) {
+        try {
+          const url = new URL(link.getAttribute('href') || link.href || '', location.href);
+          if (url.origin !== target.origin
+            || `${url.pathname}${url.search}${url.hash}` !== route
+            || link.getAttribute('aria-disabled') === 'true') continue;
+          link.click();
+          return { activated: true, renderedControl: true, unchanged: false };
+        } catch {}
+      }
+      for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
+    }
+  }
+
+  // ChatGPT's router observes same-document history transitions. Keep the
+  // authenticated WebContents alive instead of replacing its document.
+  try {
+    history.pushState(history.state, '', route);
+    window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
+    return { activated: true, renderedControl: false, unchanged: false };
+  } catch {
+    return { activated: false, renderedControl: false, unchanged: false };
   }
 }
 
@@ -620,16 +659,22 @@ function readRunStatusAction() {
 }
 
 function readChatSnapshotAction() {
+  const readableText = (element) => String(element?.innerText || element?.textContent || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
   const messages = [...document.querySelectorAll('[data-message-author-role]')].map((element, index) => {
     const role = element.getAttribute('data-message-author-role');
-    const content = String(element.textContent || '').replace(/\s+/g, ' ').trim();
+    const content = readableText(element);
     return { id: element.getAttribute('data-message-id') || `${role}-${index}`, role, content };
   }).filter((message) => message.content && ['user', 'assistant', 'system'].includes(message.role));
   const thinking = [...document.querySelectorAll('[data-testid*="reasoning" i], details')]
-    .map((element) => String(element.textContent || '').replace(/\s+/g, ' ').trim())
+    .map(readableText)
     .find(Boolean) || null;
   const attachments = [...document.querySelectorAll('[data-testid*="attachment" i], [class*="attachment" i]')]
-    .map((element) => String(element.textContent || element.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim())
+    .map((element) => readableText(element) || String(element.getAttribute('aria-label') || '').trim())
     .filter(Boolean)
     .map((name) => ({ name, status: 'ready' }));
   return { messages, thinkingSummary: thinking, attachments };
@@ -671,14 +716,103 @@ class ChatGPTBrowserDriver {
     });
   }
 
+  async navigate(url) {
+    const target = new URL(String(url || ''), CHATGPT_HOME_URL);
+    if (target.protocol !== 'https:' || target.hostname !== 'chatgpt.com') {
+      throw new Error('The browser route must stay on ChatGPT.');
+    }
+    const currentUrl = String(this.webContents.getURL?.() || '');
+    if (!currentUrl || currentUrl === 'about:blank') {
+      await this.#loadBrowserSurface(CHATGPT_HOME_URL);
+    } else if (!isChatGPTBrowserUrl(currentUrl)) {
+      throw new Error('The persistent browser is outside ChatGPT. Restore the ChatGPT session before retrying.');
+    }
+    const route = `${target.pathname}${target.search}${target.hash}`;
+    const current = new URL(String(this.webContents.getURL?.() || CHATGPT_HOME_URL));
+    if (`${current.pathname}${current.search}${current.hash}` === route) return true;
+
+    const switchingConversation = /\/c\/[0-9a-f-]{36}\/?$/i.test(target.pathname);
+    const previousSnapshot = switchingConversation
+      ? await this.readChatSnapshot().catch(() => null)
+      : null;
+    const snapshotFingerprint = (snapshot) => (snapshot?.messages || [])
+      .map((message) => `${message.role}:${message.id}:${message.content}`)
+      .join('\n');
+    const previousFingerprint = snapshotFingerprint(previousSnapshot);
+
+    let documentNavigationBlocked = false;
+    const preventDocumentNavigation = (event) => {
+      documentNavigationBlocked = true;
+      event.preventDefault?.();
+    };
+    this.webContents.on?.('will-navigate', preventDocumentNavigation);
+    let navigation;
+    try {
+      navigation = await this.#execute(
+        navigateChatGPTRouteAction,
+        { url: target.toString(), localRouteOnly: false },
+      );
+      await delay(50);
+    } finally {
+      this.webContents.removeListener?.('will-navigate', preventDocumentNavigation);
+    }
+    if (documentNavigationBlocked) {
+      navigation = await this.#execute(
+        navigateChatGPTRouteAction,
+        { url: target.toString(), localRouteOnly: true },
+      );
+    }
+    if (!navigation?.activated) {
+      throw new Error('ChatGPT did not accept the in-app route change. Patchwork did not reload the browser.');
+    }
+
+    const routeMatches = () => {
+      const active = new URL(String(this.webContents.getURL?.() || CHATGPT_HOME_URL));
+      return `${active.pathname}${active.search}${active.hash}` === route;
+    };
+    const waitForRoute = async (milliseconds) => {
+      const deadline = Date.now() + milliseconds;
+      while (Date.now() < deadline) {
+        if (routeMatches()) return true;
+        await delay(50);
+      }
+      return routeMatches();
+    };
+
+    let reachedRoute = await waitForRoute(navigation.renderedControl ? 750 : BROWSER_ACTION_TIMEOUT_MILLISECONDS);
+    if (!reachedRoute && navigation.renderedControl) {
+      navigation = await this.#execute(
+        navigateChatGPTRouteAction,
+        { url: target.toString(), localRouteOnly: true },
+      );
+      if (navigation?.activated) reachedRoute = await waitForRoute(BROWSER_ACTION_TIMEOUT_MILLISECONDS);
+    }
+    if (!reachedRoute) throw new Error('ChatGPT did not finish the in-app route change.');
+
+    if (switchingConversation) {
+      const renderDeadline = Date.now() + BROWSER_ACTION_TIMEOUT_MILLISECONDS;
+      while (Date.now() < renderDeadline) {
+        const snapshot = await this.readChatSnapshot().catch(() => null);
+        const fingerprint = snapshotFingerprint(snapshot);
+        if (fingerprint && fingerprint !== previousFingerprint) return true;
+        await delay(100);
+      }
+      throw new Error('ChatGPT changed conversations, but the target transcript did not finish rendering.');
+    }
+
+    // Give the app router one render turn before composer automation begins.
+    await delay(100);
+    return true;
+  }
+
   async listWorkspaces() {
     let browserCapture = null;
     let captureError = null;
     let initialState = null;
     try {
-      // Keep the browser's current ChatGPT document and authenticated session
-      // whenever possible. A newly-created hidden browser starts at about:blank
-      // and needs one real document before Chromium observation is available.
+      // Reuse the one persistent ChatGPT document and authenticated session.
+      // The initial about:blank load is the only point where this helper needs
+      // to create the first ChatGPT document for that persistent WebContents.
       const currentUrl = String(this.webContents.getURL?.() || '');
       if (!currentUrl || currentUrl === 'about:blank') {
         await this.#loadBrowserSurface(CHATGPT_HOME_URL);
@@ -842,16 +976,17 @@ class ChatGPTBrowserDriver {
         message: 'Enter a project name.',
       };
     }
-    try {
-      await this.#loadBrowserSurface(CHATGPT_PROJECTS_URL);
-    } catch (error) {
+    const projects = await this.listWorkspaces();
+    if (!projects?.ok) {
       return {
         ok: false,
         workspace: null,
-        authenticationRequired: false,
-        message: String(error?.message || error || 'The projects page could not be opened.').slice(0, 240),
+        authenticationRequired: Boolean(projects?.authenticationRequired),
+        message: projects?.message || null,
       };
     }
+    const existing = projects.workspaces?.find((workspace) => workspace.name === projectName) || null;
+    if (existing) return { ok: true, workspace: existing, authenticationRequired: false, message: null };
     let submitted = false;
     for (let attempt = 0; attempt < 40; attempt += 1) {
       const index = await this.#executeWorkspaceAction(readWorkspaceIndexAction, {}, 'reading projects');

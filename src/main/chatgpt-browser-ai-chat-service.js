@@ -77,26 +77,19 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   #operations = new SerialOperationQueue();
   #runStatusByChat = new Map();
   #webContents;
-  #workspaceBrowser;
-  #workspaceOperations = new SerialOperationQueue();
 
-  constructor(
-    webContents,
-    browserDriver = new ChatGPTBrowserDriver(webContents),
-    workspaceBrowserDriver = browserDriver,
-  ) {
+  constructor(webContents, browserDriver = new ChatGPTBrowserDriver(webContents)) {
     super();
     this.#webContents = webContents;
     this.#browser = browserDriver;
-    this.#workspaceBrowser = workspaceBrowserDriver;
   }
 
   listWorkspaces() {
-    return this.#workspaceOperations.run(() => this.#listWorkspaces());
+    return this.#operations.run(() => this.#listWorkspaces());
   }
 
   async #listWorkspaces() {
-    const result = await this.#workspaceBrowser.listWorkspaces();
+    const result = await this.#browser.listWorkspaces();
     if (result?.authenticationRequired) {
       throw new AIChatError(
         AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
@@ -121,13 +114,13 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   }
 
   createWorkspace(input) {
-    return this.#workspaceOperations.run(() => this.#createWorkspace(input));
+    return this.#operations.run(() => this.#createWorkspace(input));
   }
 
   async #createWorkspace(input) {
     const name = String(input?.name || input || '').trim();
     if (!name) throw new AIChatError(AI_CHAT_ERROR_CODE.INVALID_INPUT, 'Enter a workspace name.');
-    const result = await this.#workspaceBrowser.createWorkspace(name);
+    const result = await this.#browser.createWorkspace(name);
     if (result?.authenticationRequired) {
       throw new AIChatError(
         AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
@@ -161,9 +154,9 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   async #createChat(input = {}) {
     const workspaceId = input.workspaceId || input.workspace?.id || null;
     const target = workspaceId ? workspaceUrl(workspaceId) : CHATGPT_HOME;
-    // Electron's reload() does not return a navigation promise. Always using
-    // loadURL keeps configuration, attachment, and prompt work on the final document.
-    await this.#webContents.loadURL(target);
+    // Keep one authenticated ChatGPT document alive. Route changes happen
+    // through ChatGPT's in-app router instead of replacing the WebContents.
+    await this.#browser.navigate(target);
     const descriptor = {
       id: `pending:${randomUUID()}`,
       workspaceId,
@@ -188,7 +181,7 @@ class ChatGPTBrowserAIChatService extends AIChatService {
     const target = workspaceId
       ? `${CHATGPT_HOME}g/${workspaceId}/c/${id}`
       : `${CHATGPT_HOME}c/${id}`;
-    if (conversationId(this.#webContents.getURL()) !== id) await this.#webContents.loadURL(target);
+    if (conversationId(this.#webContents.getURL()) !== id) await this.#browser.navigate(target);
     return this.#chat({
       id,
       workspaceId,
@@ -421,7 +414,7 @@ class ChatGPTBrowserAIChatService extends AIChatService {
     const target = descriptor.workspaceId
       ? `${CHATGPT_HOME}g/${descriptor.workspaceId}/c/${descriptor.id}`
       : `${CHATGPT_HOME}c/${descriptor.id}`;
-    await this.#webContents.loadURL(target);
+    await this.#browser.navigate(target);
   }
 
   async #configure(descriptor, nextConfiguration = null) {

@@ -366,6 +366,7 @@ function registerIpc() {
     return true;
   });
   ipcMain.handle('task:open', async (_event, taskId) => {
+    chatController.setVisible(false);
     const task = await taskService.getTask(taskId);
     if (task.conversationId || task.conversationUrl) {
       await chatController.enqueue(() => chatController.openTaskConversation(task));
@@ -375,6 +376,21 @@ function registerIpc() {
   ipcMain.handle('task:submit', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
     return publicTask(await chatController.enqueue(() => chatController.submit(task)));
+  });
+  ipcMain.handle('task:chat', async (_event, taskId) => {
+    const task = await taskService.getTask(taskId);
+    const snapshot = await chatController.enqueue(() => chatController.readTaskChat(task));
+    return { task: publicTask(await taskService.getTask(taskId)), snapshot };
+  });
+  ipcMain.handle('task:chat-send', async (_event, taskId, text) => {
+    const task = await taskService.getTask(taskId);
+    const result = await chatController.enqueue(() => chatController.sendTaskMessage(task, text));
+    return { task: publicTask(result.task), snapshot: result.snapshot };
+  });
+  ipcMain.handle('task:chat-stop', async (_event, taskId) => {
+    const task = await taskService.getTask(taskId);
+    const result = await chatController.enqueue(() => chatController.stopTaskChat(task));
+    return { task: publicTask(result.task), snapshot: result.snapshot };
   });
   ipcMain.handle('task:set-target', async (_event, taskId, input = {}) => {
     const task = await taskService.getTask(taskId);

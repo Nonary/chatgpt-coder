@@ -21,6 +21,11 @@ const state = {
   conflictResolutionTaskId: null,
   gitSummaryBusy: false,
   diffTabContextKey: null,
+  chatTaskId: null,
+  chatSnapshot: null,
+  chatLoading: false,
+  chatSending: false,
+  chatError: null,
 };
 
 const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
@@ -60,9 +65,8 @@ const elements = Object.fromEntries(
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'delete-task-button', 'result-card', 'result-summary', 'patch-list',
     'use-git-summary-button', 'apply-button', 'retry-apply-button', 'resolve-conflict-button', 'rollback-button', 'activity-list', 'toast', 'connection-pill',
-    'chatgpt-surface', 'browser-back-button', 'browser-forward-button',
-    'browser-reload-button', 'new-chat-button', 'browser-title', 'browser-status',
-    'browser-status-dot',
+    'task-chat-status', 'task-chat-thinking', 'task-chat-messages', 'task-chat-form',
+    'task-chat-input', 'task-chat-refresh-button', 'task-chat-stop-button', 'task-chat-send-button',
     'session-chatgpt-surface', 'session-back-button', 'session-forward-button',
     'session-reload-button', 'session-new-chat-button', 'session-browser-title',
     'session-browser-status', 'session-status-dot',
@@ -734,8 +738,7 @@ function closeConflictResolutionModal() {
   elements['conflict-resolution-instructions'].value = '';
   elements['conflict-resolution-submit-button'].disabled = false;
   if (!elements['task-view'].classList.contains('hidden')) {
-    window.patchwork.setBrowserVisible(true);
-    requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
+    window.patchwork.setBrowserVisible(false);
   }
 }
 
@@ -1239,7 +1242,7 @@ async function deleteTask(taskId) {
 
 const statusText = {
   prepared: ['Package prepared', 'Attach the package in ChatGPT and send the copied instructions.'],
-  submitted: ['Task is running', 'ChatGPT is still working in the embedded browser. Patchwork is actively watching for the result.'],
+  submitted: ['Task is running', 'ChatGPT is working in the hidden persistent browser. Patchwork mirrors the conversation here and checks background tasks periodically.'],
   ready: ['Waiting to apply', 'The plain-text result is validated and waiting for you to apply it.'],
   conflicted: ['Conflict needs resolution', 'Clean up the task target and retry the apply, or send a resolution task to ChatGPT to preserve both versions.'],
   resolved: ['Conflict resolved', 'The original task conflict was resolved by a follow-up task.'],
@@ -1314,9 +1317,158 @@ function renderResult(task) {
     </div>`).join('') + (task.result.commitMessage ? `<div class="patch-item"><strong>Commit</strong><pre>${escapeHtml(task.result.commitMessage)}${task.result.commits?.[0]?.commit ? `\n${escapeHtml(shortCommit(task.result.commits[0].commit))}` : ''}</pre></div>` : '');
 }
 
+function taskHasChat(task) {
+  return Boolean(task?.conversationId || task?.conversationUrl);
+}
+
+function renderTaskChat(task = state.activeTask) {
+  if (!task) return;
+  const hasChat = taskHasChat(task);
+  const snapshot = state.chatTaskId === task.taskId ? state.chatSnapshot : null;
+  const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
+  const runStatus = snapshot?.run?.status || task.chatStatus || 'unknown';
+  const streaming = runStatus === 'streaming';
+
+  elements['task-chat-refresh-button'].disabled = !hasChat || state.chatLoading || state.chatSending;
+  elements['task-chat-input'].disabled = !hasChat || state.chatSending || streaming;
+  elements['task-chat-send-button'].disabled = !hasChat || state.chatSending || streaming;
+  elements['task-chat-stop-button'].classList.toggle('hidden', !hasChat || !streaming);
+  elements['task-chat-stop-button'].disabled = state.chatSending;
+
+  if (!hasChat) {
+    elements['task-chat-status'].textContent = 'Submit this task to start a ChatGPT conversation.';
+  } else if (state.chatLoading) {
+    elements['task-chat-status'].textContent = 'Reading the hidden ChatGPT session…';
+  } else if (state.chatSending) {
+    elements['task-chat-status'].textContent = 'Sending through the hidden ChatGPT session…';
+  } else if (state.chatError) {
+    elements['task-chat-status'].textContent = state.chatError;
+  } else if (streaming) {
+    elements['task-chat-status'].textContent = 'ChatGPT is responding. Patchwork refreshes background tasks about every 15 seconds.';
+  } else if (runStatus === 'failed') {
+    elements['task-chat-status'].textContent = 'ChatGPT reported an error for this conversation.';
+  } else if (runStatus === 'stopped') {
+    elements['task-chat-status'].textContent = 'Generation was stopped. You can send another message.';
+  } else {
+    elements['task-chat-status'].textContent = 'Conversation mirrored from the same persistent ChatGPT browser session.';
+  }
+
+  const thinking = String(snapshot?.thinkingSummary || '').trim();
+  elements['task-chat-thinking'].classList.toggle('hidden', !thinking);
+  elements['task-chat-thinking'].textContent = thinking ? `Reasoning summary: ${thinking}` : '';
+
+  if (messages.length === 0) {
+    elements['task-chat-messages'].innerHTML = `<div class="task-chat-empty">
+      <strong>${hasChat ? (state.chatLoading ? 'Loading conversation…' : 'No messages found') : 'No conversation yet'}</strong>
+      <span>${hasChat ? 'Refresh to read the current browser transcript.' : 'After submission, Patchwork reads the hidden browser and renders the conversation here.'}</span>
+    </div>`;
+    return;
+  }
+
+  elements['task-chat-messages'].innerHTML = messages.map((message) => {
+    const role = ['user', 'assistant', 'system'].includes(message.role) ? message.role : 'assistant';
+    const label = role === 'user' ? 'You' : role === 'system' ? 'System' : 'ChatGPT';
+    return `<article class="task-chat-message ${role}" data-message-id="${escapeHtml(message.id || '')}">
+      <div class="task-chat-message-label">${label}</div>
+      <pre>${escapeHtml(message.text || '')}</pre>
+    </article>`;
+  }).join('');
+  requestAnimationFrame(() => {
+    elements['task-chat-messages'].scrollTop = elements['task-chat-messages'].scrollHeight;
+  });
+}
+
+async function refreshTaskChat(taskId = state.activeTask?.taskId) {
+  if (!taskId || state.chatLoading) return;
+  const task = state.tasks.find((item) => item.taskId === taskId) || state.activeTask;
+  if (!task || !taskHasChat(task)) {
+    if (state.activeTask?.taskId === taskId) {
+      state.chatTaskId = taskId;
+      state.chatSnapshot = null;
+      renderTaskChat(task);
+    }
+    return;
+  }
+  state.chatLoading = true;
+  state.chatError = null;
+  if (state.activeTask?.taskId === taskId) renderTaskChat(task);
+  try {
+    const result = await window.patchwork.getTaskChat(taskId);
+    if (result?.task) upsertTask(result.task);
+    if (state.activeTask?.taskId !== taskId) return;
+    state.activeTask = result.task || state.activeTask;
+    state.chatTaskId = taskId;
+    state.chatSnapshot = result.snapshot || null;
+    state.chatError = null;
+    renderTaskChat(state.activeTask);
+  } catch (error) {
+    if (state.activeTask?.taskId === taskId) state.chatError = error.message;
+  } finally {
+    state.chatLoading = false;
+    if (state.activeTask?.taskId === taskId) renderTaskChat(state.activeTask);
+  }
+}
+
+async function sendTaskChatMessage(event) {
+  event.preventDefault();
+  const task = state.activeTask;
+  const text = elements['task-chat-input'].value.trim();
+  if (!task || !taskHasChat(task) || !text || state.chatSending) return;
+  state.chatSending = true;
+  state.chatError = null;
+  renderTaskChat(task);
+  try {
+    const result = await window.patchwork.sendTaskChatMessage(task.taskId, text);
+    elements['task-chat-input'].value = '';
+    if (result?.task) upsertTask(result.task);
+    if (state.activeTask?.taskId === task.taskId) {
+      state.activeTask = result.task || state.activeTask;
+      state.chatTaskId = task.taskId;
+      state.chatSnapshot = result.snapshot || null;
+      state.chatError = null;
+    }
+  } catch (error) {
+    state.chatError = error.message;
+    showToast(error.message, true);
+  } finally {
+    state.chatSending = false;
+    if (state.activeTask?.taskId === task.taskId) renderTaskChat(state.activeTask);
+  }
+}
+
+async function stopTaskChat() {
+  const task = state.activeTask;
+  if (!task || !taskHasChat(task) || state.chatSending) return;
+  state.chatSending = true;
+  state.chatError = null;
+  renderTaskChat(task);
+  try {
+    const result = await window.patchwork.stopTaskChat(task.taskId);
+    if (result?.task) upsertTask(result.task);
+    if (state.activeTask?.taskId === task.taskId) {
+      state.activeTask = result.task || state.activeTask;
+      state.chatTaskId = task.taskId;
+      state.chatSnapshot = result.snapshot || null;
+      state.chatError = null;
+    }
+  } catch (error) {
+    state.chatError = error.message;
+    showToast(error.message, true);
+  } finally {
+    state.chatSending = false;
+    if (state.activeTask?.taskId === task.taskId) renderTaskChat(state.activeTask);
+  }
+}
+
 function showTask(task) {
   closeConflictResolutionModal();
+  const changedTask = state.chatTaskId !== task.taskId;
   state.activeTask = task;
+  if (changedTask) {
+    state.chatTaskId = task.taskId;
+    state.chatSnapshot = null;
+    state.chatError = null;
+  }
   state.activity = [];
   elements['composer-view'].classList.add('hidden');
   elements['session-view'].classList.add('hidden');
@@ -1352,8 +1504,9 @@ function showTask(task) {
   renderResult(task);
   renderTaskTargetOptions(task);
   renderTaskList();
-  window.patchwork.setBrowserVisible(true);
-  requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
+  window.patchwork.setBrowserVisible(false);
+  renderTaskChat(task);
+  if (taskHasChat(task) && !state.chatSnapshot) refreshTaskChat(task.taskId).catch(() => {});
 }
 
 function showComposer() {
@@ -1461,13 +1614,8 @@ function showTaskHistory() {
 }
 
 function syncBrowserBounds() {
-  const surface = !elements['session-view'].classList.contains('hidden')
-    ? elements['session-chatgpt-surface']
-    : !elements['task-view'].classList.contains('hidden')
-      ? elements['chatgpt-surface']
-      : null;
-  if (!surface) return;
-  const bounds = surface.getBoundingClientRect();
+  if (elements['session-view'].classList.contains('hidden')) return;
+  const bounds = elements['session-chatgpt-surface'].getBoundingClientRect();
   window.patchwork.setBrowserBounds({
     x: bounds.x,
     y: bounds.y,
@@ -1989,7 +2137,7 @@ async function createTask() {
     await refreshTrees();
     showTask(task);
     addActivity('Fresh embedded chat prepared');
-    showToast('Task package prepared. Submitting through the embedded browser…');
+    showToast('Task package prepared. Submitting through the hidden ChatGPT session…');
     setTimeout(() => runTaskAction(window.patchwork.submitTask), 700);
   } catch (error) {
     showToast(error.message, true);
@@ -2148,14 +2296,19 @@ elements['conflict-resolution-modal'].addEventListener('click', (event) => {
   if (event.target === elements['conflict-resolution-modal']) closeConflictResolutionModal();
 });
 elements['rollback-button'].addEventListener('click', () => runTaskAction(window.patchwork.rollbackTask, 'Changes rolled back.'));
-elements['new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
-elements['browser-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));
-elements['browser-back-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserBack));
-elements['browser-forward-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserForward));
 elements['session-new-chat-button'].addEventListener('click', () => runBrowserAction(window.patchwork.newChat, 'New ChatGPT chat opened.'));
 elements['session-reload-button'].addEventListener('click', () => runBrowserAction(window.patchwork.reloadBrowser));
 elements['session-back-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserBack));
 elements['session-forward-button'].addEventListener('click', () => runBrowserAction(window.patchwork.browserForward));
+elements['task-chat-form'].addEventListener('submit', sendTaskChatMessage);
+elements['task-chat-refresh-button'].addEventListener('click', () => refreshTaskChat());
+elements['task-chat-stop-button'].addEventListener('click', stopTaskChat);
+elements['task-chat-input'].addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey) {
+    event.preventDefault();
+    elements['task-chat-form'].requestSubmit();
+  }
+});
 let diffScrollSyncing = false;
 function syncDiffVerticalScroll(source, target) {
   if (diffScrollSyncing || target.scrollTop === source.scrollTop) return;
@@ -2210,7 +2363,6 @@ elements['source-commit-button'].addEventListener('click', async () => {
 
 window.addEventListener('resize', syncBrowserBounds);
 window.addEventListener('scroll', syncBrowserBounds, true);
-new ResizeObserver(syncBrowserBounds).observe(elements['chatgpt-surface']);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
 setInterval(updateTaskElapsedTimes, 1_000);
 
@@ -2220,8 +2372,14 @@ window.patchwork.onTaskEvent((event) => {
     renderTaskList();
     if (!elements['history-view'].classList.contains('hidden')) renderTaskHistory();
   }
-  if (event.task && (!state.activeTask || state.activeTask.taskId === event.task.taskId)) showTask(event.task);
-  if (event.message) addActivity(event.message);
+  if (event.task && state.activeTask?.taskId === event.task.taskId) showTask(event.task);
+  if (event.type === 'task-chat-snapshot' && state.activeTask?.taskId === event.taskId) {
+    state.chatTaskId = event.taskId;
+    state.chatSnapshot = event.snapshot || null;
+    state.chatError = null;
+    renderTaskChat(state.activeTask);
+  }
+  if (event.message && state.activeTask && (!event.taskId || event.taskId === state.activeTask.taskId)) addActivity(event.message);
   if (event.type === 'task-deleted') {
     state.tasks = state.tasks.filter((task) => task.taskId !== event.taskId);
     if (state.activeTask?.taskId === event.taskId) {
@@ -2249,13 +2407,10 @@ window.patchwork.onTaskEvent((event) => {
     showToast(event.task?.summaryOnly ? 'The Git Summary result is ready.' : 'The ChatGPT result is ready to review.');
   }
   if (event.type === 'browser-loading') {
-    elements['browser-status'].textContent = event.loading ? 'Loading…' : 'Embedded session';
-    elements['browser-status-dot'].classList.toggle('loading', event.loading);
     elements['session-browser-status'].textContent = event.loading ? 'Loading…' : 'Persistent embedded session';
     elements['session-status-dot'].classList.toggle('loading', event.loading);
   }
   if (event.type === 'browser-title' && event.title) {
-    elements['browser-title'].textContent = event.title;
     elements['session-browser-title'].textContent = event.title;
   }
   if (event.type === 'browser-login-required') showToast(event.message, true);
