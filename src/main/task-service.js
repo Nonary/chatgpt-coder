@@ -5,6 +5,7 @@ const AdmZip = require('adm-zip');
 const {
   createBundle,
   createSnapshotBundle,
+  createSubmoduleBundles,
   createWorkingSnapshotBundle,
   inspectRepository,
 } = require('./git');
@@ -89,6 +90,7 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Extrac
 4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
 6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.
+7. If a repository entry in \`manifest.json\` contains \`submodules\`, clone each listed submodule bundle into the exact \`path\` under that repository, check it out at the listed \`commit\`, and repeat recursively for nested submodules. These local bundles are the authoritative source; do not fetch submodule history from a remote.
 
 ## Inspect supplied working changes
 
@@ -366,6 +368,16 @@ class TaskService {
           await fs.rm(snapshotPath, { recursive: true, force: true });
         }
       }
+      const submoduleBundleDirectory = path.join(taskDir, 'repositories', repository.id, 'submodules');
+      const submodules = repository.hasHead
+        ? await createSubmoduleBundles(
+          repository.path,
+          taskRepository.baseCommit,
+          submoduleBundleDirectory,
+          `repositories/${repository.id}/submodules`,
+        )
+        : [];
+      taskRepository.submodules = submodules;
       taskRepository.readOnly = readOnly;
       taskRepositories.push(taskRepository);
       publicRepositories.push({
@@ -378,6 +390,7 @@ class TaskService {
         workingChanges: taskRepository.workingChanges,
         workingStatus: taskRepository.workingStatus,
         bundleFile,
+        submodules,
         readOnly,
       });
     }
@@ -413,8 +426,19 @@ class TaskService {
     zip.addLocalFile(path.join(taskDir, 'TASK.md'));
     zip.addLocalFile(path.join(taskDir, 'AGENTS.md'));
     if (input.conflictContext) zip.addLocalFile(path.join(taskDir, 'CONFLICTS.md'));
+    function addSubmoduleBundles(items) {
+      for (const submodule of items) {
+        addStoredLocalFile(
+          zip,
+          path.join(taskDir, submodule.bundleFile),
+          path.posix.dirname(submodule.bundleFile),
+        );
+        addSubmoduleBundles(submodule.submodules || []);
+      }
+    }
     for (const repository of publicRepositories) {
       addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'repositories');
+      addSubmoduleBundles(repository.submodules || []);
     }
     for (const attachment of attachments) zip.addLocalFile(attachment.path, 'attachments');
     for (const skill of taskSkills) zip.addLocalFolder(skill.path, skill.directory);

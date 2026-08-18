@@ -190,6 +190,63 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
 });
 
+test('task packages include recursively bundled Git submodules', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-submodule-package-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const dependencyPath = await createRepository(path.join(root, 'dependency-source'));
+  const nestedDependencyPath = await createRepository(path.join(root, 'nested-dependency-source'));
+  await runGit(dependencyPath, [
+    '-c', 'protocol.file.allow=always',
+    'submodule', 'add', nestedDependencyPath, 'vendor/nested-dependency',
+  ]);
+  await runGit(dependencyPath, ['commit', '-m', 'Add nested dependency submodule']);
+
+  const repositoryPath = await createRepository(path.join(root, 'superproject'));
+  await runGit(repositoryPath, [
+    '-c', 'protocol.file.allow=always',
+    'submodule', 'add', dependencyPath, 'vendor/dependency',
+  ]);
+  await runGit(repositoryPath, ['commit', '-m', 'Add dependency submodule']);
+
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Inspect the dependency.',
+    repositories: [repository],
+    autoApply: false,
+  });
+
+  const zip = new AdmZip(task.packagePath);
+  const entries = new Map(zip.getEntries().map((entry) => [entry.entryName, entry]));
+  const manifest = JSON.parse(entries.get('manifest.json').getData().toString('utf8'));
+  const submodule = manifest.repositories[0].submodules[0];
+  const { stdout: submoduleEntry } = await runGit(
+    repositoryPath,
+    ['ls-tree', '-r', 'HEAD', '--', 'vendor/dependency'],
+  );
+  assert.equal(submodule.path, 'vendor/dependency');
+  assert.equal(submodule.commit, submoduleEntry.trim().split(/\s+/)[2]);
+  assert.ok(entries.has(submodule.bundleFile));
+  assert.match(submodule.bundleFile, new RegExp(`^repositories/${repository.id}/submodules/vendor/dependency\\.bundle$`));
+  const nestedSubmodule = submodule.submodules[0];
+  const { stdout: nestedSubmoduleEntry } = await runGit(
+    dependencyPath,
+    ['ls-tree', '-r', 'HEAD', '--', 'vendor/nested-dependency'],
+  );
+  assert.equal(nestedSubmodule.path, 'vendor/nested-dependency');
+  assert.equal(nestedSubmodule.commit, nestedSubmoduleEntry.trim().split(/\s+/)[2]);
+  assert.ok(entries.has(nestedSubmodule.bundleFile));
+  assert.match(nestedSubmodule.bundleFile, /\/vendor\/dependency\/submodules\/vendor\/nested-dependency\.bundle$/);
+  const agentInstructions = entries.get('AGENTS.md').getData().toString('utf8');
+  assert.match(agentInstructions, /manifest\.json.*submodules/i);
+  assert.match(agentInstructions, /do not fetch submodule history from a remote/i);
+
+  const extractedBundle = path.join(root, 'dependency.bundle');
+  await fs.writeFile(extractedBundle, entries.get(submodule.bundleFile).getData());
+  await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
+});
+
 test('task packages preserve multiple writable repositories', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

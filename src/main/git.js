@@ -38,6 +38,161 @@ function slugify(value) {
   return slug || 'repository';
 }
 
+function gitContextOptions(context) {
+  if (!context.env) return {};
+  return {
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      ...context.env,
+    },
+  };
+}
+
+async function runGitContext(context, args) {
+  return runGit(context.cwd, args, gitContextOptions(context));
+}
+
+async function resolveGitDirPath(repositoryPath) {
+  const { stdout } = await runGit(repositoryPath, ['rev-parse', '--git-dir']);
+  return path.resolve(repositoryPath, stdout.trim());
+}
+
+async function repositoryGitContext(repositoryPath) {
+  return {
+    cwd: repositoryPath,
+    gitDirPath: await resolveGitDirPath(repositoryPath),
+    worktreePath: repositoryPath,
+    env: null,
+  };
+}
+
+function gitDirContext(gitDirPath) {
+  return {
+    cwd: gitDirPath,
+    gitDirPath,
+    worktreePath: null,
+    env: { GIT_DIR: gitDirPath },
+  };
+}
+
+function validateSubmodulePath(relativePath) {
+  if (
+    !relativePath
+    || relativePath.startsWith('/')
+    || relativePath.includes('\\')
+    || relativePath.split('/').some((segment) => !segment || segment === '.' || segment === '..')
+  ) {
+    throw new Error(`Unsupported submodule path: ${relativePath}`);
+  }
+  return relativePath;
+}
+
+function parseGitlinkEntries(output) {
+  return output
+    .split('\0')
+    .filter(Boolean)
+    .flatMap((entry) => {
+      const separator = entry.indexOf('\t');
+      if (separator < 0) return [];
+      const [mode, type, commit] = entry.slice(0, separator).split(' ');
+      if (mode !== '160000' || type !== 'commit' || !commit) return [];
+      const submodulePath = validateSubmodulePath(entry.slice(separator + 1));
+      return [{ path: submodulePath, commit }];
+    });
+}
+
+async function listGitlinkEntries(context, revision) {
+  const { stdout } = await runGitContext(context, ['ls-tree', '-r', '-z', revision, '--']);
+  return parseGitlinkEntries(stdout);
+}
+
+async function currentHead(context) {
+  try {
+    const { stdout } = await runGitContext(context, ['rev-parse', '--verify', 'HEAD']);
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+async function resolveSubmoduleContext(parentContext, relativePath) {
+  const segments = validateSubmodulePath(relativePath).split('/');
+  if (parentContext.worktreePath) {
+    const submodulePath = path.join(parentContext.worktreePath, ...segments);
+    try {
+      const realSubmodulePath = await fs.realpath(submodulePath);
+      const { stdout } = await runGit(realSubmodulePath, ['rev-parse', '--show-toplevel']);
+      const submoduleRoot = await fs.realpath(stdout.trim());
+      if (submoduleRoot === realSubmodulePath) {
+        return await repositoryGitContext(realSubmodulePath);
+      }
+    } catch {
+      // Fall through to Git's module object database for uninitialized submodules.
+    }
+  }
+
+  const { stdout: gitPathOutput } = await runGitContext(parentContext, [
+    'rev-parse', '--git-path', `modules/${relativePath}`,
+  ]);
+  const gitDirPath = path.resolve(parentContext.cwd, gitPathOutput.trim());
+  try {
+    await fs.access(path.join(gitDirPath, 'HEAD'));
+  } catch {
+    throw new Error(
+      `Submodule ${relativePath} is not initialized and its local Git object database is unavailable. `
+      + 'Initialize the submodule before creating a Patchwork task package.',
+    );
+  }
+  return gitDirContext(gitDirPath);
+}
+
+async function createBundleFromContext(context, outputPath, revisions = ['HEAD']) {
+  const args = ['bundle', 'create', outputPath, ...revisions];
+  await runGitContext(context, args);
+  await runGitContext(context, ['bundle', 'verify', outputPath]);
+}
+
+async function createSubmoduleBundles(repositoryPath, revision, localRoot, archiveRoot) {
+  const rootContext = await repositoryGitContext(repositoryPath);
+
+  async function visit(parentContext, parentRevision, parentLocalRoot, parentArchiveRoot) {
+    const submodules = await listGitlinkEntries(parentContext, parentRevision);
+    const results = [];
+    for (const submodule of submodules) {
+      const childContext = await resolveSubmoduleContext(parentContext, submodule.path);
+      const childHead = await currentHead(childContext);
+      const revisions = childHead && childHead === submodule.commit
+        ? ['HEAD']
+        : childHead
+          ? ['HEAD', submodule.commit]
+          : [submodule.commit];
+      const localBundlePath = path.join(parentLocalRoot, `${submodule.path}.bundle`);
+      const bundleFile = path.posix.join(parentArchiveRoot, `${submodule.path}.bundle`);
+      await fs.mkdir(path.dirname(localBundlePath), { recursive: true });
+      await createBundleFromContext(childContext, localBundlePath, revisions);
+
+      const nestedLocalRoot = path.join(parentLocalRoot, submodule.path, 'submodules');
+      const nestedArchiveRoot = path.posix.join(parentArchiveRoot, submodule.path, 'submodules');
+      const nestedSubmodules = await visit(
+        childContext,
+        submodule.commit,
+        nestedLocalRoot,
+        nestedArchiveRoot,
+      );
+      results.push({
+        path: submodule.path,
+        commit: submodule.commit,
+        bundleFile,
+        submodules: nestedSubmodules,
+      });
+    }
+    return results;
+  }
+
+  return visit(rootContext, revision, localRoot, archiveRoot);
+}
+
 async function inspectRepository(selectedPath) {
   const candidate = await fs.realpath(selectedPath);
   const { stdout: rootOutput } = await runGit(candidate, ['rev-parse', '--show-toplevel']);
@@ -275,5 +430,6 @@ module.exports = {
   listSnapshotPaths,
   runGit,
   slugify,
+  createSubmoduleBundles,
   verifyHead,
 };
