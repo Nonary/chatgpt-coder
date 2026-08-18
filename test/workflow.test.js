@@ -1753,6 +1753,7 @@ test('native Patchwork chat surfaces stream transcript responses and preserve mo
   ]);
   assert.match(renderer, /message\?\.text \?\? message\?\.content/);
   assert.doesNotMatch(renderer, /refreshStreamingChats/);
+  assert.match(renderer, /container\.replaceChildren\(\.\.\.next\)/);
   assert.match(renderer, /sendTaskChatMessage\(task\.taskId, text, configuration\)/);
   assert.match(renderer, /sendSessionChatMessage\(text, \{/);
   assert.match(markup, /id="session-chat-model-select"/);

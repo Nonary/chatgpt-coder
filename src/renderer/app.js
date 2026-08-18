@@ -1352,22 +1352,46 @@ function normalizedChatMessageText(message) {
 function renderChatTranscript(container, snapshot, prefix, emptyTitle, emptyCopy) {
   const messages = Array.isArray(snapshot?.messages) ? snapshot.messages : [];
   if (messages.length === 0) {
-    container.innerHTML = `<div class="${prefix}-empty">
-      <strong>${escapeHtml(emptyTitle)}</strong>
-      <span>${escapeHtml(emptyCopy)}</span>
-    </div>`;
+    const existingEmpty = container.querySelector(`.${prefix}-empty`);
+    if (!existingEmpty || container.children.length !== 1) {
+      container.innerHTML = `<div class="${prefix}-empty">
+        <strong>${escapeHtml(emptyTitle)}</strong>
+        <span>${escapeHtml(emptyCopy)}</span>
+      </div>`;
+    } else {
+      existingEmpty.querySelector('strong').textContent = emptyTitle;
+      existingEmpty.querySelector('span').textContent = emptyCopy;
+    }
     return;
   }
-  container.innerHTML = messages.map((message) => {
+  const existing = new Map([...container.querySelectorAll(`article.${prefix}-message`)]
+    .map((article) => [article.dataset.messageId, article]));
+  const next = [];
+  messages.forEach((message, index) => {
     const role = ['user', 'assistant', 'system'].includes(message?.role) ? message.role : 'assistant';
     const label = role === 'user' ? 'You' : role === 'system' ? 'System' : 'ChatGPT';
     const text = normalizedChatMessageText(message);
-    if (!text) return '';
-    return `<article class="${prefix}-message ${role}" data-message-id="${escapeHtml(message.id || '')}">
-      <div class="${prefix}-message-label">${label}</div>
-      <pre>${escapeHtml(text)}</pre>
-    </article>`;
-  }).join('');
+    if (!text) return;
+    const messageId = String(message?.id || `${role}-${index}`);
+    const article = existing.get(messageId) || document.createElement('article');
+    article.className = `${prefix}-message ${role}`;
+    article.dataset.messageId = messageId;
+    let labelNode = article.querySelector(`.${prefix}-message-label`);
+    if (!labelNode) {
+      labelNode = document.createElement('div');
+      article.appendChild(labelNode);
+    }
+    labelNode.className = `${prefix}-message-label`;
+    labelNode.textContent = label;
+    let textNode = article.querySelector('pre');
+    if (!textNode) {
+      textNode = document.createElement('pre');
+      article.appendChild(textNode);
+    }
+    textNode.textContent = text;
+    next.push(article);
+  });
+  container.replaceChildren(...next);
   requestAnimationFrame(() => {
     container.scrollTop = container.scrollHeight;
   });
