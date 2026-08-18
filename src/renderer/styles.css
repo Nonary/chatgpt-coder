@@ -99,6 +99,36 @@ button:disabled { opacity: .5; cursor: wait; transform: none !important; }
 .repo-state.dirty { color: var(--warning); }
 .remove-repo { border: 0; background: transparent; color: #747b6e; font-size: 16px; }
 
+.repository-picker-backdrop { align-items: center; justify-content: center; padding: 24px; }
+.repository-picker-modal { width: min(760px, 100%); max-height: min(760px, calc(100vh - 48px)); display: flex; flex-direction: column; overflow: hidden; padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: #141712; box-shadow: 0 24px 80px rgba(0,0,0,.46); }
+.repository-picker-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.repository-picker-header .eyebrow { margin-bottom: 6px; }
+.repository-picker-copy { margin: 14px 0 16px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.repository-picker-toolbar { flex: 0 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.repository-picker-list { flex: 1 1 auto; min-height: 160px; overflow-y: auto; margin-top: 12px; padding-right: 3px; }
+.repository-picker-section + .repository-picker-section { margin-top: 18px; }
+.repository-picker-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; color: #7c8474; font-size: 9px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.repository-picker-section-heading span { color: #61695b; font-weight: 700; letter-spacing: 0; }
+.repository-picker-option { width: 100%; display: grid; grid-template-columns: 20px 32px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--line-soft); border-radius: 10px; background: #11140f; color: var(--text); text-align: left; }
+.repository-picker-option + .repository-picker-option { margin-top: 6px; }
+.repository-picker-option:hover:not(:disabled), .repository-picker-option.selected { border-color: #4a533e; background: #1a1f16; }
+.repository-picker-option:disabled { cursor: default; opacity: .45; }
+.repository-picker-check { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid #4a5241; border-radius: 5px; background: #1a1e17; color: var(--accent); font-size: 10px; font-weight: 900; }
+.repository-picker-option.selected .repository-picker-check { border-color: var(--accent); background: #29311e; }
+.repository-picker-option .repo-icon { width: 32px; height: 32px; }
+.repository-picker-copy-block { min-width: 0; }
+.repository-picker-copy-block strong, .repository-picker-copy-block small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repository-picker-copy-block strong { font-size: 11px; }
+.repository-picker-copy-block small { margin-top: 4px; color: #72796b; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.repository-picker-meta { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #737b6d; font-size: 9px; text-align: right; }
+.repository-picker-option.unavailable .repository-picker-meta { color: var(--warning); }
+.repository-picker-empty { min-height: 180px; display: grid; place-items: center; align-content: center; gap: 7px; padding: 22px; border: 1px dashed #373d31; border-radius: 11px; color: #747b6e; text-align: center; }
+.repository-picker-empty strong { color: #c7cdbf; font-size: 11px; }
+.repository-picker-empty span { max-width: 420px; font-size: 9px; line-height: 1.5; }
+.repository-picker-footer { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+.repository-picker-footer .field-help { margin: 0; }
+.repository-picker-actions { display: flex; gap: 7px; }
+
 textarea { width: 100%; resize: vertical; padding: 15px; color: var(--text); background: #11140f; border: 1px solid #343a2f; border-radius: 11px; line-height: 1.55; outline: none; }
 textarea:focus { border-color: #77895a; box-shadow: 0 0 0 3px rgba(200, 243, 106, .08); }
 textarea::placeholder { color: #606659; }
@@ -503,6 +533,11 @@ textarea::placeholder { color: #606659; }
   .conflict-resolution-fields { grid-template-columns: minmax(0, 1fr); }
   .conflict-resolution-footer { align-items: stretch; flex-direction: column; }
   .conflict-resolution-actions { justify-content: flex-end; }
+  .repository-picker-backdrop { padding: 12px; }
+  .repository-picker-modal { max-height: calc(100vh - 24px); padding: 18px; }
+  .repository-picker-toolbar { grid-template-columns: minmax(0, 1fr); }
+  .repository-picker-footer { align-items: stretch; flex-direction: column; }
+  .repository-picker-actions { justify-content: flex-end; }
 }
 /* Coding-tree task history controls retained across the UX merge. */
 .task-list-more { border: 0; border-top: 1px solid var(--line-soft); background: transparent; color: #8e9686; padding: 10px; text-align: left; font-size: 10px; font-weight: 750; }

@@ -237,15 +237,15 @@
               <div class="card-heading">
                 <div>
                   <span class="step-number">2</span>
-                  <h2>Choose a repository</h2>
+                  <h2>Choose repositories</h2>
                 </div>
-                <button id="add-repository-button" class="secondary">Add repository</button>
+                <button id="add-repository-button" class="secondary">Choose repositories</button>
               </div>
-              <p class="card-copy">Current-working-change tasks use the selected repository as it is now, including uncommitted changes. New coding trees require one clean repository.</p>
+              <p class="card-copy">Current-working-change tasks can include one or more repositories, including their uncommitted changes. New coding trees still require one clean repository.</p>
               <div id="repository-list" class="repository-list empty-state">
                 <div class="empty-icon">⌘</div>
-                <strong>No repository selected</strong>
-                <span>Add one Git repository to begin.</span>
+                <strong>No repositories selected</strong>
+                <span>Choose existing repositories or browse for one to begin.</span>
               </div>
             </article>
 
@@ -524,6 +524,32 @@
             </form>
             <div id="prompt-manager-list" class="prompt-manager-list"></div>
           </aside>
+        </div>
+
+        <div id="repository-picker-modal" class="modal-backdrop repository-picker-backdrop hidden">
+          <section class="repository-picker-modal" role="dialog" aria-modal="true" aria-labelledby="repository-picker-title">
+            <header class="repository-picker-header">
+              <div>
+                <p class="eyebrow">TASK REPOSITORIES</p>
+                <h2 id="repository-picker-title">Choose repositories</h2>
+              </div>
+              <button id="repository-picker-close-button" class="icon-button" type="button" aria-label="Close repository picker">×</button>
+            </header>
+            <p class="repository-picker-copy">Pick one or more repositories already in your Patchwork workspace, or find a repository used by an earlier task. You can also browse for a new repository.</p>
+            <div class="repository-picker-toolbar">
+              <label class="sr-only" for="repository-picker-search">Search repositories</label>
+              <input id="repository-picker-search" class="field-control" type="search" placeholder="Search by repository name or path" autocomplete="off" />
+              <button id="repository-picker-browse-button" class="secondary" type="button">Browse…</button>
+            </div>
+            <div id="repository-picker-list" class="repository-picker-list"></div>
+            <footer class="repository-picker-footer">
+              <span id="repository-picker-status" class="field-help">No repositories selected.</span>
+              <div class="repository-picker-actions">
+                <button id="repository-picker-cancel-button" class="secondary" type="button">Cancel</button>
+                <button id="repository-picker-apply-button" class="primary" type="button">Use selected repositories</button>
+              </div>
+            </footer>
+          </section>
         </div>
 
         <div id="conflict-resolution-modal" class="modal-backdrop conflict-resolution-backdrop hidden">

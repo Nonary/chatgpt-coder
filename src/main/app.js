@@ -111,8 +111,8 @@ async function attachChatGPTView() {
 function registerIpc() {
   ipcMain.handle('repositories:choose', async () => {
     const response = await dialog.showOpenDialog(mainWindow, {
-      title: 'Choose a Git repository',
-      properties: ['openDirectory'],
+      title: 'Choose Git repositories',
+      properties: ['openDirectory', 'multiSelections'],
     });
     if (response.canceled) return [];
     return gitService.addRepositories(response.filePaths);
@@ -138,6 +138,10 @@ function registerIpc() {
   });
 
   ipcMain.handle('workspace:list', async () => gitService.listRepositories());
+  ipcMain.handle('workspace:add', async (_event, repositoryPaths) => {
+    if (!Array.isArray(repositoryPaths) || repositoryPaths.length === 0) return [];
+    return gitService.addRepositories(repositoryPaths);
+  });
   ipcMain.handle('workspace:remove', async (_event, repositoryPath) => gitService.removeRepository(repositoryPath));
   ipcMain.handle('git:status', async (_event, repositoryPath) => gitService.status(repositoryPath));
   ipcMain.handle('git:stage', async (_event, repositoryPath, files) => gitService.stage(repositoryPath, files));

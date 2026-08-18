@@ -1,6 +1,8 @@
 const state = {
   repositories: [],
   workspaceRepositories: [],
+  repositoryPickerSearch: '',
+  repositoryPickerPaths: new Set(),
   tasks: [],
   trees: [],
   activeTask: null,
@@ -26,6 +28,7 @@ const state = {
 const TASK_MODEL_STORAGE_KEY = 'patchwork.task-model';
 const TASK_REASONING_STORAGE_KEY = 'patchwork.task-reasoning';
 const TASK_TREE_STORAGE_KEY = 'patchwork.task-tree';
+const TASK_REPOSITORIES_STORAGE_KEY = 'patchwork.task-repositories';
 const TASK_PROJECT_STORAGE_KEY = 'patchwork.task-project';
 const PROMPT_LIBRARY_STORAGE_KEY = 'patchwork.prompt-library';
 const TASK_NEW_TREE_VALUE = '__new__';
@@ -40,6 +43,9 @@ const elements = Object.fromEntries(
     'history-view', 'task-history-button', 'task-history-count', 'task-history-list',
     'task-history-search', 'task-history-state',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
+    'repository-picker-modal', 'repository-picker-title', 'repository-picker-close-button', 'repository-picker-cancel-button',
+    'repository-picker-search', 'repository-picker-browse-button', 'repository-picker-list', 'repository-picker-status',
+    'repository-picker-apply-button',
     'add-attachment-button', 'attachment-list', 'configure-skills-button', 'skill-selection-label', 'skill-selection-summary',
     'skills-modal', 'skills-close-button', 'skills-refresh-button', 'skills-search', 'skills-list', 'skills-selection-status', 'skills-done-button',
     'prompt-library-trigger', 'prompt-library-trigger-label', 'prompt-selection-summary', 'prompt-library-menu',
@@ -463,6 +469,173 @@ function buildTaskTextWithPrompts(baseTaskText) {
   return `${baseTaskText}\n\nAdditional instructions from the prompt library:\n\n${additions}`;
 }
 
+function selectedRepositoryPaths() {
+  return state.repositories.map((repository) => repository.path).filter(Boolean);
+}
+
+function persistTaskRepositorySelection() {
+  try {
+    localStorage.setItem(TASK_REPOSITORIES_STORAGE_KEY, JSON.stringify(selectedRepositoryPaths()));
+  } catch {
+    // Local storage may be unavailable in restricted renderer contexts.
+  }
+}
+
+function restoreTaskRepositorySelection() {
+  const workspaceByPath = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
+  try {
+    const raw = localStorage.getItem(TASK_REPOSITORIES_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    const paths = Array.isArray(parsed) ? parsed.map((item) => String(item || '')).filter(Boolean) : [];
+    const restored = paths
+      .map((repositoryPath) => workspaceByPath.get(repositoryPath))
+      .filter((repository) => repository && !repository.unavailable);
+    state.repositories = restored.length
+      ? restored
+      : state.workspaceRepositories.filter((repository) => !repository.unavailable).slice(0, 1);
+  } catch {
+    state.repositories = state.workspaceRepositories.filter((repository) => !repository.unavailable).slice(0, 1);
+  }
+  persistTaskRepositorySelection();
+}
+
+function repositoryPickerCandidates() {
+  const workspacePaths = new Set(state.workspaceRepositories.map((repository) => repository.path));
+  const workspace = state.workspaceRepositories.map((repository) => ({
+    ...repository,
+    source: 'workspace',
+    lastUsedAt: null,
+    lastTaskTitle: null,
+  }));
+  const historyByPath = new Map();
+  for (const task of state.tasks) {
+    if (task.treeId) continue;
+    for (const repository of task.repositories || []) {
+      if (!repository?.path || workspacePaths.has(repository.path)) continue;
+      const previous = historyByPath.get(repository.path);
+      if (!previous || String(task.createdAt || '') > String(previous.lastUsedAt || '')) {
+        historyByPath.set(repository.path, {
+          ...repository,
+          source: 'history',
+          lastUsedAt: task.createdAt || null,
+          lastTaskTitle: task.conversationTitle || task.taskText || null,
+        });
+      }
+    }
+  }
+  const history = [...historyByPath.values()].sort((left, right) => (
+    String(right.lastUsedAt || '').localeCompare(String(left.lastUsedAt || ''))
+  ));
+  return { workspace, history };
+}
+
+function toggleRepositoryPickerPath(repositoryPath) {
+  if (state.repositoryPickerPaths.has(repositoryPath)) state.repositoryPickerPaths.delete(repositoryPath);
+  else state.repositoryPickerPaths.add(repositoryPath);
+  renderRepositoryPicker();
+}
+
+function renderRepositoryPicker() {
+  const container = elements['repository-picker-list'];
+  const query = state.repositoryPickerSearch.trim().toLowerCase();
+  const { workspace, history } = repositoryPickerCandidates();
+  const matches = (repository) => {
+    if (!query) return true;
+    return [
+      repository.name,
+      repository.path,
+      repository.branch,
+      repository.lastTaskTitle,
+    ].filter(Boolean).join(' ').toLowerCase().includes(query);
+  };
+
+  const sections = [
+    { title: 'In your workspace', repositories: workspace.filter(matches) },
+    { title: 'From task history', repositories: history.filter(matches) },
+  ].filter((section) => section.repositories.length > 0);
+
+  if (sections.length === 0) {
+    container.innerHTML = `<div class="repository-picker-empty">
+      <div class="empty-icon">⌕</div>
+      <strong>${query ? 'No repositories match that search' : 'No saved repositories yet'}</strong>
+      <span>${query ? 'Try another repository name or path, or browse for a repository.' : 'Browse for a Git repository to add it to your workspace and use it in future tasks.'}</span>
+    </div>`;
+  } else {
+    container.innerHTML = sections.map((section) => `
+      <section class="repository-picker-section">
+        <div class="repository-picker-section-heading"><span>${escapeHtml(section.title)}</span><span>${section.repositories.length}</span></div>
+        ${section.repositories.map((repository) => {
+          const selected = state.repositoryPickerPaths.has(repository.path);
+          const unavailable = repository.unavailable === true;
+          const meta = repository.source === 'history'
+            ? `Used ${repository.lastUsedAt ? escapeHtml(formatDateTime(repository.lastUsedAt)) : 'in a previous task'}`
+            : (unavailable ? 'Unavailable' : (repository.branch || '(detached HEAD)'));
+          return `<button class="repository-picker-option${selected ? ' selected' : ''}${unavailable ? ' unavailable' : ''}" type="button" data-repository-path="${escapeHtml(repository.path)}" ${unavailable ? 'disabled' : ''} aria-pressed="${selected}">
+            <span class="repository-picker-check" aria-hidden="true">${selected ? '✓' : ''}</span>
+            <span class="repo-icon" aria-hidden="true">${escapeHtml(repository.name?.[0]?.toUpperCase() || 'G')}</span>
+            <span class="repository-picker-copy-block" title="${escapeHtml(repository.path)}"><strong>${escapeHtml(repository.name || repository.path)}</strong><small>${escapeHtml(repository.path)}</small></span>
+            <span class="repository-picker-meta">${meta}</span>
+          </button>`;
+        }).join('')}
+      </section>`).join('');
+    container.querySelectorAll('.repository-picker-option').forEach((button) => button.addEventListener('click', () => {
+      toggleRepositoryPickerPath(button.dataset.repositoryPath);
+    }));
+  }
+
+  const count = state.repositoryPickerPaths.size;
+  elements['repository-picker-status'].textContent = count
+    ? `${count} ${count === 1 ? 'repository' : 'repositories'} selected.`
+    : 'No repositories selected.';
+  elements['repository-picker-apply-button'].disabled = count === 0;
+}
+
+function openRepositoryPicker() {
+  state.repositoryPickerSearch = '';
+  elements['repository-picker-search'].value = '';
+  state.repositoryPickerPaths = new Set(selectedRepositoryPaths());
+  renderRepositoryPicker();
+  elements['repository-picker-modal'].classList.remove('hidden');
+  requestAnimationFrame(() => elements['repository-picker-search'].focus());
+}
+
+function closeRepositoryPicker() {
+  elements['repository-picker-modal'].classList.add('hidden');
+  state.repositoryPickerSearch = '';
+  state.repositoryPickerPaths = new Set();
+}
+
+async function useSelectedRepositories() {
+  const selectedPaths = [...state.repositoryPickerPaths];
+  if (selectedPaths.length === 0) return;
+  const button = elements['repository-picker-apply-button'];
+  button.disabled = true;
+  try {
+    const workspacePaths = new Set(state.workspaceRepositories.map((repository) => repository.path));
+    const historicalPaths = selectedPaths.filter((repositoryPath) => !workspacePaths.has(repositoryPath));
+    if (historicalPaths.length > 0) {
+      await window.patchwork.addWorkspaceRepositories(historicalPaths);
+      state.workspaceRepositories = await window.patchwork.listWorkspaceRepositories();
+    }
+    const workspaceByPath = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
+    const selectedRepositories = selectedPaths.map((repositoryPath) => workspaceByPath.get(repositoryPath));
+    if (selectedRepositories.some((repository) => !repository || repository.unavailable)) {
+      throw new Error('One or more selected repositories are no longer available. Browse for them again and retry.');
+    }
+    state.repositories = selectedRepositories;
+    persistTaskRepositorySelection();
+    resetTaskSkills();
+    renderRepositories();
+    renderTaskTreeOptions();
+    closeRepositoryPicker();
+  } catch (error) {
+    showToast(error.message, true);
+    renderRepositoryPicker();
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function persistTaskTreeSelectionValue(value) {
   try {
     localStorage.setItem(TASK_TREE_STORAGE_KEY, value);
@@ -536,6 +709,9 @@ function renderRepositories() {
   const container = elements['repository-list'];
   const selectedTree = state.trees.find((tree) => tree.id === elements['task-tree-select'].value);
   elements['add-repository-button'].disabled = Boolean(selectedTree);
+  elements['add-repository-button'].textContent = state.repositories.length
+    ? `Choose repositories · ${state.repositories.length} selected`
+    : 'Choose repositories';
   if (selectedTree) {
     container.className = 'repository-list';
     container.innerHTML = `<div class="repository-row">
@@ -548,7 +724,7 @@ function renderRepositories() {
   }
   if (state.repositories.length === 0) {
     container.className = 'repository-list empty-state';
-    container.innerHTML = '<div class="empty-icon">⌘</div><strong>No repository selected</strong><span>Add one Git repository to begin.</span>';
+    container.innerHTML = '<div class="empty-icon">⌘</div><strong>No repositories selected</strong><span>Choose existing repositories or browse for one to begin.</span>';
     return;
   }
   container.className = 'repository-list';
@@ -563,8 +739,10 @@ function renderRepositories() {
   container.querySelectorAll('.remove-repo').forEach((button) => {
     button.addEventListener('click', () => {
       state.repositories = state.repositories.filter((item) => item.id !== button.dataset.repositoryId);
+      persistTaskRepositorySelection();
       resetTaskSkills();
       renderRepositories();
+      renderTaskTreeOptions();
     });
   });
 }
@@ -818,11 +996,16 @@ async function refreshChatGPTProjects(showErrors = false) {
 function renderTaskTreeOptions() {
   const select = elements['task-tree-select'];
   const previous = select.value;
-  select.innerHTML = '<option value="">Use current working changes</option><option value="__new__">Create a new coding tree</option>' + state.trees
+  const canCreateTree = state.repositories.length === 1;
+  const treeOption = `<option value="__new__"${canCreateTree ? '' : ' disabled'}>${canCreateTree ? 'Create a new coding tree' : 'Create a new coding tree · choose one repository'}</option>`;
+  select.innerHTML = '<option value="">Use current working changes</option>' + treeOption + state.trees
     .filter((tree) => tree.available && tree.mergeState !== 'submitted')
     .map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}${tree.managed === false ? ' · Git worktree' : ''}</option>`)
     .join('');
-  if ([...select.options].some((option) => option.value === previous)) {
+  if (previous === TASK_NEW_TREE_VALUE && !canCreateTree) {
+    select.value = '';
+    persistTaskTreeSelectionValue('');
+  } else if ([...select.options].some((option) => option.value === previous)) {
     select.value = previous;
   } else {
     select.value = '';
@@ -1462,16 +1645,16 @@ function syncBrowserBounds() {
   });
 }
 
-async function chooseRepositories() {
+async function browseRepositories(selectInTask = false) {
   try {
     const repositories = await window.patchwork.chooseRepositories();
-    if (repositories[0]) {
-      state.repositories = [repositories[0]];
-      resetTaskSkills();
-    }
     const workspace = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
     repositories.forEach((repository) => workspace.set(repository.path, repository));
     state.workspaceRepositories = [...workspace.values()];
+    if (selectInTask) {
+      for (const repository of repositories) state.repositoryPickerPaths.add(repository.path);
+      renderRepositoryPicker();
+    }
     renderRepositories();
     renderSourceRepositories();
     return repositories;
@@ -2081,8 +2264,19 @@ elements['trees-project-select'].addEventListener('change', (event) => {
   renderChatGPTProjects();
 });
 elements['trees-refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
-elements['add-repository-button'].addEventListener('click', chooseRepositories);
+elements['add-repository-button'].addEventListener('click', openRepositoryPicker);
 elements['add-attachment-button'].addEventListener('click', chooseAttachments);
+elements['repository-picker-search'].addEventListener('input', (event) => {
+  state.repositoryPickerSearch = event.target.value;
+  renderRepositoryPicker();
+});
+elements['repository-picker-browse-button'].addEventListener('click', () => browseRepositories(true));
+elements['repository-picker-apply-button'].addEventListener('click', useSelectedRepositories);
+elements['repository-picker-cancel-button'].addEventListener('click', closeRepositoryPicker);
+elements['repository-picker-close-button'].addEventListener('click', closeRepositoryPicker);
+elements['repository-picker-modal'].addEventListener('click', (event) => {
+  if (event.target === elements['repository-picker-modal']) closeRepositoryPicker();
+});
 elements['configure-skills-button'].addEventListener('click', openSkillDrawer);
 elements['skills-close-button'].addEventListener('click', closeSkillDrawer);
 elements['skills-done-button'].addEventListener('click', closeSkillDrawer);
@@ -2106,6 +2300,7 @@ elements['diff-tab-context-menu'].querySelectorAll('[data-action]').forEach((but
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !elements['skills-modal'].classList.contains('hidden')) closeSkillDrawer();
   if (event.key === 'Escape' && !elements['prompt-library-modal'].classList.contains('hidden')) closePromptManager();
+  if (event.key === 'Escape' && !elements['repository-picker-modal'].classList.contains('hidden')) closeRepositoryPicker();
   if (event.key === 'Escape' && !elements['prompt-library-menu'].classList.contains('hidden')) closePromptLibraryMenu();
   if (event.key === 'Escape' && !elements['conflict-resolution-modal'].classList.contains('hidden')) closeConflictResolutionModal();
   if (event.key === 'Escape' && !elements['diff-tab-context-menu'].classList.contains('hidden')) closeDiffTabContextMenu();
@@ -2171,7 +2366,7 @@ elements['diff-after-rows'].addEventListener('scroll', () => syncDiffVerticalScr
 elements['source-repository-select'].addEventListener('change', (event) => loadGitStatus(event.target.value));
 elements['source-refresh'].addEventListener('click', () => loadGitStatus(state.selectedGitPath));
 elements['source-add-repository'].addEventListener('click', async () => {
-  const added = await chooseRepositories();
+  const added = await browseRepositories(false);
   renderSourceRepositories();
   if (added[0]) await loadGitStatus(added[0].path);
 });
@@ -2180,6 +2375,7 @@ elements['source-remove-repository'].addEventListener('click', async () => {
   try {
     state.workspaceRepositories = await window.patchwork.removeWorkspaceRepository(state.selectedGitPath);
     state.repositories = state.repositories.filter((item) => item.path !== state.selectedGitPath);
+    persistTaskRepositorySelection();
     state.selectedGitPath = null;
     state.gitStatus = null;
     resetGitDiffTabs();
@@ -2221,7 +2417,9 @@ window.patchwork.onTaskEvent((event) => {
     renderTaskList();
     if (!elements['history-view'].classList.contains('hidden')) renderTaskHistory();
   }
-  if (event.task && (!state.activeTask || state.activeTask.taskId === event.task.taskId)) showTask(event.task);
+  if (event.task
+    && !elements['task-view'].classList.contains('hidden')
+    && state.activeTask?.taskId === event.task.taskId) showTask(event.task);
   if (event.message) addActivity(event.message);
   if (event.type === 'task-deleted') {
     state.tasks = state.tasks.filter((task) => task.taskId !== event.taskId);
@@ -2285,7 +2483,8 @@ async function initialize() {
     state.tasks = tasks;
     state.trees = trees;
     state.workspaceRepositories = repositories;
-    state.repositories = repositories.filter((repository) => !repository.unavailable).slice(0, 1);
+    state.repositories = [];
+    restoreTaskRepositorySelection();
     restoreTaskModelSelection();
     restoreTaskReasoningSelection();
     restoreTaskProjectSelection();

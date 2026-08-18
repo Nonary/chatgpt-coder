@@ -160,6 +160,18 @@ test('Source Control summaries prepare a normal Luna Medium task and reuse stand
   assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
 });
 
+test('background task events update task history without opening an inactive task view', async () => {
+  const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
+  const eventHandlerStart = renderer.indexOf('window.patchwork.onTaskEvent((event) => {');
+  const eventHandlerEnd = renderer.indexOf('\n});', eventHandlerStart);
+  assert.ok(eventHandlerStart >= 0);
+  assert.ok(eventHandlerEnd > eventHandlerStart);
+  const eventHandler = renderer.slice(eventHandlerStart, eventHandlerEnd);
+
+  assert.match(eventHandler, /if \(event\.task\n\s*&& !elements\['task-view'\]\.classList\.contains\('hidden'\)\n\s*&& state\.activeTask\?\.taskId === event\.task\.taskId\) showTask\(event\.task\);/);
+  assert.doesNotMatch(eventHandler, /if \(event\.task && \(!state\.activeTask \|\| state\.activeTask\.taskId === event\.task\.taskId\)\) showTask\(event\.task\);/);
+});
+
 test('outbound task packages are ZIP archives containing real Git bundles', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
