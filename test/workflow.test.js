@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
-const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
+const { EventEmitter } = require('node:events');
 const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -9,23 +9,18 @@ const AdmZip = require('adm-zip');
 const {
   CHATGPT_URL,
   ChatGPTView,
-  buildConversationStatusScript,
-  buildTaskConfigurationScript,
-  buildLimitNoticeDismissalScript,
-  buildPackageAttachmentStatusScript,
-  buildMergeResultDetectionScript,
-  buildTaskResultDetectionScript,
   conversationIdFromRouteUrl,
-  conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
-  isDismissibleLimitNotice,
-  normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
-  rewriteConversationRequestBody,
-  taskRequestConfiguration,
   mergeTreeId,
   resultTaskId,
 } = require('../src/main/chatgpt-view');
+const {
+  ChatGPTBrowserAIChatService,
+  normalizeConfiguration,
+  providerRequestConfiguration,
+} = require('../src/main/chatgpt-browser-ai-chat-service');
+const { ChatGPTBrowserDriver } = require('../src/main/chatgpt-browser-driver');
 const { fingerprintRepository, runGit } = require('../src/main/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/main/git-service');
 const { ResultService, parsePlainTextResult } = require('../src/main/result-service');
@@ -805,7 +800,7 @@ test('result downloads match ChatGPT filenames including duplicate suffixes', ()
 });
 
 test('opening a task loads its saved ChatGPT conversation', async () => {
-  const loaded = [];
+  const opened = [];
   const events = [];
   const task = {
     taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
@@ -813,7 +808,7 @@ test('opening a task loads its saved ChatGPT conversation', async () => {
     conversationUrl: 'https://chatgpt.com/c/6a80f4cf-1650-83ea-8609-adb411b3e4bc',
   };
   const view = Object.create(ChatGPTView.prototype);
-  view.view = { webContents: { getURL: () => CHATGPT_URL, loadURL: async (url) => loaded.push(url) } };
+  view.chatService = { openChat: async (input) => { opened.push(input); return { id: input.id }; } };
   view.activeTask = null;
   view.activeMerge = { id: 'merge-in-progress' };
   view.knownTasks = new Map();
@@ -823,19 +818,18 @@ test('opening a task loads its saved ChatGPT conversation', async () => {
 
   const result = await view.openTaskConversation(task);
   assert.equal(result.opened, true);
-  assert.deepEqual(loaded, [task.conversationUrl]);
+  assert.equal(opened[0].id, '6a80f4cf-1650-83ea-8609-adb411b3e4bc');
   assert.equal(view.activeTask, task);
   assert.equal(view.activeMerge, null);
   assert.equal(events[0].type, 'task-chat-opened');
   await assert.rejects(
     view.openTaskConversation({ ...task, conversationUrl: 'https://example.com/not-chatgpt' }),
-    /invalid saved ChatGPT conversation URL/,
+    /no saved AI chat/,
   );
 });
 
 test('opening an already-live task preserves the streaming conversation page', async () => {
   const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
-  const loaded = [];
   const task = {
     taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
     state: 'submitted',
@@ -843,12 +837,8 @@ test('opening an already-live task preserves the streaming conversation page', a
     conversationUrl: `https://chatgpt.com/c/${conversationId}`,
   };
   const view = Object.create(ChatGPTView.prototype);
-  view.view = {
-    webContents: {
-      getURL: () => `https://chatgpt.com/g/g-p-example/c/${conversationId}?model=gpt-5-6`,
-      loadURL: async (url) => loaded.push(url),
-    },
-  };
+  const opened = [];
+  view.chatService = { openChat: async (input) => { opened.push(input); return { id: input.id }; } };
   view.activeTask = task;
   view.activeMerge = null;
   view.knownTasks = new Map([[task.taskId, task]]);
@@ -857,59 +847,9 @@ test('opening an already-live task preserves the streaming conversation page', a
 
   const result = await view.openTaskConversation(task);
   assert.equal(result.opened, true);
-  assert.deepEqual(loaded, []);
+  assert.equal(opened[0].id, conversationId);
 });
 
-test('ChatGPT thinking dialogs are not treated as request-limit notices', () => {
-  let clicked = false;
-  const closeButton = {
-    textContent: '',
-    disabled: false,
-    getAttribute: (name) => (name === 'aria-label' ? 'Close' : null),
-    click: () => { clicked = true; },
-  };
-  const thinkingModal = {
-    textContent: 'Thinking details Usage limit reached for deep research Close',
-    querySelectorAll: () => [closeButton],
-  };
-  const document = {
-    querySelector: () => null,
-    querySelectorAll: (selector) => (selector.includes('[role="dialog"]') ? [thinkingModal] : []),
-  };
-
-  const result = vm.runInNewContext(buildLimitNoticeDismissalScript(), { document });
-  assert.equal(result.dismissed, false);
-  assert.equal(clicked, false);
-});
-
-test('ChatGPT request-limit dialogs are recognized and dismissed without broad clicking', () => {
-  assert.equal(isDismissibleLimitNotice('Too many requests'), true);
-  assert.equal(isDismissibleLimitNotice('Messages limit reached'), true);
-  assert.equal(isDismissibleLimitNotice('You’ve reached your daily usage limit.'), true);
-  assert.equal(isDismissibleLimitNotice('This patch exceeds its configured size limit.'), false);
-
-  let clicked = false;
-  const button = {
-    textContent: 'Got it',
-    disabled: false,
-    getAttribute: () => null,
-    click: () => { clicked = true; },
-  };
-  const modal = {
-    textContent: 'Too many requests Please wait a few minutes before trying again. Got it',
-    querySelectorAll: () => [button],
-  };
-  const document = {
-    querySelector: (selector) => (
-      selector === '[data-testid="modal-conversation-history-rate-limit"]' ? modal : null
-    ),
-    querySelectorAll: () => [],
-  };
-  const result = vm.runInNewContext(buildLimitNoticeDismissalScript(), { document });
-  assert.equal(result.dismissed, true);
-  assert.equal(result.action, 'Got it');
-  assert.equal(clicked, true);
-});
 
 test('a downloaded text result file validates and applies automatically', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
@@ -1647,177 +1587,362 @@ test('task composer persists all sticky task selections in local storage', async
   assert.match(renderer, /persistTaskTreeSelectionValue\(button\.dataset\.treeId\)/);
 });
 
-test('task configuration installs an owned Luna picker outside React and suppresses native controls', () => {
-  const script = buildTaskConfigurationScript('luna', 'extra-high', 'task-123');
-  assert.match(script, /GPT-5\.6 Luna/);
-  assert.match(script, /gpt-5-6-t-mini/);
-  assert.match(script, /thinkingEffort: "max"/);
-  assert.match(script, /patchwork-model-selector/);
-  assert.match(script, /patchwork-task-model-selector/);
-  assert.match(script, /patchwork-task-model-selector-slot/);
-  assert.match(script, /document\.body\.append\(picker\)/);
-  assert.match(script, /nativePicker\.remove\(\)/);
-  assert.match(script, /patchwork-native-model-selector-suppression/);
-  assert.match(script, /user_last_used_model_config\?model_slug=/);
-  assert.match(script, /method: 'PATCH'/);
-  assert.match(script, /model-switcher-dropdown/);
-  assert.match(script, /Model selector/);
-  assert.match(script, /--vt-thread-model-switcher/);
-  assert.match(script, /anchor\.closest\('button, \[role="button"\], \[aria-haspopup="menu"\]'\)/);
-  assert.doesNotMatch(script, /button\[style\*="--vt-thread-model-switcher"\]/);
-  assert.match(script, /MutationObserver/);
-  assert.match(script, /attributeFilter: \['aria-label', 'data-testid', 'role', 'style'\]/);
-  assert.match(script, /candidate\.querySelectorAll\(':scope > span'\)/);
-  assert.match(script, /nativePicker\.replaceWith\(slot\)/);
-  assert.match(script, /flex:0 0/);
-  assert.match(script, /compactModelLabel/);
-  assert.match(script, /characterData: true/);
-  assert.doesNotMatch(script, /bounds\.top < 96/);
-  assert.match(script, /attachShadow/);
-  assert.match(script, /aria-expanded/);
-  assert.match(script, /data-reasoning-mode/);
-  assert.match(script, /model-picker-anchor-not-found/);
-  assert.match(script, /__patchworkOwnedModelSelection/);
-  assert.match(script, /task-123/);
-  assert.match(script, /Extra High/);
-  assert.doesNotMatch(script, /GPT-5\.6 Terra/);
-});
-
-test('task configuration supports Luna Low reasoning from the HAR', () => {
-  const script = buildTaskConfigurationScript('luna', 'low', 'task-123');
-  assert.match(script, /GPT-5\.6 Luna/);
-  assert.match(script, /Low/);
-  assert.match(script, /thinkingEffort: \"min\"/);
-  assert.match(script, /reasoning:low/);
-});
-
-test('ChatGPT request configuration uses HAR-confirmed Sol and Luna slugs', () => {
-  assert.deepEqual(taskRequestConfiguration('default', 'default'), {
-    model: 'default',
-    reasoningMode: 'default',
-    modelSlug: 'gpt-5-6',
-    thinkingEffort: null,
-  });
-  assert.equal(taskRequestConfiguration('sol', 'instant').modelSlug, 'gpt-5-6-instant');
-  assert.deepEqual(taskRequestConfiguration('luna', 'low'), {
-    model: 'luna',
-    reasoningMode: 'low',
+test('AIChat exposes chat, attachment, message, snapshot, and run operations as domain objects', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  let url = CHATGPT_URL;
+  let navigations = 0;
+  let reloads = 0;
+  let activeSnapshotReads = 0;
+  let maximumConcurrentSnapshotReads = 0;
+  const installedConfigurations = [];
+  const interceptedConfigurations = [];
+  const interceptedDrafts = [];
+  const browser = {
+    listWorkspaces: async () => ({ workspaces: [], authenticationRequired: false }),
+    readSessionState: async () => ({ authenticated: true }),
+    dismissBlockingNotice: async () => ({ resolved: false, notice: null, action: null }),
+    hasComposer: async () => true,
+    installConfigurationPicker: async (configuration) => {
+      installedConfigurations.push(configuration);
+      return { model: configuration.model, reasoning: configuration.reasoning, providerConfigured: true };
+    },
+    readConfigurationPicker: async () => ({ model: 'luna', reasoning: 'high' }),
+    interceptNextConversationRequest: async (configuration, draft) => {
+      interceptedConfigurations.push(configuration);
+      interceptedDrafts.push(draft);
+      return { wait: async () => ({ applied: true }), dispose: async () => {} };
+    },
+    insertPrompt: async () => ({ available: true, present: true, length: 15 }),
+    promptState: async () => ({ available: true, present: true, length: 15 }),
+    attachFile: async () => true,
+    attachmentState: async () => ({ present: true, busy: false, confirmed: true }),
+    sendState: async () => ({ available: true, enabled: true }),
+    clickSend: async () => { url = `${CHATGPT_URL}c/${conversationId}`; return { enabled: true }; },
+    stopRun: async () => true,
+    readRunStatus: async () => ({ status: 'completed', evidence: 'assistant-turn' }),
+    readChatSnapshot: async () => {
+      activeSnapshotReads += 1;
+      maximumConcurrentSnapshotReads = Math.max(maximumConcurrentSnapshotReads, activeSnapshotReads);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeSnapshotReads -= 1;
+      return {
+        messages: [{ id: 'm1', role: 'assistant', content: 'Done.' }],
+        thinkingSummary: 'Checked the repository.',
+        attachments: [],
+      };
+    },
+    downloadAttachment: async (name) => name === 'result.txt',
+  };
+  const webContents = {
+    getURL: () => url,
+    getTitle: () => 'Completed task',
+    loadURL: async (next) => { navigations += 1; url = next; },
+    reload: async () => { reloads += 1; },
+    navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+  };
+  const service = new ChatGPTBrowserAIChatService(webContents, browser);
+  assert.deepEqual(await service.currentSession(), { authenticated: true, status: 'authenticated' });
+  assert.deepEqual(await service.recoverSession(), { resolved: false, notice: null });
+  const chat = await service.createChat({ model: 'luna', reasoning: 'high' });
+  assert.equal(navigations, 1);
+  assert.equal(reloads, 0);
+  assert.deepEqual(chat.configuration, { model: 'luna', reasoning: 'high' });
+  assert.deepEqual(await chat.attach({ path: '/tmp/task.zip', name: 'task.zip' }), { name: 'task.zip', status: 'ready' });
+  const sent = await chat.send({ text: 'Implement this.' });
+  assert.equal(sent.chatId, conversationId);
+  assert.deepEqual(sent.configuration, { model: 'luna', reasoning: 'high' });
+  assert.deepEqual(installedConfigurations.map(({ model, reasoning }) => ({ model, reasoning })), [
+    { model: 'luna', reasoning: 'high' },
+    { model: 'luna', reasoning: 'high' },
+  ]);
+  assert.deepEqual(interceptedConfigurations, [{
     modelSlug: 'gpt-5-6-t-mini',
-    thinkingEffort: 'min',
-  });
-  assert.deepEqual(taskRequestConfiguration('sol', 'high'), {
-    model: 'sol',
-    reasoningMode: 'high',
-    modelSlug: 'gpt-5-6-thinking',
     thinkingEffort: 'extended',
+  }]);
+  assert.deepEqual(interceptedDrafts, [{ prompt: 'Implement this.', attachments: ['task.zip'] }]);
+  assert.deepEqual(await chat.current(), {
+    id: conversationId,
+    title: 'Completed task',
+    messages: [{ id: 'm1', role: 'assistant', text: 'Done.' }],
+    thinkingSummary: 'Checked the repository.',
+    attachments: [{ name: 'task.zip', status: 'ready' }],
+    run: { status: 'completed', error: null },
   });
-  assert.deepEqual(taskRequestConfiguration('luna', 'extra-high'), {
-    model: 'luna',
-    reasoningMode: 'extra-high',
-    modelSlug: 'gpt-5-6-t-mini',
-    thinkingEffort: 'max',
-  });
-  assert.throws(() => taskRequestConfiguration('terra', 'medium'), /unsupported chatgpt model/i);
+  await Promise.all([chat.current(), chat.current()]);
+  assert.equal(maximumConcurrentSnapshotReads, 1);
+  assert.equal((await chat.stop()).status, 'stopped');
+  assert.equal((await chat.current()).run.status, 'stopped');
+  assert.equal(await chat.downloadAttachment('result.txt'), true);
 });
 
-test('conversation payload rewriting enforces the selected model and thinking effort', () => {
-  const rewritten = rewriteConversationRequestBody(JSON.stringify({
-    action: 'next',
-    model: 'gpt-5-6',
-    messages: [],
-  }), taskRequestConfiguration('luna', 'high'));
-  const payload = JSON.parse(rewritten.text);
-  assert.equal(payload.model, 'gpt-5-6-t-mini');
-  assert.equal(payload.thinking_effort, 'extended');
-  assert.equal(rewritten.model, 'gpt-5-6-t-mini');
-  assert.equal(rewritten.thinkingEffort, 'extended');
-
-  const low = rewriteConversationRequestBody(JSON.stringify({
-    action: 'next',
-    model: 'gpt-5-6',
-    messages: [],
-  }), taskRequestConfiguration('luna', 'low'));
-  const lowPayload = JSON.parse(low.text);
-  assert.equal(lowPayload.model, 'gpt-5-6-t-mini');
-  assert.equal(lowPayload.thinking_effort, 'min');
+test('AIChat maps its owned Sol and Luna choices to provider request configuration', () => {
+  assert.deepEqual(normalizeConfiguration({ model: 'default', reasoning: 'default' }), {
+    model: 'default', reasoning: 'default',
+  });
+  assert.deepEqual(providerRequestConfiguration({ model: 'luna', reasoning: 'low' }), {
+    modelSlug: 'gpt-5-6-t-mini', thinkingEffort: 'min',
+  });
+  assert.deepEqual(providerRequestConfiguration({ model: 'sol', reasoning: 'instant' }), {
+    modelSlug: 'gpt-5-6-instant', thinkingEffort: null,
+  });
+  assert.throws(
+    () => normalizeConfiguration({ model: 'terra', reasoning: 'medium' }),
+    /unsupported AI chat model/i,
+  );
 });
 
-test('task request enforcement observes and rewrites ChatGPT’s actual conversation request', async () => {
+test('the browser provider dismisses only the known blocking usage notice', async () => {
+  let clicked = false;
+  const button = {
+    textContent: 'Got it',
+    disabled: false,
+    getAttribute: () => null,
+    click: () => { clicked = true; },
+  };
+  const modal = {
+    textContent: 'Too many requests. Please wait a few minutes. Got it',
+    querySelectorAll: () => [button],
+  };
+  const document = {
+    querySelector: (selector) => (
+      selector === '[data-testid="modal-conversation-history-rate-limit"]' ? modal : null
+    ),
+    querySelectorAll: () => [],
+  };
+  const driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, { document }),
+  });
+  const recovery = await driver.dismissBlockingNotice();
+  assert.equal(recovery.resolved, true);
+  assert.equal(recovery.action, 'Got it');
+  assert.equal(clicked, true);
+});
+
+test('the browser provider dispatches page file-selection events after CDP attachment', async () => {
+  const pageActions = [];
   const commands = [];
-  let attached = false;
   const debuggerApi = new EventEmitter();
-  debuggerApi.isAttached = () => attached;
-  debuggerApi.attach = () => { attached = true; };
-  debuggerApi.detach = () => { attached = false; };
-  debuggerApi.sendCommand = async (command, params) => {
-    commands.push({ command, params });
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (method, parameters = {}) => {
+    commands.push({ method, parameters });
+    if (method === 'DOM.getDocument') return { root: { nodeId: 1 } };
+    if (method === 'DOM.querySelector') return { nodeId: 42 };
     return {};
   };
-  const view = {
-    view: {
-      webContents: {
-        debugger: debuggerApi,
-        executeJavaScript: async () => ({ model: 'luna', reasoningMode: 'high' }),
+  const driver = new ChatGPTBrowserDriver({
+    debugger: debuggerApi,
+    executeJavaScript: async (source) => {
+      if (source.includes('function dispatchFileSelectionAction')) {
+        pageActions.push('dispatch-exact-upload-input');
+        return true;
+      }
+      if (source.includes('function attachmentStateAction')) {
+        return { present: true, busy: false, confirmed: true };
+      }
+      return null;
+    },
+  });
+  assert.equal(await driver.attachFile('/tmp/task.zip', 'task.zip'), true);
+  assert.deepEqual(pageActions, ['dispatch-exact-upload-input']);
+  const attachment = await driver.attachmentState('task.zip');
+  assert.equal(attachment.present, true);
+  assert.equal(attachment.busy, false);
+  assert.equal(attachment.confirmed, true);
+  assert.ok(commands.some(({ method, parameters }) => (
+    method === 'DOM.setFileInputFiles' && parameters.nodeId === 42
+  )));
+  assert.ok(commands.some(({ method, parameters }) => (
+    method === 'DOM.querySelector' && parameters.selector === '#upload-files'
+  )));
+});
+
+test('the browser provider waits for the hydrated editor instead of the SSR fallback textarea', async () => {
+  let inspectedSelector = null;
+  const driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, {
+      document: {
+        querySelector: (selector) => {
+          inspectedSelector = selector;
+          return selector.includes('textarea[placeholder]') ? {} : null;
+        },
       },
+    }),
+  });
+  assert.equal(await driver.hasComposer(), false);
+  assert.doesNotMatch(inspectedSelector, /textarea\[placeholder\]/);
+  assert.match(inspectedSelector, /ProseMirror/);
+});
+
+test('attachment confirmation requires a rendered filename chip, not only a populated input', async () => {
+  const fileInput = { files: [{ name: 'task.zip' }] };
+  const withoutChip = {
+    querySelectorAll: (selector) => (selector === 'input[type="file"]' ? [fileInput] : []),
+  };
+  let driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, { document: withoutChip }),
+  });
+  let state = await driver.attachmentState('task.zip');
+  assert.equal(state.present, true);
+  assert.equal(state.busy, true);
+  assert.equal(state.confirmed, false);
+
+  const card = {
+    textContent: 'task.zip',
+    getAttribute: () => null,
+    querySelector: () => null,
+  };
+  const chip = {
+    textContent: 'task.zip',
+    getAttribute: () => null,
+    closest: () => card,
+    parentElement: card,
+  };
+  const withChip = {
+    querySelectorAll: (selector) => {
+      if (selector === 'input[type="file"]') return [fileInput];
+      if (selector.includes('[data-testid*="file"')) return [chip];
+      return [];
     },
   };
-  const enforcement = await ChatGPTView.prototype.beginTaskRequestEnforcement.call(view, {
-    model: 'sol',
-    reasoningMode: 'instant',
+  driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, { document: withChip }),
+  });
+  state = await driver.attachmentState('task.zip');
+  assert.equal(state.present, true);
+  assert.equal(state.busy, false);
+  assert.equal(state.confirmed, true);
+});
+
+test('the browser provider enters prompts through browser input instead of mutating DOM text', async () => {
+  class BrowserInput {
+    constructor() {
+      this.disabled = false;
+      this.isConnected = true;
+      this.value = '';
+    }
+    closest() { return null; }
+    focus() { document.activeElement = this; }
+    getAttribute() { return null; }
+    select() {}
+    setSelectionRange() {}
+  }
+  class BrowserTextArea extends BrowserInput {}
+  const composer = new BrowserTextArea();
+  const document = {
+    activeElement: null,
+    querySelectorAll: (selector) => (selector.includes('#prompt-textarea') ? [composer] : []),
+  };
+  const debuggerApi = new EventEmitter();
+  const commands = [];
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (method, parameters = {}) => {
+    commands.push({ method, parameters });
+    if (method === 'Input.insertText') composer.value = parameters.text;
+    return {};
+  };
+  const driver = new ChatGPTBrowserDriver({
+    debugger: debuggerApi,
+    focus: () => {},
+    executeJavaScript: async (source) => vm.runInNewContext(source, {
+      document,
+      window: {},
+      HTMLInputElement: BrowserInput,
+      HTMLTextAreaElement: BrowserTextArea,
+    }),
+  });
+  const prompt = await driver.insertPrompt('Actual controlled input');
+  assert.equal(prompt.present, true);
+  assert.ok(commands.some(({ method, parameters }) => (
+    method === 'Input.insertText' && parameters.text === 'Actual controlled input'
+  )));
+});
+
+test('the browser provider privately applies Luna to the next conversation request', async () => {
+  const commands = [];
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (method, parameters = {}) => {
+    commands.push({ method, parameters });
+    return {};
+  };
+  const driver = new ChatGPTBrowserDriver({ debugger: debuggerApi });
+  const interception = await driver.interceptNextConversationRequest({
+    modelSlug: 'gpt-5-6-t-mini',
+    thinkingEffort: 'extended',
+  }, {
+    prompt: 'Implement this.',
+    attachments: ['task.zip'],
   });
   debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
     requestId: 'request-1',
     request: {
       method: 'POST',
       url: 'https://chatgpt.com/backend-api/f/conversation',
-      postData: JSON.stringify({ action: 'next', model: 'gpt-5-6' }),
+      postData: JSON.stringify({
+        action: 'next',
+        model: 'gpt-5-6',
+        messages: [{ content: { parts: ['Implement this.'] }, attachments: [{ name: 'task.zip' }] }],
+      }),
     },
   });
-  const verified = await enforcement.wait(500);
-  await enforcement.dispose();
-  const continued = commands.find((item) => item.command === 'Fetch.continueRequest');
-  const payload = JSON.parse(Buffer.from(continued.params.postData, 'base64').toString('utf8'));
-  assert.deepEqual(verified, {
-    ok: true,
-    model: 'gpt-5-6-t-mini',
-    thinkingEffort: 'extended',
-    selectedModel: 'luna',
-    selectedReasoningMode: 'high',
-    selectionSource: 'patchwork-selector',
+  assert.deepEqual(await interception.wait(100), {
+    applied: true,
+    attachmentsConfirmed: ['task.zip'],
+    modelSlug: 'gpt-5-6-t-mini',
+    promptConfirmed: true,
   });
+  await interception.dispose();
+
+  const continued = commands.find(({ method, parameters }) => (
+    method === 'Fetch.continueRequest' && parameters.postData
+  ));
+  const payload = JSON.parse(Buffer.from(continued.parameters.postData, 'base64').toString('utf8'));
   assert.equal(payload.model, 'gpt-5-6-t-mini');
   assert.equal(payload.thinking_effort, 'extended');
-  assert.equal(commands[0].command, 'Fetch.enable');
-  assert.equal(commands.at(-1).command, 'Fetch.disable');
-  assert.equal(attached, false);
+  assert.ok(commands.some(({ method }) => method === 'Fetch.enable'));
+  assert.ok(commands.some(({ method }) => method === 'Fetch.disable'));
 });
 
-test('ChatGPT stream status helpers follow the status endpoint captured in the HAR', () => {
-  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
-  assert.equal(
-    conversationIdFromStreamStatusUrl(`https://chatgpt.com/backend-api/conversation/${conversationId}/stream_status`),
-    conversationId,
-  );
-  assert.equal(
-    conversationIdFromRouteUrl(`https://chatgpt.com/c/${conversationId}`),
-    conversationId,
-  );
-  assert.equal(
-    conversationIdFromRouteUrl(`https://chatgpt.com/g/g-p-example/c/${conversationId}`),
-    conversationId,
-  );
-  assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/WEB:1443a631-8e0c-4683-bd40-8071fd8ab3c6'), null);
-  assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/not-a-uuid'), null);
-  assert.equal(conversationIdFromStreamStatusUrl('https://example.com/backend-api/conversation/nope/stream_status'), null);
-  assert.equal(normalizeConversationStreamStatus('IS_STREAMING'), 'streaming');
-  assert.equal(normalizeConversationStreamStatus('COMPLETE'), 'completed');
-  assert.equal(normalizeConversationStreamStatus('NOT_STREAMING'), 'completed');
-  assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
-  assert.match(buildConversationStatusScript(conversationId), /backend-api\/conversation.*stream_status/);
-  assert.match(buildConversationStatusScript(conversationId), /cache: 'no-store'/);
+test('the browser provider aborts an incomplete conversation request before submission', async () => {
+  const commands = [];
+  const debuggerApi = new EventEmitter();
+  debuggerApi.isAttached = () => true;
+  debuggerApi.sendCommand = async (method, parameters = {}) => {
+    commands.push({ method, parameters });
+    return {};
+  };
+  const driver = new ChatGPTBrowserDriver({ debugger: debuggerApi });
+  const interception = await driver.interceptNextConversationRequest({
+    modelSlug: 'gpt-5-6-t-mini', thinkingEffort: 'standard',
+  }, {
+    prompt: 'Summarize this.', attachments: ['summary.zip'],
+  });
+  debuggerApi.emit('message', {}, 'Fetch.requestPaused', {
+    requestId: 'request-2',
+    request: {
+      method: 'POST',
+      url: 'https://chatgpt.com/backend-api/f/conversation',
+      postData: JSON.stringify({ messages: [{ content: { parts: ['Summarize this.'] } }] }),
+    },
+  });
+  await assert.rejects(interception.wait(100), /did not contain.*summary\.zip/i);
+  await interception.dispose();
+  assert.ok(commands.some(({ method }) => method === 'Fetch.failRequest'));
+  assert.equal(commands.some(({ method, parameters }) => method === 'Fetch.continueRequest' && parameters.postData), false);
 });
 
-test('completed ChatGPT stream status stops the task timer and persists the chat completion state', async () => {
+test('AIChat has no string-command API and keeps browser transport details out of its public boundary', async () => {
+  const [main, preload] = await Promise.all([
+    fs.readFile(path.join(__dirname, '../src/main/ai-chat-service.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
+  ]);
+  assert.doesNotMatch(main, /executeJavaScript|selector|chatgpt|browser|fetch\(|webRequest|Fetch\./i);
+  assert.doesNotMatch(main, /(?:run|enqueue)\(['"`]/);
+  assert.doesNotMatch(preload, /executeJavaScript|webContents|cookie|token|selector/);
+});
+
+
+test('a completed AI chat run stops the task timer and persists the completion state', async () => {
   const task = {
     taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
     state: 'submitted',
@@ -1840,19 +1965,17 @@ test('completed ChatGPT stream status stops the task timer and persists the chat
       },
     },
     onEvent: async (event) => events.push(event),
-    view: {
-      webContents: {
-        isDestroyed: () => false,
-        getURL: () => `https://chatgpt.com/c/${task.conversationId}`,
-        executeJavaScript: async () => ({ ok: true, status: 'COMPLETE' }),
-      },
+    view: { webContents: { isDestroyed: () => false } },
+    activeChat: {
+      id: task.conversationId,
+      current: async () => ({ run: { status: 'completed', error: null } }),
     },
   };
 
   const result = await ChatGPTView.prototype.checkConversationStatus.call(view);
-  assert.equal(result.status, 'COMPLETE');
+  assert.equal(result.run.status, 'completed');
   assert.equal(current.chatStatus, 'completed');
-  assert.equal(current.chatStatusRaw, 'COMPLETE');
+  assert.equal(current.chatStatusRaw, null);
   assert.ok(Number.isFinite(Date.parse(current.chatFinishedAt)));
   assert.ok(Date.parse(current.chatFinishedAt) >= Date.parse(task.submittedAt));
   assert.equal(view.activeTask.chatStatus, 'completed');
@@ -1901,22 +2024,17 @@ test('task submit does not report success until a ChatGPT conversation exists', 
       },
     },
     onEvent: async (event) => events.push(event),
-    waitForComposer: async () => true,
-    configureTaskModel: async () => {},
-    beginTaskRequestEnforcement: async () => ({
-      wait: async () => ({ model: 'gpt-5-6', thinkingEffort: null }),
-      dispose: async () => {},
-    }),
-    injectPrompt: async () => {},
-    uploadPackage: async () => {},
-    clickSend: async () => true,
-    waitForConversationUrl: async () => null,
+    activeChat: {
+      id: 'pending:test',
+      attach: async () => ({ status: 'ready' }),
+      send: async () => ({ chatId: null, status: 'unknown' }),
+    },
     installResultWatcher: () => {},
   };
 
   await assert.rejects(
     ChatGPTView.prototype.submit.call(view, task),
-    /could not confirm a ChatGPT conversation/i,
+    /could not confirm an AI chat/i,
   );
   assert.equal(updateCount, 0);
   assert.equal(events.at(-1).type, 'task-submit-unconfirmed');
@@ -1924,7 +2042,7 @@ test('task submit does not report success until a ChatGPT conversation exists', 
 
 test('task submit persists the confirmed ChatGPT conversation with submitted state', async () => {
   const task = { taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7', handoffPrompt: 'Task', packagePath: '/task.txt' };
-  const conversationUrl = 'https://chatgpt.com/c/confirmed-conversation';
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
   let update;
   const view = {
     activeMerge: null,
@@ -1937,27 +2055,24 @@ test('task submit persists the confirmed ChatGPT conversation with submitted sta
       },
     },
     onEvent: async () => {},
-    waitForComposer: async () => true,
-    configureTaskModel: async () => {},
-    beginTaskRequestEnforcement: async () => ({
-      wait: async () => ({ model: 'gpt-5-6', thinkingEffort: null }),
-      dispose: async () => {},
-    }),
-    injectPrompt: async () => {},
-    uploadPackage: async () => {},
-    clickSend: async () => true,
-    waitForConversationUrl: async () => conversationUrl,
+    activeChat: {
+      id: conversationId,
+      attach: async () => ({ status: 'ready' }),
+      send: async () => ({ chatId: conversationId, status: 'streaming' }),
+      current: async () => ({ title: 'Confirmed chat', run: { status: 'streaming' } }),
+    },
     installResultWatcher: () => {},
   };
 
   const submitted = await ChatGPTView.prototype.submit.call(view, task);
   assert.equal(update.state, 'submitted');
-  assert.equal(update.conversationUrl, conversationUrl);
+  assert.equal(update.conversationUrl, null);
+  assert.equal(update.conversationId, conversationId);
   assert.match(update.submittedAt, /^\d{4}-\d{2}-\d{2}T/);
-  assert.equal(submitted.conversationUrl, conversationUrl);
+  assert.equal(submitted.conversationId, conversationId);
 });
 
-test('task submit selects the requested model and reasoning before injecting the prompt', async () => {
+test('task chats own their model and reasoning before the prompt is sent', async () => {
   const task = {
     taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
     handoffPrompt: 'Task',
@@ -1966,324 +2081,44 @@ test('task submit selects the requested model and reasoning before injecting the
     reasoningMode: 'high',
   };
   const steps = [];
+  const chat = {
+    id: '6a80f4cf-1650-83ea-8609-adb411b3e4bc',
+    send: async (message) => {
+      steps.push(`send:${message.text}`);
+      assert.deepEqual(message, {
+        text: 'Task',
+        attachments: [{ path: '/task.txt', name: 'task.txt' }],
+      });
+      return { chatId: '6a80f4cf-1650-83ea-8609-adb411b3e4bc', status: 'streaming' };
+    },
+    current: async () => ({ title: null, run: { status: 'streaming' } }),
+  };
   const view = {
     activeMerge: null,
     activeTask: null,
     knownTasks: new Map(),
-    configureTaskModel: async () => steps.push('configure'),
     taskService: {
       updateTask: async (_taskId, next) => ({ ...task, ...next }),
     },
     onEvent: async () => {},
-    waitForComposer: async () => true,
-    beginTaskRequestEnforcement: async () => {
-      steps.push('enforce');
-      return {
-        wait: async () => {
-          steps.push('verify');
-          return { model: 'gpt-5-6-t-mini', thinkingEffort: 'extended' };
-        },
-        dispose: async () => {},
-      };
+    activeChat: null,
+    chatService: {
+      createChat: async (configuration) => {
+        steps.push(`create:${configuration.model}:${configuration.reasoning}`);
+        return chat;
+      },
     },
-    injectPrompt: async () => steps.push('prompt'),
-    uploadPackage: async () => steps.push('package'),
-    clickSend: async () => {
-      steps.push('send');
-      return true;
-    },
-    waitForConversationUrl: async () => 'https://chatgpt.com/c/confirmed-conversation',
     installResultWatcher: () => {},
   };
 
+  await ChatGPTView.prototype.newChat.call(view, null, null, {
+    model: task.model,
+    reasoning: task.reasoningMode,
+  });
   await ChatGPTView.prototype.submit.call(view, task);
-  assert.deepEqual(steps, ['configure', 'enforce', 'prompt', 'package', 'send', 'verify']);
+  assert.deepEqual(steps, ['create:luna:high', 'send:Task']);
 });
 
-test('task upload selects the composer file input and dispatches its change event', async () => {
-  const commands = [];
-  const scripts = [];
-  let attachmentWaitedFor = null;
-  const debuggerApi = {
-    isAttached: () => true,
-    sendCommand: async (command, params) => {
-      commands.push({ command, params });
-      return {};
-    },
-  };
-  const view = {
-    view: {
-      webContents: {
-        debugger: debuggerApi,
-        executeJavaScript: async (script) => {
-          scripts.push(script);
-          return true;
-        },
-      },
-    },
-    findFileInputNodeId: async () => 42,
-    packageAttachmentStatus: async () => ({ attached: false, busy: false }),
-    waitForPackageAttachment: async (filename) => {
-      attachmentWaitedFor = filename;
-    },
-  };
-
-  await ChatGPTView.prototype.uploadPackage.call(view, '/tasks/chatgpt-ide-task-example.txt');
-  assert.deepEqual(commands.at(-1), {
-    command: 'DOM.setFileInputFiles',
-    params: { files: ['/tasks/chatgpt-ide-task-example.txt'], nodeId: 42 },
-  });
-  assert.match(scripts[0], /dispatchEvent\(new Event\('change'/);
-  assert.equal(attachmentWaitedFor, 'chatgpt-ide-task-example.txt');
-});
-
-test('task upload reuses an attachment that is already in the composer', async () => {
-  let debuggerAccessed = false;
-  const view = {
-    view: {
-      webContents: {
-        get debugger() {
-          debuggerAccessed = true;
-          return {};
-        },
-      },
-    },
-    packageAttachmentStatus: async () => ({ attached: true, busy: false }),
-  };
-
-  assert.equal(await ChatGPTView.prototype.uploadPackage.call(view, '/tasks/already-attached.txt'), true);
-  assert.equal(debuggerAccessed, false);
-});
-
-test('task attachment confirmation finds uploaded packages in a hidden view and inside shadow roots', () => {
-  const filename = 'chatgpt-ide-task-shadow-root.zip';
-  const card = {
-    textContent: filename,
-    getAttribute: () => null,
-    querySelector: () => null,
-  };
-  const attachment = {
-    textContent: filename,
-    getAttribute: () => null,
-    // Source Control collapses the hidden ChatGPT WebContentsView to zero
-    // bounds while its summary automation continues in the page DOM.
-    getBoundingClientRect: () => ({ width: 0, height: 0 }),
-    closest: () => card,
-    parentElement: card,
-  };
-  const shadowRoot = {
-    querySelectorAll: (selector) => {
-      if (selector === '[role="dialog"], [role="alert"], [aria-live]') return [];
-      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') {
-        return [attachment];
-      }
-      if (selector === '*') return [];
-      return [];
-    },
-  };
-  const host = { shadowRoot };
-  const document = {
-    querySelectorAll: (selector) => {
-      if (selector === '*') return [host];
-      return [];
-    },
-  };
-
-  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
-    document,
-    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
-  });
-
-  assert.equal(result.attached, true);
-  assert.equal(result.busy, false);
-});
-
-test('task attachment confirmation trusts the selected input before broad busy page matches', () => {
-  const filename = 'chatgpt-ide-task-hidden-input.zip';
-  const fileInput = { files: [{ name: filename }] };
-  const broadPageMatch = {
-    textContent: `Chat history ${filename} unrelated processing status`,
-    getAttribute: () => null,
-    parentElement: {
-      textContent: `Chat history ${filename} unrelated processing status`,
-      getAttribute: () => null,
-      querySelector: () => ({ role: 'progressbar' }),
-    },
-    closest: () => null,
-  };
-  const document = {
-    querySelectorAll: (selector) => {
-      if (selector === 'input[type="file"]') return [fileInput];
-      if (selector === '[data-testid*="file"], [data-testid*="attach"], [aria-label], [title], span, div') {
-        return [broadPageMatch];
-      }
-      return [];
-    },
-  };
-
-  const result = vm.runInNewContext(buildPackageAttachmentStatusScript(filename), {
-    document,
-    getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
-  });
-
-  assert.equal(result.attached, true);
-  assert.equal(result.busy, false);
-});
-
-test('task attachments upload after the package and before ChatGPT is sent', async () => {
-  const uploads = [];
-  const view = {
-    uploadPackage: async (filePath) => uploads.push(filePath),
-  };
-
-  await ChatGPTView.prototype.uploadAttachments.call(view, [
-    { path: '/tasks/context.png' },
-    '/tasks/specification.pdf',
-  ]);
-
-  assert.deepEqual(uploads, ['/tasks/context.png', '/tasks/specification.pdf']);
-});
-
-
-test('Source Control summary result detection uses the standard task result filename', () => {
-  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
-  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
-  let clicked = false;
-  const link = {
-    getAttribute: (name) => (name === 'download' ? resultFilename : null),
-    textContent: resultFilename,
-    scrollIntoView: () => {},
-    click: () => { clicked = true; },
-  };
-  const document = {
-    querySelector: () => null,
-    querySelectorAll: (selector) => {
-      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [link];
-      if (selector === '*') return [];
-      return [];
-    },
-  };
-  const result = vm.runInNewContext(buildTaskResultDetectionScript({ taskId, resultFilename }), { document });
-  assert.equal(result.kind, 'download');
-  assert.equal(clicked, true);
-  assert.equal(resultTaskId(resultFilename), taskId);
-});
-
-test('task result detection accepts only the requested text attachment after generation stops', () => {
-  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
-  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
-  let clicked = false;
-  const link = {
-    getAttribute: (name) => (name === 'download' ? resultFilename : null),
-    textContent: resultFilename,
-    scrollIntoView: () => {},
-    click: () => { clicked = true; },
-  };
-  const stopButton = {
-    disabled: false,
-    getAttribute: (name) => (name === 'aria-disabled' ? 'false' : null),
-  };
-  const buildDocument = (generating) => ({
-    querySelector: (selector) => (selector === '[data-testid="stop-button"]' && generating ? stopButton : null),
-    querySelectorAll: (selector) => {
-      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [link];
-      if (selector === '*') return [];
-      return [];
-    },
-  });
-  const script = buildTaskResultDetectionScript(taskId);
-
-  const generating = vm.runInNewContext(script, { document: buildDocument(true) });
-  assert.equal(generating.kind, 'generating');
-  assert.equal(clicked, false);
-
-  const completed = vm.runInNewContext(script, { document: buildDocument(false) });
-  assert.equal(completed.kind, 'download');
-  assert.equal(clicked, true);
-
-  const visibleEnvelopeOnly = vm.runInNewContext(script, {
-    document: {
-      querySelector: () => null,
-      querySelectorAll: (selector) => (
-        selector === '[data-message-author-role="assistant"]'
-          ? [{ textContent: `PATCHWORK_RESULT_V1\n{"taskId":"${taskId}"}\nPATCHWORK_RESULT_END` }]
-          : []
-      ),
-    },
-  });
-  assert.equal(visibleEnvelopeOnly.kind, 'none');
-});
-
-test('task result detection clicks ChatGPT’s download control instead of opening its file preview', () => {
-  const taskId = '9f1fae65-e106-4c76-acbe-8ea3928810e7';
-  const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
-  let previewOpened = false;
-  let downloaded = false;
-  const download = {
-    disabled: false,
-    getAttribute: () => null,
-    scrollIntoView: () => {},
-    click: () => { downloaded = true; },
-  };
-  const row = {
-    parentElement: null,
-    querySelectorAll: () => [download],
-  };
-  const preview = {
-    parentElement: row,
-    getAttribute: (name) => (name === 'aria-label' ? resultFilename : null),
-    textContent: resultFilename,
-    scrollIntoView: () => {},
-    click: () => { previewOpened = true; },
-  };
-  const document = {
-    querySelector: () => null,
-    querySelectorAll: (selector) => {
-      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [preview, download];
-      if (selector === '*') return [];
-      return [];
-    },
-  };
-
-  const result = vm.runInNewContext(buildTaskResultDetectionScript(taskId), { document });
-  assert.equal(result.kind, 'download');
-  assert.equal(downloaded, true);
-  assert.equal(previewOpened, false);
-});
-
-test('merge result detection accepts the requested text file after generation stops', () => {
-  const treeId = '4b2d7b31-06ad-4ec3-99b9-7e54bc8dd3e8';
-  let clicked = false;
-  const link = {
-    getAttribute: (name) => (name === 'download' ? mergeResultFilename(treeId) : null),
-    textContent: mergeResultFilename(treeId),
-    scrollIntoView: () => {},
-    click: () => { clicked = true; },
-  };
-  const stopButton = {
-    disabled: false,
-    getAttribute: (name) => (name === 'aria-disabled' ? 'false' : null),
-  };
-  const buildDocument = (generating) => ({
-    querySelector: (selector) => (selector === '[data-testid="stop-button"]' && generating ? stopButton : null),
-    querySelectorAll: (selector) => {
-      if (selector === '[data-message-author-role="assistant"]') return [];
-      if (selector === 'a[href], a[download], button, [role="link"], [role="button"]') return [link];
-      if (selector === '*') return [];
-      return [];
-    },
-  });
-  const script = buildMergeResultDetectionScript(treeId);
-
-  const generating = vm.runInNewContext(script, { document: buildDocument(true) });
-  assert.equal(generating.kind, 'generating');
-  assert.equal(clicked, false);
-
-  const completed = vm.runInNewContext(script, { document: buildDocument(false) });
-  assert.equal(completed.kind, 'download');
-  assert.equal(clicked, true);
-  assert.equal(mergeTreeId(`${mergeResultFilename(treeId).replace('.txt', '')} (2).txt`), treeId);
-});
 
 test('a downloaded plain-text ChatGPT result validates and applies automatically', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));

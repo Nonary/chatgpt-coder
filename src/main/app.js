@@ -1,7 +1,7 @@
 const path = require('node:path');
 const fs = require('node:fs/promises');
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
-const { ChatGPTView, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
+const { PatchworkAIChatController, recoverUnconfirmedSubmissions } = require('./chatgpt-view');
 const { GitService } = require('./git-service');
 const { ResultService } = require('./result-service');
 const { SkillService } = require('./skill-service');
@@ -20,7 +20,7 @@ let gitService;
 let resultService;
 let skillService;
 let worktreeService;
-let chatGPTView;
+let chatController;
 
 function emit(payload) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('task:event', payload);
@@ -47,9 +47,9 @@ function buildConflictResolutionTaskText(task, conflict, additionalInstructions 
 
 async function retryTaskApplication(task) {
   let current = task;
-  if (current.conversationUrl) {
+  if (current.conversationId || current.conversationUrl) {
     try {
-      current = await chatGPTView.refreshTaskResult(current);
+      current = await chatController.refreshTaskResult(current);
       current = await taskService.getTask(current.taskId);
     } catch (error) {
       const savedTask = await taskService.getTask(current.taskId);
@@ -93,10 +93,10 @@ async function loadMainWindow() {
   if (!HEADLESS) mainWindow.show();
 }
 
-async function attachChatGPTView() {
+async function attachChatController() {
   const [storedTasks, trees] = await Promise.all([taskService.listTasks(), worktreeService.list()]);
   const tasks = await recoverUnconfirmedSubmissions(taskService, storedTasks);
-  chatGPTView = new ChatGPTView(
+  chatController = new PatchworkAIChatController(
     mainWindow,
     taskService,
     (taskId, downloadedPath) => resultService.ingestTextFile(taskId, downloadedPath),
@@ -118,8 +118,8 @@ function registerIpc() {
     return gitService.addRepositories(response.filePaths);
   });
 
-  ipcMain.handle('projects:list', async () => chatGPTView.listProjects());
-  ipcMain.handle('projects:create', async (_event, name) => chatGPTView.createProject(name));
+  ipcMain.handle('projects:list', async () => chatController.enqueue(() => chatController.listProjects()));
+  ipcMain.handle('projects:create', async (_event, name) => chatController.enqueue(() => chatController.createProject(name)));
   ipcMain.handle('skills:list', async (_event, repositoryPaths) => {
     const skills = await skillService.discover(Array.isArray(repositoryPaths) ? repositoryPaths : []);
     return skills.map(({ sourcePath, skillFile, ...skill }) => skill);
@@ -152,8 +152,8 @@ function registerIpc() {
     const status = await gitService.status(repositoryPath);
     if (status.changes.length === 0) throw new Error('There are no uncommitted changes to summarize.');
 
-    const suspendedTaskId = chatGPTView.activeTask?.taskId || null;
-    const suspendedMergeId = chatGPTView.activeMerge?.id || null;
+    const suspendedTaskId = chatController.activeTask?.taskId || null;
+    const suspendedMergeId = chatController.activeMerge?.id || null;
     const prompt = resolveGitSummaryPrompt(customPrompt);
     const task = await taskService.createTask({
       taskText: prompt,
@@ -171,8 +171,8 @@ function registerIpc() {
       message: `Packaging ${status.changes.length} uncommitted change${status.changes.length === 1 ? '' : 's'} for Git Summary…`,
     });
     try {
-      await chatGPTView.prepare(task);
-      const completed = await chatGPTView.submitAndWaitForResult(task);
+      await chatController.enqueue(() => chatController.prepare(task));
+      const completed = await chatController.submitAndWaitForResult(task);
       const commitMessage = validateCommitMessage(completed?.result?.commitMessage);
       emit({
         type: 'git-summary-ready',
@@ -200,13 +200,15 @@ function registerIpc() {
       });
       throw error;
     } finally {
-      chatGPTView.forgetTask(task.taskId);
+      chatController.forgetTask(task.taskId);
 
       const [suspendedTask, suspendedMerge] = await Promise.all([
         suspendedTaskId ? taskService.getTask(suspendedTaskId).catch(() => null) : null,
         suspendedMergeId ? worktreeService.get(suspendedMergeId).catch(() => null) : null,
       ]);
-      await chatGPTView.restoreActiveContext(suspendedTask, suspendedMerge).catch(() => {});
+      await chatController.enqueue(
+        () => chatController.restoreActiveContext(suspendedTask, suspendedMerge),
+      ).catch(() => {});
     }
   });
 
@@ -261,7 +263,7 @@ function registerIpc() {
         await worktreeService.setChatGPTProject(treeId, chatgptProject);
       }
       const request = await worktreeService.buildMergeRequest(treeId);
-      await chatGPTView.submitMerge(request);
+      await chatController.enqueue(() => chatController.submitMerge(request));
       return worktreeService.list();
     } catch (error) {
       await worktreeService.markMergeFailed(treeId, error).catch(() => {});
@@ -295,8 +297,8 @@ function registerIpc() {
     });
     await worktreeService.attachTask(tree.id, task.taskId);
     emit({ type: 'task-prepared', task: publicTask(task) });
-    await chatGPTView.prepare(task);
-    return publicTask(await chatGPTView.submit(task));
+    await chatController.enqueue(() => chatController.prepare(task));
+    return publicTask(await chatController.enqueue(() => chatController.submit(task)));
   });
 
   ipcMain.handle('task:create', async (_event, input) => {
@@ -338,7 +340,7 @@ function registerIpc() {
       );
     }
     emit({ type: 'task-prepared', task: publicTask(task) });
-    await chatGPTView.prepare(task);
+    await chatController.enqueue(() => chatController.prepare(task));
     return publicTask(task);
   });
 
@@ -358,19 +360,21 @@ function registerIpc() {
       cancelId: 0,
     });
     if (confirmation.response !== 1) return false;
-    chatGPTView.forgetTask(task.taskId);
+    chatController.forgetTask(task.taskId);
     await taskService.deleteTask(task.taskId);
     emit({ type: 'task-deleted', taskId: task.taskId });
     return true;
   });
   ipcMain.handle('task:open', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
-    if (task.conversationUrl) await chatGPTView.openTaskConversation(task);
+    if (task.conversationId || task.conversationUrl) {
+      await chatController.enqueue(() => chatController.openTaskConversation(task));
+    }
     return publicTask(task);
   });
   ipcMain.handle('task:submit', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
-    return publicTask(await chatGPTView.submit(task));
+    return publicTask(await chatController.enqueue(() => chatController.submit(task)));
   });
   ipcMain.handle('task:set-target', async (_event, taskId, input = {}) => {
     const task = await taskService.getTask(taskId);
@@ -482,29 +486,31 @@ function registerIpc() {
     });
     if (tree) await worktreeService.attachTask(tree.id, resolutionTask.taskId);
     emit({ type: 'task-prepared', task: publicTask(resolutionTask) });
-    await chatGPTView.prepare(resolutionTask);
-    return publicTask(await chatGPTView.submit(resolutionTask));
+    return chatController.enqueue(async () => {
+      await chatController.prepare(resolutionTask);
+      return publicTask(await chatController.submit(resolutionTask));
+    });
   });
   ipcMain.handle('task:copy-prompt', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
-    chatGPTView.copyPrompt(task);
+    chatController.copyPrompt(task);
     return true;
   });
   ipcMain.handle('task:reveal-package', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
-    chatGPTView.revealPackage(task);
+    chatController.revealPackage(task);
     return true;
   });
   ipcMain.handle('task:import-result', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
-    return publicTask(await chatGPTView.importResult(task));
+    return publicTask(await chatController.importResult(task));
   });
-  ipcMain.handle('browser:set-bounds', async (_event, bounds) => chatGPTView.setBounds(bounds));
-  ipcMain.handle('browser:set-visible', async (_event, visible) => chatGPTView.setVisible(visible));
-  ipcMain.handle('browser:new-chat', async () => chatGPTView.newChat());
-  ipcMain.handle('browser:reload', async () => chatGPTView.reload());
-  ipcMain.handle('browser:back', async () => chatGPTView.goBack());
-  ipcMain.handle('browser:forward', async () => chatGPTView.goForward());
+  ipcMain.handle('browser:set-bounds', async (_event, bounds) => chatController.setBounds(bounds));
+  ipcMain.handle('browser:set-visible', async (_event, visible) => chatController.setVisible(visible));
+  ipcMain.handle('browser:new-chat', async () => chatController.enqueue(() => chatController.newChat()));
+  ipcMain.handle('browser:reload', async () => chatController.enqueue(() => chatController.reload()));
+  ipcMain.handle('browser:back', async () => chatController.enqueue(() => chatController.goBack()));
+  ipcMain.handle('browser:forward', async () => chatController.enqueue(() => chatController.goForward()));
   ipcMain.handle('task:apply', async (_event, taskId) => publicTask(await resultService.apply(taskId)));
   ipcMain.handle('task:rollback', async (_event, taskId) => publicTask(await resultService.rollback(taskId)));
   ipcMain.handle('path:reveal', async (_event, targetPath) => {
@@ -537,7 +543,7 @@ app.whenReady().then(async () => {
       emit(event);
       try {
         const request = await worktreeService.buildMergeRequest(event.task.treeId);
-        await chatGPTView.submitMerge(request);
+        await chatController.enqueue(() => chatController.submitMerge(request));
       } catch (error) {
         await worktreeService.markMergeFailed(event.task.treeId, error).catch(() => {});
         emit({ type: 'merge-failed', treeId: event.task.treeId, message: error.message });
@@ -547,14 +553,14 @@ app.whenReady().then(async () => {
     emit(event);
   });
   createMainWindow();
-  await attachChatGPTView();
+  await attachChatController();
   registerIpc();
   await loadMainWindow();
 
   app.on('activate', () => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       createMainWindow();
-      attachChatGPTView()
+      attachChatController()
         .then(loadMainWindow)
         .catch((error) => emit({ type: 'task-failed', message: error.message }));
     }

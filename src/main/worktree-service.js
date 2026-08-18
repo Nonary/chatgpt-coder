@@ -218,6 +218,7 @@ class WorktreeService {
           chatgptProject: existing?.chatgptProject || null,
           mergeState: existing?.mergeState || null,
           mergeConversationUrl: existing?.mergeConversationUrl || null,
+          mergeConversationId: existing?.mergeConversationId || null,
           managed: false,
           discovered: true,
         };
@@ -279,6 +280,7 @@ class WorktreeService {
       chatgptProject: null,
       mergeState: null,
       mergeConversationUrl: null,
+      mergeConversationId: null,
       managed: true,
       discovered: false,
     };
@@ -379,7 +381,7 @@ class WorktreeService {
     };
   }
 
-  async markMergeSubmitted(treeId, conversationUrl = null) {
+  async markMergeSubmitted(treeId, chatId = null) {
     const records = await this.readRecords();
     const index = records.findIndex((item) => item.id === treeId);
     if (index < 0) throw new Error('The selected coding tree no longer exists.');
@@ -387,7 +389,12 @@ class WorktreeService {
       ...records[index],
       mergeState: 'submitted',
       mergeError: null,
-      mergeConversationUrl: conversationUrl || records[index].mergeConversationUrl || null,
+      mergeConversationId: chatId && !String(chatId).startsWith('https://')
+        ? chatId
+        : records[index].mergeConversationId || null,
+      mergeConversationUrl: chatId && String(chatId).startsWith('https://')
+        ? chatId
+        : records[index].mergeConversationUrl || null,
       updatedAt: new Date().toISOString(),
     };
     await this.writeRecords(records);
