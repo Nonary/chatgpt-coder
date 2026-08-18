@@ -128,7 +128,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   assert.equal(result.result.commitMessage, 'fix(source-control): generate AI commit summaries');
 });
 
-test('Source Control summaries run as persistent Luna Medium tasks with an explicit handoff', async () => {
+test('Source Control summaries prepare a normal Luna Medium task and reuse standard task submission', async () => {
   const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
   const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
   const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
@@ -139,18 +139,23 @@ test('Source Control summaries run as persistent Luna Medium tasks with an expli
   );
 
   assert.match(summaryHandler, /model: 'luna',[\s\S]*reasoningMode: 'medium'/);
+  assert.match(summaryHandler, /chatgptProject/);
   assert.match(summaryHandler, /type: 'task-prepared'/);
-  assert.match(summaryHandler, /state: 'completed'/);
-  assert.match(summaryHandler, /type: 'git-summary-ready',[\s\S]*task: publicTask\(completed\)/);
+  assert.match(summaryHandler, /await chatGPTView\.prepare\(task\)/);
+  assert.match(summaryHandler, /return \{ task: publicTask\(task\), usedCustomPrompt \}/);
+  assert.doesNotMatch(summaryHandler, /submitAndWaitForResult/);
+  assert.doesNotMatch(summaryHandler, /restoreActiveContext/);
   assert.match(summaryHandler, /ipcMain\.handle\('task:use-git-summary'/);
   assert.doesNotMatch(summaryHandler, /deleteTask\(task\.taskId\)/);
   assert.doesNotMatch(renderer, /const hiddenTask = Boolean\(event\.task\?\.summaryOnly\)/);
   assert.match(renderer, /task\.summaryOnly \|\| task\.state !== 'ready'/);
-  assert.match(renderer, /Generating Git Summary/);
+  assert.match(renderer, /window\.patchwork\.gitSummary\([\s\S]*chatgptProject/);
+  assert.match(renderer, /window\.patchwork\.submitTask\(task\.taskId\)/);
   assert.match(renderer, /useActiveGitSummary/);
   assert.match(renderer, /source-commit-message'\]\.value = completed\.result\.commitMessage/);
   assert.doesNotMatch(renderer, /source-commit-message'\]\.value = result\.commitMessage/);
   assert.match(markup, /id="use-git-summary-button"[^>]*>Use in Source Control<\/button>/);
+  assert.match(preload, /gitSummary: \(repositoryPath, customPrompt, chatgptProject\)/);
   assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
 });
 

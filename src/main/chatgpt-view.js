@@ -12,7 +12,6 @@ const TASK_MONITOR_INTERVAL_MILLISECONDS = 1_500;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
-const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
@@ -1717,43 +1716,6 @@ class ChatGPTView {
         : 'Task uploaded and submitted through the ChatGPT page.',
     });
     return submittedTask;
-  }
-
-  async submitAndWaitForResult(task, timeoutMilliseconds = GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS) {
-    const taskId = String(task?.taskId || '').trim();
-    if (!taskId) throw new Error('The Git summary task is missing its task ID.');
-    const key = taskId.toLowerCase();
-    if (this.resultWaiters.has(key)) {
-      throw new Error('A result download is already in progress for this task.');
-    }
-
-    let resultTimeout = null;
-    const resultPromise = new Promise((resolve, reject) => {
-      resultTimeout = setTimeout(() => {
-        reject(new Error(`Timed out waiting for ${task.resultFilename || `chatgpt-ide-result-${taskId}.txt`} to finish downloading.`));
-      }, timeoutMilliseconds);
-      this.resultWaiters.set(key, {
-        resolve: (value) => {
-          clearTimeout(resultTimeout);
-          resolve(value);
-        },
-        reject: (error) => {
-          clearTimeout(resultTimeout);
-          reject(error);
-        },
-      });
-    });
-
-    try {
-      await this.submit(task);
-      return await resultPromise;
-    } catch (error) {
-      this.resultWaiters.get(key)?.reject(error);
-      throw error;
-    } finally {
-      clearTimeout(resultTimeout);
-      this.resultWaiters.delete(key);
-    }
   }
 
   async submitMerge(request) {

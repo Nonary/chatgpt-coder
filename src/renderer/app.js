@@ -1885,10 +1885,28 @@ async function generateGitSummary() {
   const originalLabel = button.textContent;
   button.textContent = 'Generating…';
   try {
-    const result = await window.patchwork.gitSummary(repositoryPath, gitSummaryPrompt());
+    const projectId = state.projectSelection || '';
+    const chatgptProject = projectId
+      ? state.chatgptProjects.find((project) => project.id === projectId) || null
+      : null;
+    if (projectId && !chatgptProject) {
+      throw new Error('Refresh ChatGPT projects and choose the destination again.');
+    }
+    const result = await window.patchwork.gitSummary(
+      repositoryPath,
+      gitSummaryPrompt(),
+      chatgptProject,
+    );
+    const task = result.task;
+    upsertTask(task);
+    showTask(task);
+    addActivity('Fresh embedded chat prepared');
     showToast(result.usedCustomPrompt
-      ? 'Git Summary is ready in the task view using your saved prompt.'
-      : 'Git Summary is ready in the task view using the built-in prompt.');
+      ? 'Git Summary task prepared with your saved prompt. Submitting through the embedded browser…'
+      : 'Git Summary task prepared with the built-in prompt. Submitting through the embedded browser…');
+    const submitted = await window.patchwork.submitTask(task.taskId);
+    upsertTask(submitted);
+    showTask(submitted);
   } catch (error) {
     showToast(error.message, true);
   } finally {

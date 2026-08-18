@@ -148,12 +148,10 @@ function registerIpc() {
   ipcMain.handle('git:diff', async (_event, repositoryPath, filePath, staged) => (
     gitService.diff(repositoryPath, filePath, staged)
   ));
-  ipcMain.handle('git:summary', async (_event, repositoryPath, customPrompt) => {
+  ipcMain.handle('git:summary', async (_event, repositoryPath, customPrompt, chatgptProject) => {
     const status = await gitService.status(repositoryPath);
     if (status.changes.length === 0) throw new Error('There are no uncommitted changes to summarize.');
 
-    const suspendedTaskId = chatGPTView.activeTask?.taskId || null;
-    const suspendedMergeId = chatGPTView.activeMerge?.id || null;
     const prompt = resolveGitSummaryPrompt(customPrompt);
     const task = await taskService.createTask({
       taskText: prompt,
@@ -162,6 +160,7 @@ function registerIpc() {
       reasoningMode: 'medium',
       autoApply: false,
       summaryOnly: true,
+      chatgptProject,
     });
     const usedCustomPrompt = String(customPrompt || '').trim().length > 0;
     emit({ type: 'task-prepared', task: publicTask(task) });
@@ -170,44 +169,8 @@ function registerIpc() {
       repositoryPath: status.repository.path,
       message: `Packaging ${status.changes.length} uncommitted change${status.changes.length === 1 ? '' : 's'} for Git Summary…`,
     });
-    try {
-      await chatGPTView.prepare(task);
-      const completed = await chatGPTView.submitAndWaitForResult(task);
-      const commitMessage = validateCommitMessage(completed?.result?.commitMessage);
-      emit({
-        type: 'git-summary-ready',
-        task: publicTask(completed),
-        repositoryPath: status.repository.path,
-        commitMessage,
-        message: 'AI generated a Conventional Commit message. Use it in Source Control when ready.',
-      });
-      return { taskId: task.taskId, commitMessage, usedCustomPrompt };
-    } catch (error) {
-      let failedTask = null;
-      try {
-        const currentTask = await taskService.getTask(task.taskId);
-        failedTask = currentTask.state === 'failed'
-          ? currentTask
-          : await taskService.updateTask(task.taskId, { state: 'failed', error: error.message });
-      } catch {
-        // The task may have been explicitly deleted while the summary was running.
-      }
-      emit({
-        type: 'git-summary-failed',
-        task: failedTask ? publicTask(failedTask) : undefined,
-        repositoryPath: status.repository.path,
-        message: error.message,
-      });
-      throw error;
-    } finally {
-      chatGPTView.forgetTask(task.taskId);
-
-      const [suspendedTask, suspendedMerge] = await Promise.all([
-        suspendedTaskId ? taskService.getTask(suspendedTaskId).catch(() => null) : null,
-        suspendedMergeId ? worktreeService.get(suspendedMergeId).catch(() => null) : null,
-      ]);
-      await chatGPTView.restoreActiveContext(suspendedTask, suspendedMerge).catch(() => {});
-    }
+    await chatGPTView.prepare(task);
+    return { task: publicTask(task), usedCustomPrompt };
   });
 
   ipcMain.handle('task:use-git-summary', async (_event, taskId) => {

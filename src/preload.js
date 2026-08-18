@@ -15,7 +15,9 @@ contextBridge.exposeInMainWorld('patchwork', {
   gitUnstageAll: (repositoryPath) => ipcRenderer.invoke('git:unstage-all', repositoryPath),
   gitCommit: (repositoryPath, message) => ipcRenderer.invoke('git:commit', repositoryPath, message),
   gitDiff: (repositoryPath, filePath, staged) => ipcRenderer.invoke('git:diff', repositoryPath, filePath, staged),
-  gitSummary: (repositoryPath, customPrompt) => ipcRenderer.invoke('git:summary', repositoryPath, customPrompt),
+  gitSummary: (repositoryPath, customPrompt, chatgptProject) => (
+    ipcRenderer.invoke('git:summary', repositoryPath, customPrompt, chatgptProject)
+  ),
   listTrees: () => ipcRenderer.invoke('trees:list'),
   revealTree: (treeId) => ipcRenderer.invoke('trees:reveal', treeId),
   removeTree: (treeId) => ipcRenderer.invoke('trees:remove', treeId),
