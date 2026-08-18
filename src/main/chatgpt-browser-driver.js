@@ -1,4 +1,5 @@
 const { AI_CHAT_RUN_STATUS } = require('./ai-chat-service');
+const { ipcMain } = require('electron');
 
 const COMPOSER_SELECTOR = [
   '.wcDTda_prosemirror-parent .ProseMirror[contenteditable="true"]',
@@ -15,6 +16,7 @@ const CHATGPT_PROJECTS_URL = 'https://chatgpt.com/library?tab=projects';
 const BROWSER_NAVIGATION_TIMEOUT_MILLISECONDS = 15_000;
 const BROWSER_ACTION_TIMEOUT_MILLISECONDS = 5_000;
 const WORKSPACE_NAVIGATION_WAIT_ATTEMPTS = 24;
+const CHAT_DOM_SNAPSHOT_CHANNEL = 'patchwork:chat-dom-snapshot';
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -285,6 +287,11 @@ function startNewChatAction(input) {
     ? new RegExp(`^/g/${workspaceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:-[^/]+)?(?:/project)?/?$`, 'i')
       .test(location.pathname)
     : location.pathname === '/';
+  const routeMatchesWorkspace = (route) => {
+    if (!workspaceId) return route.pathname === '/';
+    const escaped = workspaceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^/g/${escaped}(?:-[^/]+)?(?:/project)?/?$`, 'i').test(route.pathname);
+  };
   if (workspaceLink && !currentIsTarget) {
     workspaceLink.click();
     return { activated: true, action: 'workspace-route' };
@@ -298,7 +305,7 @@ function startNewChatAction(input) {
   const targetLink = controls.find((node) => {
     const route = routeOf(node);
     if (!route || route.origin !== location.origin) return false;
-    if (workspaceId) return currentIsTarget && workspaceRouteMatches(route.toString(), workspaceId);
+    if (workspaceId) return currentIsTarget && routeMatchesWorkspace(route);
     return route.pathname === '/' && !/\/c\//i.test(route.pathname);
   });
   if (targetLink) {
@@ -815,6 +822,21 @@ class ChatGPTBrowserDriver {
     this.onWorkspaceStatus = typeof options.onWorkspaceStatus === 'function'
       ? options.onWorkspaceStatus
       : () => {};
+    this.onChatSnapshot = typeof options.onChatSnapshot === 'function'
+      ? options.onChatSnapshot
+      : null;
+    if (this.onChatSnapshot) {
+      this.chatSnapshotHandler = (_event, payload) => {
+        if (_event?.sender !== this.webContents || !payload || typeof payload !== 'object') return;
+        try {
+          this.onChatSnapshot(payload);
+        } catch {}
+      };
+      ipcMain.on(CHAT_DOM_SNAPSHOT_CHANNEL, this.chatSnapshotHandler);
+      this.webContents.once?.('destroyed', () => {
+        ipcMain.removeListener(CHAT_DOM_SNAPSHOT_CHANNEL, this.chatSnapshotHandler);
+      });
+    }
   }
 
   hasComposer() { return this.#execute(hasComposerAction, { composerSelector: COMPOSER_SELECTOR }); }

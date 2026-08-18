@@ -144,6 +144,8 @@ class PatchworkAIChatController {
     this.conversationStatusBusy = false;
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
+    this.liveChatFingerprints = new Map();
+    this.liveChatSnapshotQueue = Promise.resolve();
     this.monitorQueued = false;
     this.taskChatPollTimer = null;
     this.taskChatPollQueued = false;
@@ -157,10 +159,12 @@ class PatchworkAIChatController {
     this.visible = false;
     this.view = new WebContentsView({
       webPreferences: {
+        preload: path.join(__dirname, 'chatgpt-browser-preload.js'),
         partition: PARTITION,
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
+        backgroundThrottling: false,
         spellcheck: true,
       },
     });
@@ -173,6 +177,7 @@ class PatchworkAIChatController {
         message,
         recovery,
       }),
+      onChatSnapshot: (payload) => this.handleBrowserChatSnapshot(payload),
     });
     this.chatService = new ChatGPTBrowserAIChatService(
       this.view.webContents,
@@ -562,6 +567,60 @@ class PatchworkAIChatController {
       this.worktreeService.markMergeSubmitted(treeId, id).then((tree) => {
         if (this.activeMerge?.id === treeId) this.activeMerge = tree;
       }).catch(() => {});
+    }
+  }
+
+  handleBrowserChatSnapshot(payload) {
+    this.liveChatSnapshotQueue = this.liveChatSnapshotQueue
+      .then(() => this.processBrowserChatSnapshot(payload))
+      .catch(() => {});
+  }
+
+  async processBrowserChatSnapshot(payload) {
+    const url = String(payload?.url || this.view.webContents.getURL?.() || '');
+    const conversationId = conversationIdFromRouteUrl(url);
+    if (!conversationId || !payload?.snapshot) return;
+    const snapshot = {
+      ...payload.snapshot,
+      id: conversationId,
+      title: String(payload.title || this.view.webContents.getTitle?.() || '').trim() || null,
+      messages: (Array.isArray(payload.snapshot.messages) ? payload.snapshot.messages : []).map((message) => ({
+        id: String(message?.id || ''),
+        role: ['user', 'assistant', 'system'].includes(message?.role)
+          ? message.role
+          : 'assistant',
+        text: String(message?.text ?? message?.content ?? ''),
+      })),
+      run: {
+        status: Object.values(AI_CHAT_RUN_STATUS).includes(payload.snapshot.run?.status)
+          ? payload.snapshot.run.status
+          : AI_CHAT_RUN_STATUS.UNKNOWN,
+        error: payload.snapshot.run?.error || null,
+        configuration: payload.snapshot.run?.configuration
+          || this.activeChat?.configuration
+          || { model: 'default', reasoning: 'default' },
+      },
+    };
+    const fingerprint = chatSnapshotFingerprint(snapshot);
+    if (this.liveChatFingerprints.get(conversationId) === fingerprint) return;
+    this.liveChatFingerprints.set(conversationId, fingerprint);
+
+    const task = [...this.knownTasks.values()].find((candidate) => (
+      candidate.state === 'submitted'
+        && (candidate.conversationId === conversationId
+          || conversationIdFromRouteUrl(candidate.conversationUrl) === conversationId)
+    ));
+    if (task) {
+      const currentTask = await this.updateTaskFromChatSnapshot(task, snapshot);
+      await this.emitTaskChatSnapshot(currentTask || task, snapshot);
+      this.updateTaskChatPolling(currentTask || task, snapshot);
+      if (currentTask?.chatStatus !== AI_CHAT_RUN_STATUS.STREAMING) this.requestMonitor();
+      return;
+    }
+
+    if (this.sessionChat?.id === conversationId || (!this.activeTask && this.activeChat?.id === conversationId)) {
+      await this.emitSessionChatSnapshot(snapshot);
+      this.updateSessionChatPolling(snapshot);
     }
   }
 

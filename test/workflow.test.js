@@ -1742,13 +1742,14 @@ test('new browser chats activate ChatGPT’s semantic New chat control before se
 });
 
 test('native Patchwork chat surfaces stream transcript responses and preserve model controls', async () => {
-  const [renderer, markup, driver, view, main, preload] = await Promise.all([
+  const [renderer, markup, driver, view, main, preload, browserPreload] = await Promise.all([
     fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-driver.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8'),
     fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-preload.js'), 'utf8'),
   ]);
   assert.match(renderer, /message\?\.text \?\? message\?\.content/);
   assert.doesNotMatch(renderer, /refreshStreamingChats/);
@@ -1760,6 +1761,9 @@ test('native Patchwork chat surfaces stream transcript responses and preserve mo
   assert.match(driver, /data-testid\*="conversation-turn"/);
   assert.match(driver, /startNewChatAction/);
   assert.match(driver, /const messages = collect\(primary\)/);
+  assert.match(browserPreload, /MutationObserver/);
+  assert.match(browserPreload, /patchwork:chat-dom-snapshot/);
+  assert.doesNotMatch(browserPreload, /fetch\s*\(|backend-api|document\.cookie|localStorage/i);
   assert.match(view, /await chat\.configure\(selectedConfiguration\)/);
   assert.match(view, /sessionChat/);
   assert.match(view, /TASK_CHAT_DOM_POLL_INTERVAL_MILLISECONDS/);
