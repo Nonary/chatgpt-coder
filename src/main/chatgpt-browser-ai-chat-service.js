@@ -154,13 +154,27 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   async #createChat(input = {}) {
     const workspaceId = input.workspaceId || input.workspace?.id || null;
     const target = workspaceId ? workspaceUrl(workspaceId) : CHATGPT_HOME;
-    // Keep one authenticated ChatGPT document alive. Route changes happen
-    // through ChatGPT's in-app router instead of replacing the WebContents.
-    await this.#browser.navigate(target);
+    const previousConversationId = conversationId(this.#webContents.getURL?.());
+    if (typeof this.#browser.startNewChat === 'function') {
+      const started = await this.#browser.startNewChat(workspaceId);
+      if (!started?.activated) {
+        throw new AIChatError(
+          AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE,
+          'ChatGPT did not expose its New chat control.',
+        );
+      }
+    } else {
+      // Keep the compatibility path for lightweight browser-driver test
+      // doubles. The real driver uses ChatGPT's own New chat control and
+      // verifies that the old conversation route was cleared.
+      await this.#browser.navigate(target);
+    }
     const descriptor = {
       id: `pending:${randomUUID()}`,
       workspaceId,
       title: null,
+      previousConversationId,
+      requiresNewConversation: true,
       configuration: normalizeConfiguration(input),
     };
     const chat = this.#chat(descriptor);
@@ -339,10 +353,17 @@ class ChatGPTBrowserAIChatService extends AIChatService {
     } finally {
       await requestOverride?.dispose();
     }
-    const id = await this.#waitForValue(() => conversationId(this.#webContents.getURL()), 30_000, 250);
+    const id = await this.#waitForValue(() => {
+      const nextId = conversationId(this.#webContents.getURL());
+      if (!nextId) return null;
+      if (descriptor.requiresNewConversation && nextId === descriptor.previousConversationId) return null;
+      return nextId;
+    }, 30_000, 250);
     if (!id) throw new AIChatError(AI_CHAT_ERROR_CODE.TIMED_OUT, 'The AI session did not create a chat after Send.');
     const previousId = descriptor.id;
     descriptor.id = id;
+    descriptor.requiresNewConversation = false;
+    descriptor.previousConversationId = null;
     descriptor.title = this.#webContents.getTitle?.() || null;
     if (this.#attachmentsByChat.has(previousId)) {
       this.#attachmentsByChat.set(id, this.#attachmentsByChat.get(previousId));

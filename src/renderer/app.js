@@ -1433,7 +1433,7 @@ function renderTaskChat(task = state.activeTask) {
   } else if (state.chatError) {
     elements['task-chat-status'].textContent = state.chatError;
   } else if (streaming) {
-    elements['task-chat-status'].textContent = 'ChatGPT is responding. Patchwork refreshes background tasks about every 15 seconds.';
+    elements['task-chat-status'].textContent = 'ChatGPT is responding. Patchwork is watching this open conversation for new content.';
   } else if (runStatus === 'failed') {
     elements['task-chat-status'].textContent = 'ChatGPT reported an error for this conversation.';
   } else if (runStatus === 'stopped') {
@@ -1726,6 +1726,7 @@ function showComposer() {
 }
 
 function showSession() {
+  state.activeTask = null;
   elements['composer-view'].classList.add('hidden');
   elements['task-view'].classList.add('hidden');
   elements['source-view'].classList.add('hidden');
@@ -2586,29 +2587,29 @@ window.addEventListener('scroll', syncBrowserBounds, true);
 new ResizeObserver(syncBrowserBounds).observe(elements['session-chatgpt-surface']);
 setInterval(updateTaskElapsedTimes, 1_000);
 
-function refreshStreamingChats() {
-  const activeTaskStreaming = state.activeTask && taskHasChat(state.activeTask)
-    && (state.chatSnapshot?.run?.status === 'streaming' || state.activeTask.chatStatus === 'streaming');
-  if (activeTaskStreaming && !state.chatLoading && !state.chatSending) refreshTaskChat(state.activeTask.taskId).catch(() => {});
-  const sessionStreaming = !elements['session-view'].classList.contains('hidden')
-    && state.sessionSnapshot?.run?.status === 'streaming';
-  if (sessionStreaming && !state.sessionLoading && !state.sessionSending) refreshSessionChat().catch(() => {});
-}
-
-setInterval(refreshStreamingChats, 1_500);
-
 window.patchwork.onTaskEvent((event) => {
   if (event.task) upsertTask(event.task);
   if (event.task) {
     renderTaskList();
     if (!elements['history-view'].classList.contains('hidden')) renderTaskHistory();
   }
-  if (event.task && state.activeTask?.taskId === event.task.taskId) showTask(event.task);
+  if (event.task && state.activeTask?.taskId === event.task.taskId) {
+    state.activeTask = event.task;
+    if (!elements['task-view'].classList.contains('hidden')) showTask(event.task);
+  }
   if (event.type === 'task-chat-snapshot' && state.activeTask?.taskId === event.taskId) {
     state.chatTaskId = event.taskId;
     state.chatSnapshot = event.snapshot || null;
     state.chatError = null;
     renderTaskChat(state.activeTask);
+  }
+  if (event.type === 'session-chat-snapshot') {
+    state.sessionSnapshot = event.snapshot || null;
+    const configuration = event.snapshot?.run?.configuration;
+    if (configuration) {
+      state.sessionConfiguration = setChatConfigurationSelects('session', configuration);
+    }
+    if (!elements['session-view'].classList.contains('hidden')) renderSessionChat();
   }
   if (event.message && state.activeTask && (!event.taskId || event.taskId === state.activeTask.taskId)) addActivity(event.message);
   if (event.type === 'task-deleted') {

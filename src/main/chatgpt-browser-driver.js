@@ -58,6 +58,30 @@ function isChatGPTBrowserUrl(value) {
   }
 }
 
+function conversationIdFromBrowserUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com') return null;
+    return /^\/c\/([^/]+)\/?$/i.exec(url.pathname)?.[1]
+      || /^\/g\/g-p-[A-Za-z0-9_-]+\/c\/([^/]+)\/?$/i.exec(url.pathname)?.[1]
+      || null;
+  } catch {
+    return null;
+  }
+}
+
+function workspaceRouteMatches(value, workspaceId = null) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com') return false;
+    if (!workspaceId) return url.pathname === '/';
+    const escaped = String(workspaceId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^/g/${escaped}(?:-[^/]+)?(?:/project)?/?$`, 'i').test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
 function hasComposerAction(input) {
   return Boolean(document.querySelector(input.composerSelector));
 }
@@ -224,6 +248,64 @@ function navigateChatGPTRouteAction(input) {
   } catch {
     return { activated: false, renderedControl: false, unchanged: false };
   }
+}
+
+function startNewChatAction(input) {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const visible = (node) => {
+    const bounds = node?.getBoundingClientRect?.();
+    return !bounds || (bounds.width > 0 && bounds.height > 0);
+  };
+  const workspaceId = String(input?.workspaceId || '').trim();
+  const controls = [...document.querySelectorAll('button, a, [role="button"], [role="menuitem"]')]
+    .filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
+  const label = (node) => normalize([
+    node.textContent,
+    node.getAttribute('aria-label'),
+    node.getAttribute('title'),
+    node.getAttribute('data-testid'),
+  ].filter(Boolean).join(' '));
+  const routeOf = (node) => {
+    try {
+      const href = node.getAttribute('href') || node.href || '';
+      return new URL(href, location.href);
+    } catch {
+      return null;
+    }
+  };
+  const workspaceLink = workspaceId
+    ? controls.find((node) => {
+      const route = routeOf(node);
+      if (!route || route.origin !== location.origin) return false;
+      const escaped = workspaceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`^/g/${escaped}(?:-[^/]+)?(?:/project)?/?$`, 'i').test(route.pathname);
+    })
+    : null;
+  const currentIsTarget = workspaceId
+    ? new RegExp(`^/g/${workspaceId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:-[^/]+)?(?:/project)?/?$`, 'i')
+      .test(location.pathname)
+    : location.pathname === '/';
+  if (workspaceLink && !currentIsTarget) {
+    workspaceLink.click();
+    return { activated: true, action: 'workspace-route' };
+  }
+  const newChat = controls.find((node) => /^(?:new chat|new conversation|start a new chat)$/i.test(label(node))
+    || /\bnew chat\b/i.test(label(node)));
+  if (newChat) {
+    newChat.click();
+    return { activated: true, action: 'new-chat' };
+  }
+  const targetLink = controls.find((node) => {
+    const route = routeOf(node);
+    if (!route || route.origin !== location.origin) return false;
+    if (workspaceId) return currentIsTarget && workspaceRouteMatches(route.toString(), workspaceId);
+    return route.pathname === '/' && !/\/c\//i.test(route.pathname);
+  });
+  if (targetLink) {
+    targetLink.click();
+    return { activated: true, action: 'new-chat-route' };
+  }
+  return { activated: false, action: null };
 }
 
 function advanceWorkspaceIndexAction() {
@@ -833,6 +915,49 @@ class ChatGPTBrowserDriver {
     // Give the app router one render turn before composer automation begins.
     await delay(100);
     return true;
+  }
+
+  async startNewChat(workspaceId = null) {
+    const normalizedWorkspaceId = String(workspaceId || '').trim() || null;
+    if (normalizedWorkspaceId && !/^g-p-[A-Za-z0-9_-]+$/.test(normalizedWorkspaceId)) {
+      throw new Error('The ChatGPT project ID is invalid.');
+    }
+    const target = normalizedWorkspaceId
+      ? `${CHATGPT_HOME_URL}g/${normalizedWorkspaceId}/project`
+      : CHATGPT_HOME_URL;
+    const currentUrl = String(this.webContents.getURL?.() || '');
+    if (!currentUrl || currentUrl === 'about:blank') await this.#loadBrowserSurface(CHATGPT_HOME_URL);
+    else if (!isChatGPTBrowserUrl(currentUrl)) {
+      throw new Error('The persistent browser is outside ChatGPT. Restore the ChatGPT session before retrying.');
+    }
+
+    const previousConversationId = conversationIdFromBrowserUrl(this.webContents.getURL?.());
+    const deadline = Date.now() + BROWSER_ACTION_TIMEOUT_MILLISECONDS;
+    while (Date.now() < deadline) {
+      const state = await this.#execute(startNewChatAction, { workspaceId: normalizedWorkspaceId });
+      await delay(state?.action === 'new-chat' ? 75 : 125);
+      const activeUrl = String(this.webContents.getURL?.() || '');
+      const activeConversationId = conversationIdFromBrowserUrl(activeUrl);
+      if (!activeConversationId && workspaceRouteMatches(activeUrl, normalizedWorkspaceId)) {
+        return { activated: true, action: state?.action || 'already-new-chat', url: activeUrl };
+      }
+      if (!state?.activated) await delay(125);
+      // A page-side click can update location asynchronously. Continue giving
+      // ChatGPT's router time to clear the old conversation before falling
+      // back to a document navigation below.
+      if (previousConversationId && activeConversationId !== previousConversationId && !activeConversationId) {
+        return { activated: true, action: state?.action || 'new-chat', url: activeUrl };
+      }
+    }
+
+    // A stale SPA route is worse than a short recovery load: accepting the
+    // old /c/<id> would silently append the next message to the wrong chat.
+    await this.#loadBrowserSurface(target);
+    const activeUrl = String(this.webContents.getURL?.() || target);
+    if (conversationIdFromBrowserUrl(activeUrl) || !workspaceRouteMatches(activeUrl, normalizedWorkspaceId)) {
+      throw new Error('ChatGPT did not open a fresh chat. The existing conversation was left unchanged.');
+    }
+    return { activated: true, action: 'document-recovery', url: activeUrl };
   }
 
   async listWorkspaces() {

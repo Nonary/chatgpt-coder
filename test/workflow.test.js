@@ -1705,6 +1705,42 @@ test('AIChat maps its owned Sol and Luna choices to provider request configurati
   );
 });
 
+test('new browser chats activate ChatGPT’s semantic New chat control before sending', async () => {
+  const previousId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  let url = `https://chatgpt.com/c/${previousId}`;
+  const location = {
+    href: url,
+    pathname: `/c/${previousId}`,
+  };
+  const newChatButton = {
+    textContent: 'New chat',
+    disabled: false,
+    getAttribute: () => null,
+    click: () => {
+      url = 'https://chatgpt.com/';
+      location.href = url;
+      location.pathname = '/';
+    },
+  };
+  const document = {
+    querySelectorAll: (selector) => selector.includes('button') ? [newChatButton] : [],
+  };
+  const driver = new ChatGPTBrowserDriver({
+    getURL: () => url,
+    loadURL: async (next) => { url = next; },
+    executeJavaScript: async (source) => vm.runInNewContext(source, {
+      URL,
+      document,
+      location,
+    }),
+  });
+
+  const result = await driver.startNewChat();
+  assert.equal(result.activated, true);
+  assert.equal(result.action, 'new-chat');
+  assert.equal(url, 'https://chatgpt.com/');
+});
+
 test('native Patchwork chat surfaces stream transcript responses and preserve model controls', async () => {
   const [renderer, markup, driver, view, main, preload] = await Promise.all([
     fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8'),
@@ -1715,15 +1751,22 @@ test('native Patchwork chat surfaces stream transcript responses and preserve mo
     fs.readFile(path.join(__dirname, '../src/preload.js'), 'utf8'),
   ]);
   assert.match(renderer, /message\?\.text \?\? message\?\.content/);
-  assert.match(renderer, /setInterval\(refreshStreamingChats, 1_500\)/);
+  assert.doesNotMatch(renderer, /refreshStreamingChats/);
   assert.match(renderer, /sendTaskChatMessage\(task\.taskId, text, configuration\)/);
   assert.match(renderer, /sendSessionChatMessage\(text, \{/);
   assert.match(markup, /id="session-chat-model-select"/);
   assert.match(markup, /id="session-chat-reasoning-select"/);
   assert.match(markup, /id="task-chat-model-select"/);
   assert.match(driver, /data-testid\*="conversation-turn"/);
+  assert.match(driver, /startNewChatAction/);
   assert.match(driver, /const messages = collect\(primary\)/);
   assert.match(view, /await chat\.configure\(selectedConfiguration\)/);
+  assert.match(view, /sessionChat/);
+  assert.match(view, /TASK_CHAT_DOM_POLL_INTERVAL_MILLISECONDS/);
+  assert.match(view, /this\.activeChat\.current\(\)/);
+  assert.match(view, /emitTaskChatSnapshot/);
+  assert.match(view, /emitSessionChatSnapshot/);
+  assert.match(renderer, /session-chat-snapshot/);
   assert.match(view, /async readSessionChat\(\)/);
   assert.match(main, /ipcMain\.handle\('session:chat-send'/);
   assert.match(preload, /sendSessionChatMessage:/);

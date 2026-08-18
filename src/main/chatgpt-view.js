@@ -12,6 +12,7 @@ const PARTITION = 'persist:patchwork-chatgpt';
 const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 const RESULT_RETRY_MILLISECONDS = 6_000;
 const TASK_MONITOR_INTERVAL_MILLISECONDS = 15_000;
+const TASK_CHAT_DOM_POLL_INTERVAL_MILLISECONDS = 2_000;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const GIT_SUMMARY_RESULT_TIMEOUT_MILLISECONDS = 180_000;
 const CHATGPT_CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -66,6 +67,22 @@ function normalizeConversationTitle(value) {
   return title;
 }
 
+function chatSnapshotFingerprint(snapshot) {
+  return JSON.stringify({
+    id: snapshot?.id || null,
+    messages: (Array.isArray(snapshot?.messages) ? snapshot.messages : []).map((message) => ({
+      id: String(message?.id || ''),
+      role: String(message?.role || ''),
+      text: String(message?.text ?? message?.content ?? ''),
+    })),
+    thinkingSummary: String(snapshot?.thinkingSummary || ''),
+    run: {
+      status: String(snapshot?.run?.status || AI_CHAT_RUN_STATUS.UNKNOWN),
+      error: String(snapshot?.run?.error?.message || ''),
+    },
+  });
+}
+
 async function recoverUnconfirmedSubmissions(taskService, tasks) {
   return Promise.all(tasks.map((task) => {
     if (task.state !== 'submitted' || CHATGPT_CONVERSATION_ID_PATTERN.test(task.conversationId || '')
@@ -95,7 +112,11 @@ class PatchworkAIChatController {
     onMergeResult = async () => {},
     restoredTrees = [],
   ) {
+    // There is exactly one authenticated ChatGPT browser session. These are
+    // conversation descriptors routed through that same WebContentsView; they
+    // never create another BrowserWindow, partition, or provider session.
     this.activeChat = null;
+    this.sessionChat = null;
     this.mainWindow = mainWindow;
     this.taskService = taskService;
     this.onResult = onResult;
@@ -124,6 +145,15 @@ class PatchworkAIChatController {
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
     this.monitorQueued = false;
+    this.taskChatPollTimer = null;
+    this.taskChatPollQueued = false;
+    this.taskChatPollTaskId = null;
+    this.lastTaskChatFingerprint = null;
+    this.sessionChatPollTimer = null;
+    this.sessionChatPollQueued = false;
+    this.sessionChatPollChatId = null;
+    this.lastSessionChatFingerprint = null;
+    this.activeChatMode = null;
     this.visible = false;
     this.view = new WebContentsView({
       webPreferences: {
@@ -154,7 +184,11 @@ class PatchworkAIChatController {
     this.installMergeDownloadListener();
     this.resultMonitor = setInterval(() => this.requestMonitor(), TASK_MONITOR_INTERVAL_MILLISECONDS);
     this.resultMonitor.unref?.();
-    this.mainWindow.once('closed', () => clearInterval(this.resultMonitor));
+    this.mainWindow.once('closed', () => {
+      clearInterval(this.resultMonitor);
+      this.stopTaskChatPolling();
+      this.stopSessionChatPolling();
+    });
     const legacyConversationUrl = this.activeMerge?.mergeConversationUrl || this.activeTask?.conversationUrl || null;
     this.ready = Promise.resolve(this.view.webContents.loadURL(legacyConversationUrl || CHATGPT_URL)).then(async () => {
       const id = this.activeTask?.conversationId || this.activeMerge?.mergeConversationId || null;
@@ -181,6 +215,140 @@ class PatchworkAIChatController {
     this.enqueue(() => this.monitorPage())
       .catch(() => {})
       .finally(() => { this.monitorQueued = false; });
+  }
+
+  startTaskChatPolling(task, snapshot) {
+    if (!task?.taskId || task.state !== 'submitted'
+      || snapshot?.run?.status !== AI_CHAT_RUN_STATUS.STREAMING || !this.activeChat) return;
+    const taskId = String(task.taskId);
+    if (this.taskChatPollTaskId !== taskId) {
+      this.stopTaskChatPolling();
+      this.taskChatPollTaskId = taskId;
+    }
+    if (this.taskChatPollTimer) return;
+    this.taskChatPollTimer = setInterval(
+      () => this.requestTaskChatPoll(),
+      TASK_CHAT_DOM_POLL_INTERVAL_MILLISECONDS,
+    );
+    this.taskChatPollTimer.unref?.();
+  }
+
+  stopTaskChatPolling() {
+    if (this.taskChatPollTimer) clearInterval(this.taskChatPollTimer);
+    this.taskChatPollTimer = null;
+    this.taskChatPollTaskId = null;
+    this.taskChatPollQueued = false;
+    this.lastTaskChatFingerprint = null;
+  }
+
+  updateTaskChatPolling(task, snapshot) {
+    if (snapshot?.run?.status === AI_CHAT_RUN_STATUS.STREAMING) {
+      this.startTaskChatPolling(task, snapshot);
+    } else if ([
+      AI_CHAT_RUN_STATUS.COMPLETED,
+      AI_CHAT_RUN_STATUS.STOPPED,
+      AI_CHAT_RUN_STATUS.FAILED,
+    ].includes(snapshot?.run?.status)) {
+      this.stopTaskChatPolling();
+    }
+  }
+
+  async emitTaskChatSnapshot(task, snapshot, { force = false } = {}) {
+    if (!task || this.activeTask?.taskId !== task.taskId) return false;
+    const fingerprint = chatSnapshotFingerprint(snapshot);
+    if (!force && fingerprint === this.lastTaskChatFingerprint) return false;
+    this.lastTaskChatFingerprint = fingerprint;
+    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    return true;
+  }
+
+  requestTaskChatPoll() {
+    if (this.taskChatPollQueued || !this.taskChatPollTimer || this.visible
+      || this.view.webContents.isDestroyed()) return;
+    const taskId = this.taskChatPollTaskId;
+    const task = this.activeTask;
+    if (!task || task.taskId !== taskId || !this.activeChat) {
+      this.stopTaskChatPolling();
+      return;
+    }
+    this.taskChatPollQueued = true;
+    this.enqueue(async () => {
+      if (this.visible || this.activeTask?.taskId !== taskId || !this.activeChat) return;
+      if (conversationIdFromRouteUrl(this.view.webContents.getURL()) !== this.activeChat.id) return;
+      const currentTask = this.knownTasks.get(taskId.toLowerCase()) || this.activeTask;
+      const snapshot = await this.activeChat.current();
+      const savedTask = await this.updateTaskFromChatSnapshot(currentTask, snapshot);
+      const taskForPolling = savedTask || currentTask;
+      await this.emitTaskChatSnapshot(taskForPolling, snapshot);
+      this.updateTaskChatPolling(taskForPolling, snapshot);
+    })
+      .catch(() => {})
+      .finally(() => { this.taskChatPollQueued = false; });
+  }
+
+  startSessionChatPolling(snapshot) {
+    if (this.activeChatMode !== 'session' || !this.activeChat
+      || snapshot?.run?.status !== AI_CHAT_RUN_STATUS.STREAMING) return;
+    const chatId = this.activeChat.id;
+    if (this.sessionChatPollChatId !== chatId) {
+      this.stopSessionChatPolling();
+      this.sessionChatPollChatId = chatId;
+    }
+    if (this.sessionChatPollTimer) return;
+    this.sessionChatPollTimer = setInterval(
+      () => this.requestSessionChatPoll(),
+      TASK_CHAT_DOM_POLL_INTERVAL_MILLISECONDS,
+    );
+    this.sessionChatPollTimer.unref?.();
+  }
+
+  stopSessionChatPolling() {
+    if (this.sessionChatPollTimer) clearInterval(this.sessionChatPollTimer);
+    this.sessionChatPollTimer = null;
+    this.sessionChatPollChatId = null;
+    this.sessionChatPollQueued = false;
+    this.lastSessionChatFingerprint = null;
+  }
+
+  updateSessionChatPolling(snapshot) {
+    if (snapshot?.run?.status === AI_CHAT_RUN_STATUS.STREAMING) {
+      this.startSessionChatPolling(snapshot);
+    } else if ([
+      AI_CHAT_RUN_STATUS.COMPLETED,
+      AI_CHAT_RUN_STATUS.STOPPED,
+      AI_CHAT_RUN_STATUS.FAILED,
+    ].includes(snapshot?.run?.status)) {
+      this.stopSessionChatPolling();
+    }
+  }
+
+  async emitSessionChatSnapshot(snapshot, { force = false } = {}) {
+    const fingerprint = chatSnapshotFingerprint(snapshot);
+    if (!force && fingerprint === this.lastSessionChatFingerprint) return false;
+    this.lastSessionChatFingerprint = fingerprint;
+    await this.onEvent({ type: 'session-chat-snapshot', snapshot });
+    return true;
+  }
+
+  requestSessionChatPoll() {
+    if (this.sessionChatPollQueued || !this.sessionChatPollTimer || this.visible
+      || this.view.webContents.isDestroyed()) return;
+    const chatId = this.sessionChatPollChatId;
+    if (this.activeChatMode !== 'session' || !this.activeChat || this.activeChat.id !== chatId) {
+      this.stopSessionChatPolling();
+      return;
+    }
+    this.sessionChatPollQueued = true;
+    this.enqueue(async () => {
+      if (this.visible || this.activeChatMode !== 'session' || !this.activeChat
+        || this.activeChat.id !== chatId
+        || conversationIdFromRouteUrl(this.view.webContents.getURL()) !== chatId) return;
+      const snapshot = await this.activeChat.current();
+      await this.emitSessionChatSnapshot(snapshot);
+      this.updateSessionChatPolling(snapshot);
+    })
+      .catch(() => {})
+      .finally(() => { this.sessionChatPollQueued = false; });
   }
 
   installNavigationHandlers() {
@@ -414,6 +582,9 @@ class PatchworkAIChatController {
   }
 
   async prepare(task) {
+    this.stopTaskChatPolling();
+    this.stopSessionChatPolling();
+    this.activeChatMode = null;
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -433,6 +604,9 @@ class PatchworkAIChatController {
   }
 
   async restoreActiveContext(task = null, merge = null) {
+    this.stopTaskChatPolling();
+    this.stopSessionChatPolling();
+    this.activeChatMode = task ? 'task' : null;
     this.activeTask = task || null;
     this.activeMerge = merge || null;
     if (task?.taskId) this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -463,6 +637,9 @@ class PatchworkAIChatController {
   }
 
   async openTaskConversation(task) {
+    this.stopTaskChatPolling();
+    this.stopSessionChatPolling();
+    this.activeChatMode = 'task';
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -476,16 +653,22 @@ class PatchworkAIChatController {
   }
 
   async readTaskChat(task) {
+    this.stopSessionChatPolling();
+    this.activeChatMode = 'task';
     const chat = await this.ensureTaskChat(task);
+    this.activeTask = task;
     const snapshot = await chat.current();
-    await this.updateTaskFromChatSnapshot(task, snapshot);
-    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    const currentTask = await this.updateTaskFromChatSnapshot(task, snapshot);
+    await this.emitTaskChatSnapshot(currentTask || task, snapshot, { force: true });
+    this.updateTaskChatPolling(currentTask || task, snapshot);
     return snapshot;
   }
 
   async sendTaskMessage(task, text, configuration = {}) {
     const message = String(text || '').trim();
     if (!message) throw new Error('Enter a chat message.');
+    this.stopSessionChatPolling();
+    this.activeChatMode = 'task';
     this.activeMerge = null;
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
@@ -517,62 +700,97 @@ class PatchworkAIChatController {
       });
     }
     const snapshot = await chat.current();
-    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    await this.emitTaskChatSnapshot(currentTask || task, snapshot, { force: true });
+    this.updateTaskChatPolling(currentTask || task, snapshot);
     this.requestMonitor();
     return { task: currentTask, snapshot };
   }
 
   async readSessionChat() {
-    if (!this.activeChat) this.activeChat = await this.chatService.createChat();
-    const snapshot = await this.activeChat.current();
-    return { snapshot, configuration: this.activeChat.configuration };
+    this.stopTaskChatPolling();
+    this.activeChatMode = 'session';
+    if (!this.sessionChat || String(this.sessionChat.id).startsWith('pending:')) {
+      this.activeTask = null;
+      this.activeMerge = null;
+      this.sessionChat = await this.chatService.createChat();
+    }
+    this.activeChat = this.sessionChat;
+    const snapshot = await this.sessionChat.current();
+    this.lastSessionChatFingerprint = chatSnapshotFingerprint(snapshot);
+    this.updateSessionChatPolling(snapshot);
+    return { snapshot, configuration: this.sessionChat.configuration };
   }
 
   async sendSessionMessage(text, configuration = {}) {
     const message = String(text || '').trim();
     if (!message) throw new Error('Enter a chat message.');
-    if (!this.activeChat) this.activeChat = await this.chatService.createChat();
+    this.stopTaskChatPolling();
+    this.activeChatMode = 'session';
+    if (!this.sessionChat || String(this.sessionChat.id).startsWith('pending:')) {
+      this.activeTask = null;
+      this.activeMerge = null;
+      this.sessionChat = await this.chatService.createChat();
+    }
+    this.activeChat = this.sessionChat;
     const selectedConfiguration = {
-      model: String(configuration?.model || this.activeChat.configuration.model || 'default'),
-      reasoning: String(configuration?.reasoning || configuration?.reasoningMode || this.activeChat.configuration.reasoning || 'default'),
+      model: String(configuration?.model || this.sessionChat.configuration.model || 'default'),
+      reasoning: String(configuration?.reasoning || configuration?.reasoningMode || this.sessionChat.configuration.reasoning || 'default'),
     };
-    await this.activeChat.configure(selectedConfiguration);
-    const run = await this.activeChat.send({ text: message });
-    const snapshot = await this.activeChat.current();
+    await this.sessionChat.configure(selectedConfiguration);
+    const run = await this.sessionChat.send({ text: message });
+    const snapshot = await this.sessionChat.current();
+    this.lastSessionChatFingerprint = chatSnapshotFingerprint(snapshot);
+    this.updateSessionChatPolling(snapshot);
     return { snapshot, configuration: run.configuration || selectedConfiguration };
   }
 
   async stopSessionChat() {
-    if (!this.activeChat) return { snapshot: null, configuration: null };
-    await this.activeChat.stop();
+    this.stopTaskChatPolling();
+    this.activeChatMode = 'session';
+    if (!this.sessionChat) return { snapshot: null, configuration: null };
+    this.activeChat = this.sessionChat;
+    await this.sessionChat.stop();
+    const snapshot = await this.sessionChat.current();
+    this.lastSessionChatFingerprint = chatSnapshotFingerprint(snapshot);
+    this.updateSessionChatPolling(snapshot);
     return {
-      snapshot: await this.activeChat.current(),
-      configuration: this.activeChat.configuration,
+      snapshot,
+      configuration: this.sessionChat.configuration,
     };
   }
 
   async newSessionChat() {
+    this.stopTaskChatPolling();
+    this.stopSessionChatPolling();
+    this.activeChatMode = 'session';
     this.activeTask = null;
     this.activeMerge = null;
-    this.activeChat = await this.chatService.createChat();
+    this.sessionChat = await this.chatService.createChat();
+    this.activeChat = this.sessionChat;
     return {
-      snapshot: await this.activeChat.current(),
-      configuration: this.activeChat.configuration,
+      snapshot: await this.sessionChat.current(),
+      configuration: this.sessionChat.configuration,
     };
   }
 
   async stopTaskChat(task) {
+    this.stopSessionChatPolling();
+    this.activeChatMode = 'task';
     this.activeTask = task;
     this.knownTasks.set(task.taskId.toLowerCase(), task);
     const chat = await this.ensureTaskChat(task);
     await chat.stop();
     const snapshot = await chat.current();
     const currentTask = await this.updateTaskFromChatSnapshot(task, snapshot);
-    await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot });
+    await this.emitTaskChatSnapshot(currentTask || task, snapshot, { force: true });
+    this.updateTaskChatPolling(currentTask || task, snapshot);
     return { task: currentTask, snapshot };
   }
 
   async newChat(projectId = null, projectShortUrl = null, configuration = {}) {
+    this.stopTaskChatPolling?.();
+    this.stopSessionChatPolling?.();
+    this.activeChatMode = null;
     this.activeChat = await this.chatService.createChat({
       workspaceId: projectId || null,
       model: configuration.model || 'default',
@@ -726,6 +944,9 @@ class PatchworkAIChatController {
   }
 
   async submitMerge(request) {
+    this.stopTaskChatPolling();
+    this.stopSessionChatPolling();
+    this.activeChatMode = null;
     this.activeTask = null;
     this.activeMerge = {
       ...(await this.worktreeService.get(request.treeId)),
@@ -841,11 +1062,18 @@ class PatchworkAIChatController {
     try {
       const conversationId = task.conversationId || await this.discoverConversationId(task);
       if (!conversationId) return null;
-      const chat = await this.ensureTaskChat({ ...task, conversationId });
+      const chat = this.activeChat?.id === conversationId
+        ? this.activeChat
+        : await this.ensureTaskChat({ ...task, conversationId });
       const current = await chat.current();
-      await this.updateTaskFromChatSnapshot(task, current);
-      if (this.activeTask?.taskId === task.taskId) {
+      const currentTask = await this.updateTaskFromChatSnapshot(task, current);
+      if (typeof this.emitTaskChatSnapshot === 'function') {
+        await this.emitTaskChatSnapshot(currentTask || task, current);
+      } else if (this.activeTask?.taskId === task.taskId) {
         await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot: current });
+      }
+      if (typeof this.updateTaskChatPolling === 'function') {
+        this.updateTaskChatPolling(currentTask || task, current);
       }
       return current;
     } finally {
@@ -865,10 +1093,15 @@ class PatchworkAIChatController {
     this.monitorBusy = true;
     try {
       const expectedName = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
-      const chat = await this.ensureTaskChat(task);
+      const chat = this.activeChat?.id === task.conversationId
+        ? this.activeChat
+        : await this.ensureTaskChat(task);
       const current = await chat.current();
-      if (this.activeTask?.taskId === task.taskId) {
-        await this.onEvent({ type: 'task-chat-snapshot', taskId: task.taskId, snapshot: current });
+      if (typeof this.emitTaskChatSnapshot === 'function') {
+        await this.emitTaskChatSnapshot(task, current);
+      }
+      if (typeof this.updateTaskChatPolling === 'function') {
+        this.updateTaskChatPolling(task, current);
       }
       const ready = force || current.run.status !== AI_CHAT_RUN_STATUS.STREAMING;
       if (!ready) return false;
@@ -995,7 +1228,12 @@ class PatchworkAIChatController {
     this.knownTasks.delete(key);
     this.processingTasks.delete(taskId);
     this.resultAttempts.delete(taskId);
-    if (this.activeTask?.taskId === taskId) this.activeTask = null;
+    if (this.activeTask?.taskId === taskId) {
+      this.activeTask = null;
+      this.stopTaskChatPolling();
+      this.stopSessionChatPolling();
+      this.activeChatMode = null;
+    }
     if (this.pendingDownload?.kind === 'task' && this.pendingDownload.taskId === taskId) {
       this.pendingDownload = null;
     }
