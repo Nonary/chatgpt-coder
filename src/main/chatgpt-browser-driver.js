@@ -60,41 +60,102 @@ function dismissBlockingNoticeAction(input) {
 
 function listWorkspacesAction() {
   const workspaces = new Map();
-  for (const link of document.querySelectorAll('a[href]')) {
-    const match = /\/g\/(g-p-[A-Za-z0-9_-]+)/.exec(link.href || '');
-    const name = String(link.textContent || link.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-    if (match && name) workspaces.set(match[1], { id: match[1], routeId: match[1], name });
+  const roots = [document];
+  const visited = new Set();
+  const links = [];
+  const controls = [];
+  while (roots.length) {
+    const root = roots.shift();
+    if (!root || visited.has(root)) continue;
+    visited.add(root);
+    links.push(...root.querySelectorAll('a[href]'));
+    controls.push(...root.querySelectorAll('button, a, [role="button"]'));
+    for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
   }
-  const authenticationRequired = [...document.querySelectorAll('button, a')]
-    .some((node) => /log in|sign in/i.test(String(node.textContent || node.getAttribute('aria-label') || '')));
+  for (const link of links) {
+    let routeId = null;
+    try {
+      const pathname = new URL(link.getAttribute('href') || link.href || '', location.href).pathname;
+      routeId = /^\/g\/(g-p-[A-Za-z0-9_-]+)(?:\/|$)/i.exec(pathname)?.[1] || null;
+    } catch {}
+    if (!routeId) continue;
+    const parts = routeId.split('-');
+    const id = parts.length > 2 && parts[0] === 'g' && parts[1] === 'p'
+      ? `g-p-${parts[2]}`
+      : routeId;
+    const name = String(link.textContent || link.getAttribute('aria-label') || link.getAttribute('title') || '')
+      .replace(/\s+/g, ' ').trim();
+    if (name && !workspaces.has(id)) workspaces.set(id, { id, routeId, name });
+  }
+  const authenticationRequired = controls.some((node) => /log in|sign in/i.test(String(
+    node.textContent || node.getAttribute('aria-label') || '',
+  )));
   return { workspaces: [...workspaces.values()], authenticationRequired };
 }
 
-function openCreateWorkspaceAction() {
-  const control = [...document.querySelectorAll('button, [role="button"]')].find((node) => (
-    /new project|create project/i.test([
-      node.textContent,
-      node.getAttribute('aria-label'),
-      node.getAttribute('title'),
-    ].filter(Boolean).join(' '))
+function revealWorkspacesAction() {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const visible = (node) => {
+    const bounds = node?.getBoundingClientRect?.();
+    return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
+  };
+  const controls = [...document.querySelectorAll('button, a, [role="button"]')];
+  const control = controls.find((node) => visible(node) && /^(?:projects|view all projects|show more projects|more projects)$/i.test(
+    normalize([node.textContent, node.getAttribute('aria-label'), node.getAttribute('title')].filter(Boolean).join(' ')),
   ));
-  control?.click();
-  return Boolean(control);
+  if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') return false;
+  control.click();
+  return true;
+}
+
+function openCreateWorkspaceAction() {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const visible = (node) => {
+    const bounds = node?.getBoundingClientRect?.();
+    return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
+  };
+  const controls = [...document.querySelectorAll('button, a, [role="button"], [role="menuitem"]')];
+  const exact = controls.find((node) => visible(node) && /^(?:new project|create project)$/i.test(normalize([
+    node.textContent, node.getAttribute('aria-label'), node.getAttribute('title'),
+  ].filter(Boolean).join(' '))));
+  const projectsPageNew = controls.find((node) => visible(node) && /^new$/i.test(normalize(node.textContent))
+    && /project/i.test(normalize(node.closest('main, [role="main"], section')?.textContent)));
+  const menuProject = controls.find((node) => visible(node) && /^project$/i.test(normalize(node.textContent))
+    && Boolean(node.closest('[role="menu"], [data-radix-menu-content], [data-headlessui-state]')));
+  const control = exact || menuProject || projectsPageNew;
+  if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') return false;
+  control.click();
+  return true;
 }
 
 function submitCreateWorkspaceAction(args) {
   const { name } = args;
-  const input = [...document.querySelectorAll('input, textarea')].find((node) => /project name|name/i.test([
-    node.getAttribute('placeholder'), node.getAttribute('aria-label'), node.name,
-  ].filter(Boolean).join(' ')));
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const visible = (node) => {
+    const bounds = node?.getBoundingClientRect?.();
+    return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
+  };
+  const dialog = [...document.querySelectorAll('[role="dialog"], dialog')].find((node) => visible(node)) || document;
+  const labels = [...dialog.querySelectorAll('label')];
+  const projectNameLabel = labels.find((label) => /project name/i.test(normalize(label.textContent)));
+  let input = null;
+  if (projectNameLabel?.htmlFor) input = document.getElementById(projectNameLabel.htmlFor);
+  input ||= projectNameLabel?.querySelector('input, textarea') || null;
+  input ||= [...dialog.querySelectorAll('input, textarea')].find((node) => /project name/i.test(normalize([
+    node.getAttribute('aria-label'), node.name, node.id,
+  ].filter(Boolean).join(' ')))) || null;
+  input ||= [...dialog.querySelectorAll('input, textarea')].find((node) => visible(node) && !node.disabled) || null;
   if (!input) return { ready: false, submitted: false };
-  input.focus();
-  const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(input, name);
-  input.dispatchEvent(new Event('input', { bubbles: true }));
-  const submit = [...document.querySelectorAll('button, [role="button"]')].find((node) => (
-    /^(?:create|save)$/i.test(String(node.textContent || '').trim())
-      && !node.disabled && node.getAttribute('aria-disabled') !== 'true'
+  if (input.value !== name) {
+    input.focus();
+    const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(input, name);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  const submit = [...dialog.querySelectorAll('button, [role="button"]')].find((node) => (
+    /^(?:create|save)$/i.test(normalize(node.textContent))
+      && visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true'
   ));
   submit?.click();
   return { ready: true, submitted: Boolean(submit) };
@@ -139,16 +200,16 @@ async function installConfigurationPickerAction(input) {
   if (!picker) {
     picker = document.createElement('patchwork-ai-chat-configuration');
     picker.id = pickerId;
-    picker.style.cssText = 'display:inline-flex;position:fixed;z-index:2147483646;color:#f4f4f4;font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+    picker.style.cssText = 'display:inline-flex;position:fixed;z-index:2147483646;align-items:center;min-width:0;vertical-align:middle;';
     const shadow = picker.attachShadow({ mode: 'open' });
-    shadow.innerHTML = '<style>button{display:inline-flex;min-height:32px;align-items:center;gap:5px;padding:0 9px;border:0;border-radius:8px;color:inherit;background:#212121;font:500 14px/20px inherit;box-shadow:0 1px 5px #0003;white-space:nowrap;cursor:pointer}button:hover,button[aria-expanded="true"]{background:#2f2f2f}</style><button type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Patchwork model and reasoning"><span></span><span aria-hidden="true">⌄</span></button>';
+    shadow.innerHTML = '<style>:host{display:inline-flex;align-items:center;color:var(--text-primary,#f4f4f4);font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button{display:inline-flex;min-height:32px;align-items:center;gap:4px;padding:0 8px;border:0;border-radius:8px;color:inherit;background:transparent;font:400 14px/20px inherit;white-space:nowrap;cursor:pointer}button:hover,button[aria-expanded="true"]{background:var(--surface-hover,var(--main-surface-secondary,rgba(255,255,255,.08)))}</style><button type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Patchwork model and reasoning"><span></span><span aria-hidden="true">⌄</span></button>';
     document.body.append(picker);
 
     menu = document.createElement('patchwork-ai-chat-configuration-menu');
     menu.id = menuId;
     menu.hidden = true;
     menu.style.cssText = 'position:fixed;z-index:2147483647;width:250px;padding:6px;border:1px solid #ffffff1f;border-radius:14px;background:#212121;color:#f4f4f4;box-shadow:0 14px 36px #0007;font:14px/20px ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
-    menu.innerHTML = '<div data-heading>Model</div><button data-model="sol">GPT-5.6 Sol</button><button data-model="luna">GPT-5.6 Luna</button><hr><div data-heading>Thinking</div><button data-reasoning="default">Model default</button><button data-reasoning="instant">Instant</button><button data-reasoning="low">Low</button><button data-reasoning="medium">Medium</button><button data-reasoning="high">High</button><button data-reasoning="extra-high">Extra High</button><style>:scope{box-sizing:border-box}:scope button{display:flex;width:100%;justify-content:space-between;padding:8px 10px;border:0;border-radius:8px;color:inherit;background:transparent;font:inherit;text-align:left;cursor:pointer}:scope button:hover,:scope button[aria-checked="true"]{background:#2f2f2f}:scope button[aria-checked="true"]::after{content:"✓"}:scope [data-heading]{padding:6px 10px 3px;color:#aaa;font-size:12px;font-weight:600}:scope hr{height:1px;margin:5px 4px;border:0;background:#ffffff1f}</style>';
+    menu.innerHTML = '<div data-heading>Model</div><button data-model="sol">GPT-5.6 Sol</button><button data-model="luna">GPT-5.6 Luna</button><hr><div data-heading>Thinking</div><button data-reasoning="default">Model default</button><button data-reasoning="instant">Instant</button><button data-reasoning="low">Low</button><button data-reasoning="medium">Medium</button><button data-reasoning="high">High</button><button data-reasoning="extra-high">Extra High</button><style>#patchwork-ai-chat-configuration-menu{box-sizing:border-box}#patchwork-ai-chat-configuration-menu>button{display:flex;width:100%;justify-content:space-between;padding:9px 10px;border:0;border-radius:9px;color:inherit;background:transparent;font:inherit;text-align:left;cursor:pointer}#patchwork-ai-chat-configuration-menu>button:hover,#patchwork-ai-chat-configuration-menu>button[aria-checked="true"]{background:#2f2f2f}#patchwork-ai-chat-configuration-menu>button[aria-checked="true"]::after{content:"✓";margin-left:16px;font-size:14px}#patchwork-ai-chat-configuration-menu>[data-heading]{padding:7px 10px 5px;color:#aaa;font-size:12px;font-weight:600}#patchwork-ai-chat-configuration-menu>hr{height:1px;margin:5px 4px;border:0;background:#ffffff1f}</style>';
     document.body.append(menu);
 
     const trigger = shadow.querySelector('button');
@@ -444,8 +505,12 @@ function downloadAttachmentAction(input) {
     .filter((element) => normalize(element.textContent || element.getAttribute('aria-label')).includes(input.name));
   for (const match of matches) {
     const container = match.closest('article, [data-message-author-role="assistant"], li, div') || match.parentElement;
-    const control = (match.matches('a[download], button[aria-label*="download" i]') ? match : null)
-      || container?.querySelector('a[download], button[aria-label*="download" i], [role="button"][aria-label*="download" i]');
+    const control = (match.matches('a[download], button[aria-label*="download" i], [role="button"][aria-label*="download" i]')
+      ? match
+      : null)
+      || container?.querySelector('a[download], button[aria-label*="download" i], [role="button"][aria-label*="download" i]')
+      || (match.matches('a[href], button, [role="button"]') ? match : null)
+      || match.closest('a[href], button, [role="button"]');
     if (!control || control.disabled || control.getAttribute('aria-disabled') === 'true') continue;
     control.click();
     return true;
@@ -471,6 +536,8 @@ class ChatGPTBrowserDriver {
   }
 
   listWorkspaces() { return this.#execute(listWorkspacesAction); }
+
+  revealWorkspaces() { return this.#execute(revealWorkspacesAction); }
 
   openCreateWorkspace() { return this.#execute(openCreateWorkspaceAction); }
 

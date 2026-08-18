@@ -1886,6 +1886,9 @@ async function generateGitSummary() {
   button.textContent = 'Generating…';
   try {
     const result = await window.patchwork.gitSummary(repositoryPath, gitSummaryPrompt());
+    const task = await window.patchwork.openTask(result.taskId);
+    upsertTask(task);
+    showTask(task);
     showToast(result.usedCustomPrompt
       ? 'Git Summary is ready in the task view using your saved prompt.'
       : 'Git Summary is ready in the task view using the built-in prompt.');
@@ -2287,7 +2290,6 @@ async function initialize() {
 initialize();
 
 function upsertTask(task) {
-  if (task?.summaryOnly) return;
   const index = state.tasks.findIndex((item) => item.taskId === task.taskId);
   if (index >= 0) state.tasks[index] = task;
   else state.tasks.unshift(task);

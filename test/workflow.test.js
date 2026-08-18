@@ -140,9 +140,11 @@ test('Source Control summaries run as persistent Luna Medium tasks with an expli
   assert.match(summaryHandler, /ipcMain\.handle\('task:use-git-summary'/);
   assert.doesNotMatch(summaryHandler, /deleteTask\(task\.taskId\)/);
   assert.doesNotMatch(renderer, /const hiddenTask = Boolean\(event\.task\?\.summaryOnly\)/);
+  assert.doesNotMatch(renderer, /if \(task\?\.summaryOnly\) return/);
   assert.match(renderer, /task\.summaryOnly \|\| task\.state !== 'ready'/);
   assert.match(renderer, /Generating Git Summary/);
   assert.match(renderer, /useActiveGitSummary/);
+  assert.match(renderer, /const task = await window\.patchwork\.openTask\(result\.taskId\);[\s\S]*upsertTask\(task\);[\s\S]*showTask\(task\)/);
   assert.match(renderer, /source-commit-message'\]\.value = completed\.result\.commitMessage/);
   assert.doesNotMatch(renderer, /source-commit-message'\]\.value = result\.commitMessage/);
   assert.match(markup, /id="use-git-summary-button"[^>]*>Use in Source Control<\/button>/);
@@ -1597,6 +1599,7 @@ test('AIChat exposes chat, attachment, message, snapshot, and run operations as 
   const installedConfigurations = [];
   const interceptedConfigurations = [];
   const interceptedDrafts = [];
+  let attachmentStateReads = 0;
   const browser = {
     listWorkspaces: async () => ({ workspaces: [], authenticationRequired: false }),
     readSessionState: async () => ({ authenticated: true }),
@@ -1615,7 +1618,12 @@ test('AIChat exposes chat, attachment, message, snapshot, and run operations as 
     insertPrompt: async () => ({ available: true, present: true, length: 15 }),
     promptState: async () => ({ available: true, present: true, length: 15 }),
     attachFile: async () => true,
-    attachmentState: async () => ({ present: true, busy: false, confirmed: true }),
+    attachmentState: async () => {
+      attachmentStateReads += 1;
+      return attachmentStateReads === 1
+        ? { present: true, busy: false, confirmed: true }
+        : { present: false, busy: false, confirmed: false };
+    },
     sendState: async () => ({ available: true, enabled: true }),
     clickSend: async () => { url = `${CHATGPT_URL}c/${conversationId}`; return { enabled: true }; },
     stopRun: async () => true,
@@ -1660,6 +1668,7 @@ test('AIChat exposes chat, attachment, message, snapshot, and run operations as 
     thinkingEffort: 'extended',
   }]);
   assert.deepEqual(interceptedDrafts, [{ prompt: 'Implement this.', attachments: ['task.zip'] }]);
+  assert.equal(attachmentStateReads, 1);
   assert.deepEqual(await chat.current(), {
     id: conversationId,
     title: 'Completed task',
@@ -1855,6 +1864,29 @@ test('the browser provider enters prompts through browser input instead of mutat
   assert.ok(commands.some(({ method, parameters }) => (
     method === 'Input.insertText' && parameters.text === 'Actual controlled input'
   )));
+});
+
+test('the browser provider activates a clickable generated attachment card when no download control exists', async () => {
+  let clicked = false;
+  const card = {
+    textContent: 'chatgpt-ide-result-task.txt',
+    disabled: false,
+    getAttribute: () => null,
+    matches: (selector) => selector.includes('button'),
+    closest: () => null,
+    parentElement: null,
+    click: () => { clicked = true; },
+  };
+  const driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, {
+      document: {
+        querySelectorAll: () => [card],
+      },
+    }),
+  });
+
+  assert.equal(await driver.downloadAttachment('chatgpt-ide-result-task.txt'), true);
+  assert.equal(clicked, true);
 });
 
 test('the browser provider privately applies Luna to the next conversation request', async () => {

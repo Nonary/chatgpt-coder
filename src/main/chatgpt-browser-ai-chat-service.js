@@ -38,6 +38,20 @@ function conversationId(value) {
   }
 }
 
+function workspaceId(value) {
+  try {
+    const routeId = /^\/g\/(g-p-[A-Za-z0-9_-]+)(?:\/|$)/i.exec(new URL(value).pathname)?.[1] || null;
+    if (!routeId) return null;
+    const parts = routeId.split('-');
+    const id = parts.length > 2 && parts[0] === 'g' && parts[1] === 'p'
+      ? `g-p-${parts[2]}`
+      : routeId;
+    return WORKSPACE_ID_PATTERN.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
 function workspaceUrl(workspaceId) {
   if (!WORKSPACE_ID_PATTERN.test(String(workspaceId || ''))) {
     throw new AIChatError(AI_CHAT_ERROR_CODE.INVALID_INPUT, 'The AI workspace ID is invalid.');
@@ -89,14 +103,20 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   }
 
   async #listWorkspaces() {
-    const result = await this.#browser.listWorkspaces();
-    if (result.authenticationRequired && result.workspaces.length === 0) {
-      throw new AIChatError(
-        AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
-        'Sign in to the AI session before loading workspaces.',
-      );
+    let lastResult = { workspaces: [], authenticationRequired: false };
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      lastResult = await this.#browser.listWorkspaces();
+      if (lastResult.authenticationRequired && lastResult.workspaces.length === 0) {
+        throw new AIChatError(
+          AI_CHAT_ERROR_CODE.AUTHENTICATION_REQUIRED,
+          'Sign in to the AI session before loading workspaces.',
+        );
+      }
+      if (lastResult.workspaces.length > 0) break;
+      if (attempt === 0) await this.#browser.revealWorkspaces?.().catch(() => false);
+      await delay(250);
     }
-    return result.workspaces
+    return lastResult.workspaces
       .map(({ id, name }) => ({ id, name }))
       .sort((left, right) => left.name.localeCompare(right.name));
   }
@@ -108,16 +128,24 @@ class ChatGPTBrowserAIChatService extends AIChatService {
   async #createWorkspace(input) {
     const name = String(input?.name || input || '').trim();
     if (!name) throw new AIChatError(AI_CHAT_ERROR_CODE.INVALID_INPUT, 'Enter a workspace name.');
-    if (!await this.#browser.openCreateWorkspace()) {
-      throw new AIChatError(AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE, 'The AI session does not expose workspace creation.');
-    }
+    await this.#browser.revealWorkspaces?.().catch(() => false);
+    let submitted = false;
     const startedAt = Date.now();
     while (Date.now() - startedAt < 10_000) {
-      const result = await this.#browser.submitCreateWorkspace(name);
-      if (result.submitted) break;
+      await this.#browser.openCreateWorkspace().catch(() => false);
+      const result = await this.#browser.submitCreateWorkspace(name).catch(() => ({ ready: false, submitted: false }));
+      if (result.submitted) {
+        submitted = true;
+        break;
+      }
       await delay(250);
     }
-    for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (!submitted) {
+      throw new AIChatError(AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE, 'The AI session does not expose workspace creation.');
+    }
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const id = workspaceId(this.#webContents.getURL());
+      if (id) return { id, name };
       const workspace = (await this.#listWorkspaces()).find((item) => item.name === name);
       if (workspace) return workspace;
       await delay(300);
@@ -302,15 +330,6 @@ class ChatGPTBrowserAIChatService extends AIChatService {
       }
       if (!(await this.#browser.promptState(text)).present) {
         throw new AIChatError(AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE, 'The confirmed prompt disappeared before Send.');
-      }
-      for (const filename of expectedAttachments) {
-        const state = await this.#browser.attachmentState(filename, { dismissDuplicate: true });
-        if (state.confirmed !== true || state.busy) {
-          throw new AIChatError(
-            AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE,
-            `The confirmed attachment ${filename} disappeared before Send.`,
-          );
-        }
       }
       if (!(await this.#browser.clickSend()).enabled) {
         throw new AIChatError(AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE, 'The AI session did not accept Send.');
