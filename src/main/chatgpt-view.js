@@ -137,6 +137,7 @@ class PatchworkAIChatController {
       .sort((left, right) => String(right.updatedAt || right.createdAt)
         .localeCompare(String(left.updatedAt || left.createdAt)))[0] || null;
     this.resultAttempts = new Map();
+    this.resultMisses = new Map();
     this.resultWaiters = new Map();
     this.pendingDownload = null;
     this.processingTasks = new Set();
@@ -146,6 +147,7 @@ class PatchworkAIChatController {
     this.dismissedNoticeEvents = new Map();
     this.liveChatFingerprints = new Map();
     this.liveChatSnapshotQueue = Promise.resolve();
+    this.chatAwaitingEmptyTranscript = null;
     this.monitorQueued = false;
     this.taskChatPollTimer = null;
     this.taskChatPollQueued = false;
@@ -577,9 +579,30 @@ class PatchworkAIChatController {
   }
 
   async processBrowserChatSnapshot(payload) {
+    if (!payload?.snapshot) return;
     const url = String(payload?.url || this.view.webContents.getURL?.() || '');
-    const conversationId = conversationIdFromRouteUrl(url);
-    if (!conversationId || !payload?.snapshot) return;
+    const routeId = conversationIdFromRouteUrl(url);
+    // A brand-new chat has no conversation route until Send creates one.
+    // Between the two, the page holds the only copy of the user's turn and the
+    // start of the response, so the native session chat still follows it.
+    const pendingSessionId = !routeId && this.activeChatMode === 'session'
+      && String(this.sessionChat?.id || '').startsWith('pending:')
+      ? this.sessionChat.id
+      : null;
+    const conversationId = routeId || pendingSessionId;
+    if (!conversationId) return;
+    if (pendingSessionId) {
+      // ChatGPT's router clears the old transcript a beat after its New chat
+      // control is activated. Until the page has actually shown an empty
+      // transcript once, anything it reports still belongs to the chat that was
+      // left behind, and painting it here is what made a new chat open holding
+      // the previous conversation.
+      const messageCount = Array.isArray(payload.snapshot.messages) ? payload.snapshot.messages.length : 0;
+      if (this.chatAwaitingEmptyTranscript === pendingSessionId) {
+        if (messageCount > 0) return;
+        this.chatAwaitingEmptyTranscript = null;
+      }
+    }
     const snapshot = {
       ...payload.snapshot,
       id: conversationId,
@@ -698,6 +721,16 @@ class PatchworkAIChatController {
       || (this.activeChatMode === 'task' ? this.activeChat?.id || null : null);
   }
 
+  // Background work may only borrow the shared browser when the conversation on
+  // screen can be handed it back. A chat that has never been sent lives on
+  // ChatGPT's fresh-chat route, and re-establishing that route means clicking
+  // New chat again, which would discard whatever the user is composing. So a
+  // pending chat is never interrupted; its tasks wait for the next sweep.
+  focusedConversationIsBusy() {
+    if (String(this.focusedConversationId() || '').startsWith('pending:')) return true;
+    return this.focusedConversationIsStreaming();
+  }
+
   focusedConversationIsStreaming() {
     if (this.activeChatMode === 'session') return Boolean(this.sessionChatPollTimer);
     const task = this.activeTask;
@@ -725,7 +758,8 @@ class PatchworkAIChatController {
   // Hand the shared browser back to the conversation on screen and give the
   // native transcript whatever it missed while the route was borrowed.
   async restoreFocusedConversation(conversationId) {
-    if (!conversationId || this.visible || this.view.webContents.isDestroyed()) return;
+    if (!conversationId || String(conversationId).startsWith('pending:')) return;
+    if (this.visible || this.view.webContents.isDestroyed()) return;
     if (conversationIdFromRouteUrl(this.view.webContents.getURL()) === conversationId) return;
     const chat = this.activeChat?.id === conversationId ? this.activeChat : null;
     if (!chat) return;
@@ -828,7 +862,7 @@ class PatchworkAIChatController {
   async readSessionChat() {
     this.stopTaskChatPolling();
     this.activeChatMode = 'session';
-    if (!this.sessionChat || String(this.sessionChat.id).startsWith('pending:')) {
+    if (!this.sessionChat) {
       this.activeTask = null;
       this.activeMerge = null;
       this.sessionChat = await this.chatService.createChat();
@@ -845,10 +879,10 @@ class PatchworkAIChatController {
     if (!message) throw new Error('Enter a chat message.');
     this.stopTaskChatPolling();
     this.activeChatMode = 'session';
-    if (!this.sessionChat || String(this.sessionChat.id).startsWith('pending:')) {
+    if (!this.sessionChat) {
       this.activeTask = null;
       this.activeMerge = null;
-      this.sessionChat = await this.chatService.createChat();
+      this.sessionChat = await this.chatService.createChat(configuration || {});
     }
     this.activeChat = this.sessionChat;
     const selectedConfiguration = {
@@ -878,18 +912,25 @@ class PatchworkAIChatController {
     };
   }
 
-  async newSessionChat() {
+  async newSessionChat(configuration = null) {
     this.stopTaskChatPolling();
     this.stopSessionChatPolling();
     this.activeChatMode = 'session';
     this.activeTask = null;
     this.activeMerge = null;
-    this.sessionChat = await this.chatService.createChat();
+    // Starting a new chat is not a request to go back to the default model.
+    const carried = configuration || this.sessionChat?.configuration || {};
+    this.sessionChat = await this.chatService.createChat({
+      model: carried.model || 'default',
+      reasoning: carried.reasoning || 'default',
+    });
     this.activeChat = this.sessionChat;
-    return {
-      snapshot: await this.sessionChat.current(),
-      configuration: this.sessionChat.configuration,
-    };
+    this.liveChatFingerprints.delete(this.sessionChat.id);
+    this.lastSessionChatFingerprint = null;
+    this.chatAwaitingEmptyTranscript = this.sessionChat.id;
+    const snapshot = await this.sessionChat.current();
+    await this.emitSessionChatSnapshot(snapshot, { force: true });
+    return { snapshot, configuration: this.sessionChat.configuration };
   }
 
   async stopTaskChat(task) {
@@ -1013,8 +1054,14 @@ class PatchworkAIChatController {
       reasoningMode: run.configuration?.reasoning || task.reasoningMode,
     });
     this.activeTask = submittedTask;
+    this.activeChatMode = 'task';
     this.knownTasks.set(task.taskId.toLowerCase(), submittedTask);
     this.installResultWatcher();
+    // Hand the task view the running conversation now and start following it.
+    // Without this the transcript stays blank until the first background sweep,
+    // which reads as nothing happening for up to fifteen seconds.
+    await this.emitTaskChatSnapshot(submittedTask, current, { force: true });
+    this.updateTaskChatPolling(submittedTask, current);
     await this.onEvent({
       type: 'task-submitted',
       task: submittedTask,
@@ -1093,7 +1140,10 @@ class PatchworkAIChatController {
   }
 
   async monitorPage() {
-    if (this.visible || this.view.webContents.isDestroyed()) return false;
+    if (this.view.webContents.isDestroyed()) return false;
+    // Dismissing a blocking notice is worth doing whether or not the browser is
+    // on screen: while one is up it swallows clicks on the composer, Send, and
+    // New chat, so every automated step below would fail for the same reason.
     const recovery = await this.chatService.recoverSession();
     if (recovery.resolved) {
       const eventKey = String(recovery.notice || 'blocking-notice').toLowerCase();
@@ -1107,6 +1157,8 @@ class PatchworkAIChatController {
       }
     }
 
+    if (this.visible) return false;
+
     if (this.activeMerge?.mergeState === 'submitted' && await this.checkForMerge()) return true;
 
     // Every submitted task shares the one authenticated browser, so this sweep
@@ -1114,7 +1166,7 @@ class PatchworkAIChatController {
     // screen goes first, a live stream is never interrupted for a background
     // check, and a borrowed route is always handed back.
     const focusedId = this.focusedConversationId();
-    const streamingFocus = this.focusedConversationIsStreaming();
+    const busyFocus = this.focusedConversationIsBusy();
     const conversationOf = (task) => task.conversationId || conversationIdFromRouteUrl(task.conversationUrl);
     const tasks = [...this.knownTasks.values()]
       .filter((task) => task.state === 'submitted' && (
@@ -1129,7 +1181,7 @@ class PatchworkAIChatController {
       for (const task of tasks) {
         if (this.visible) break;
         if (focusedId && conversationOf(task) !== focusedId) {
-          if (streamingFocus) continue;
+          if (busyFocus) continue;
           borrowedRoute = true;
         }
         await this.checkConversationStatus(task);
@@ -1225,7 +1277,11 @@ class PatchworkAIChatController {
     if (this.processingTasks.has(task.taskId) || this.view.webContents.isDestroyed()) return false;
     if (this.pendingDownload && Date.now() - this.pendingDownload.startedAt < 20_000) return false;
     const attemptedAt = this.resultAttempts.get(task.taskId) || 0;
-    if (!force && Date.now() - attemptedAt < RESULT_RETRY_MILLISECONDS) return false;
+    // Each miss widens the gap before the next look. A task whose conversation
+    // never produces a result would otherwise pull the one shared browser back
+    // to it every single sweep, forever.
+    const retryDelay = RESULT_RETRY_MILLISECONDS * Math.min(this.resultMisses.get(task.taskId) || 1, 20);
+    if (!force && Date.now() - attemptedAt < retryDelay) return false;
 
     this.monitorBusy = true;
     try {
@@ -1246,8 +1302,11 @@ class PatchworkAIChatController {
         if (this.pendingDownload?.kind === 'task' && this.pendingDownload.taskId === task.taskId) {
           this.pendingDownload = null;
         }
+        this.resultAttempts.set(task.taskId, Date.now());
+        this.resultMisses.set(task.taskId, (this.resultMisses.get(task.taskId) || 0) + 1);
         return false;
       }
+      this.resultMisses.delete(task.taskId);
       this.resultAttempts.set(task.taskId, Date.now());
       await this.onEvent({
         type: 'result-link-activated',
@@ -1366,6 +1425,7 @@ class PatchworkAIChatController {
     this.knownTasks.delete(key);
     this.processingTasks.delete(taskId);
     this.resultAttempts.delete(taskId);
+    this.resultMisses.delete(taskId);
     if (this.activeTask?.taskId === taskId) {
       this.activeTask = null;
       this.stopTaskChatPolling();

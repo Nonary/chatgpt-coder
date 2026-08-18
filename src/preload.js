@@ -33,7 +33,7 @@ contextBridge.exposeInMainWorld('patchwork', {
   getSessionChat: () => ipcRenderer.invoke('session:chat'),
   sendSessionChatMessage: (text, configuration) => ipcRenderer.invoke('session:chat-send', text, configuration),
   stopSessionChat: () => ipcRenderer.invoke('session:chat-stop'),
-  newSessionChat: () => ipcRenderer.invoke('session:chat-new'),
+  newSessionChat: (configuration) => ipcRenderer.invoke('session:chat-new', configuration),
   setTaskTarget: (taskId, input) => ipcRenderer.invoke('task:set-target', taskId, input),
   useGitSummary: (taskId) => ipcRenderer.invoke('task:use-git-summary', taskId),
   resolveTaskConflict: (taskId, options) => ipcRenderer.invoke('task:resolve-conflict', taskId, options),

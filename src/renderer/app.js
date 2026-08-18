@@ -1821,9 +1821,13 @@ async function stopSessionChat() {
 
 async function startNewSessionChat() {
   try {
-    const result = await window.patchwork.newSessionChat();
+    // Starting a new chat is not a request to go back to the default model.
+    const result = await window.patchwork.newSessionChat({
+      model: elements['session-chat-model-select'].value,
+      reasoning: elements['session-chat-reasoning-select'].value,
+    });
     state.sessionSnapshot = result?.snapshot || null;
-    state.sessionConfiguration = setChatConfigurationSelects('session', result?.configuration || { model: 'default', reasoning: 'default' });
+    state.sessionConfiguration = setChatConfigurationSelects('session', result?.configuration || state.sessionConfiguration);
     state.sessionError = null;
     closeSessionBrowser();
     renderSessionChat();
@@ -2841,6 +2845,11 @@ window.patchwork.onTaskEvent((event) => {
     if (event.recovery) state.projectRecoveryUsed = true;
     setProjectListStatus(event.message, event.recovery ? 'recovery' : null);
   }
+  // A Git Summary runs the full submit-and-wait pipeline. Opening its task view
+  // as it starts is what makes that visible: the mirrored chat, the activity
+  // log, and the run status all key off the active task.
+  if (event.type === 'git-summary-started' && event.task) showTask(event.task);
+  if (event.type === 'git-summary-failed') showToast(event.message || 'The Git Summary failed.', true);
   if (event.type === 'browser-login-required') showToast(event.message, true);
   if (event.type === 'tree-created' || event.type === 'tree-removed' || event.type === 'tree-merged') {
     refreshTrees().catch(() => {});

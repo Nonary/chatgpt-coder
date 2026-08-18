@@ -105,9 +105,14 @@ function dismissBlockingNoticeAction(input) {
     exactModal,
     ...document.querySelectorAll([
       '[role="alertdialog"]',
+      // ChatGPT's limit notices ship as ordinary dialogs as often as alert
+      // dialogs. Matching the role alone would be far too broad, so every
+      // container below still has to match the limit-notice text to qualify.
+      '[role="dialog"]',
       '[role="alert"]',
       '[data-sonner-toast]',
       '[data-testid*="toast"]',
+      '[data-testid*="rate-limit" i]',
     ].join(', ')),
   ].filter((item, index, all) => item && all.indexOf(item) === index);
   for (const container of containers) {
@@ -430,23 +435,33 @@ async function installConfigurationPickerAction(input) {
     return Boolean(bounds && bounds.width > 0 && bounds.height > 0);
   };
   const nativeLabel = /^(?:ChatGPT(?:\s+5(?:\.\d+)*)?|GPT-5(?:\.\d+)*(?:\s+(?:Instant|Thinking|Auto|Pro))?|Instant|Thinking(?:\s+mini)?|Auto|Pro)$/i;
+  // Finding the native model control means measuring every button on the page.
+  // That is far too expensive to repeat while a response streams, so the result
+  // is cached and only re-derived once the cached control leaves the document
+  // or stops being visible.
   const findAnchor = () => {
+    const cached = globalThis.__patchworkAIChatConfigurationAnchor;
+    if (cached?.isConnected && visible(cached)) return cached;
     const semantic = [...document.querySelectorAll('button, [role="button"], [aria-haspopup="menu"]')]
       .find((candidate) => visible(candidate) && nativeLabel.test(String(candidate.textContent || '').replace(/\s+/g, ' ').trim()));
     const selected = [...document.querySelectorAll(nativeSelector)]
       .map((node) => node.closest('button, [role="button"], [aria-haspopup="menu"]') || node)
       .find(visible);
-    return selected || semantic || null;
+    const anchor = selected || semantic || null;
+    globalThis.__patchworkAIChatConfigurationAnchor = anchor;
+    return anchor;
   };
   const state = globalThis.__patchworkAIChatConfiguration;
   const selection = state?.chatKey === input.chatKey
     ? state
     : { chatKey: input.chatKey, model: input.model, reasoning: input.reasoning };
-  // The renderer can change the selection after the picker was installed for
-  // a fresh (pending) chat. Keep that explicit configuration authoritative
-  // rather than leaving the initial Sol/default values in the page picker.
+  // Patchwork owns the configuration and the page picker mirrors it. Writing
+  // the requested values on every install keeps a stale picker from speaking
+  // for a chat, and clearing the flag below lets a later read tell an actual
+  // in-page choice apart from the value Patchwork just wrote.
   selection.model = input.model;
   selection.reasoning = input.reasoning;
+  selection.userSelected = false;
   globalThis.__patchworkAIChatConfiguration = selection;
   const currentSelection = () => globalThis.__patchworkAIChatConfiguration;
 
@@ -483,6 +498,7 @@ async function installConfigurationPickerAction(input) {
       const current = currentSelection();
       if (option.dataset.model) current.model = option.dataset.model;
       if (option.dataset.reasoning) current.reasoning = option.dataset.reasoning;
+      current.userSelected = true;
       picker.__patchworkRender?.();
       menu.hidden = true;
       trigger.setAttribute('aria-expanded', 'false');
@@ -535,12 +551,17 @@ async function installConfigurationPickerAction(input) {
     ));
     if (!externalChange || renderPending) return;
     renderPending = true;
-    requestAnimationFrame(() => {
+    // Streaming text mutates the page continuously. The picker only has to
+    // follow ChatGPT's own control when the composer moves, so it repositions
+    // on a slow interval rather than once per animation frame.
+    setTimeout(() => {
       renderPending = false;
       render();
-    });
+    }, 250);
   });
-  observer.observe(document.body, { attributes: true, childList: true, subtree: true });
+  // Attribute mutations are excluded for the same reason: ChatGPT rewrites
+  // class names constantly, and none of that moves the composer.
+  observer.observe(document.body, { childList: true, subtree: true });
   globalThis.__patchworkAIChatConfigurationObserver = observer;
   return {
     model: currentSelection().model,
@@ -551,7 +572,13 @@ async function installConfigurationPickerAction(input) {
 function readConfigurationPickerAction() {
   const picker = document.getElementById('patchwork-ai-chat-configuration');
   if (!picker) return null;
-  return { model: picker.getAttribute('data-model'), reasoning: picker.getAttribute('data-reasoning') };
+  const selection = globalThis.__patchworkAIChatConfiguration || {};
+  return {
+    chatKey: selection.chatKey ?? null,
+    model: selection.model || picker.getAttribute('data-model'),
+    reasoning: selection.reasoning || picker.getAttribute('data-reasoning'),
+    userSelected: Boolean(selection.userSelected),
+  };
 }
 
 function promptStateAction(input) {

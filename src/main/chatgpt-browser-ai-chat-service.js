@@ -298,6 +298,7 @@ class ChatGPTBrowserAIChatService extends AIChatService {
 
   async #send(descriptor, message) {
     await this.#ensureOpen(descriptor);
+    await this.#ensureFreshChat(descriptor);
     const text = String(message?.text ?? message ?? '').trim();
     if (!text) throw new AIChatError(AI_CHAT_ERROR_CODE.INVALID_INPUT, 'A message is required.');
     if (!await this.#waitFor(async () => {
@@ -318,8 +319,15 @@ class ChatGPTBrowserAIChatService extends AIChatService {
     }
     const messageAttachments = Array.isArray(message?.attachments) ? message.attachments : [];
     for (const attachment of messageAttachments) await this.#attach(descriptor, attachment);
+    // The in-page picker is Patchwork's own control, and #configure above just
+    // wrote this chat's configuration into it. Adopting whatever it reports
+    // would let a stale or re-rendered picker silently replace the model the
+    // task was created with, so only a change the user actually made in the
+    // page, for this chat, is taken.
     const selected = await this.#browser.readConfigurationPicker();
-    if (selected) descriptor.configuration = normalizeConfiguration(selected);
+    if (selected?.userSelected && (!selected.chatKey || selected.chatKey === descriptor.id)) {
+      descriptor.configuration = normalizeConfiguration(selected);
+    }
     const requestConfiguration = providerRequestConfiguration(descriptor.configuration);
     let requestOverride;
     try {
@@ -360,16 +368,8 @@ class ChatGPTBrowserAIChatService extends AIChatService {
       return nextId;
     }, 30_000, 250);
     if (!id) throw new AIChatError(AI_CHAT_ERROR_CODE.TIMED_OUT, 'The AI session did not create a chat after Send.');
-    const previousId = descriptor.id;
-    descriptor.id = id;
-    descriptor.requiresNewConversation = false;
-    descriptor.previousConversationId = null;
+    this.#adopt(descriptor, id);
     descriptor.title = this.#webContents.getTitle?.() || null;
-    if (this.#attachmentsByChat.has(previousId)) {
-      this.#attachmentsByChat.set(id, this.#attachmentsByChat.get(previousId));
-      this.#attachmentsByChat.delete(previousId);
-    }
-    this.#runStatusByChat.delete(previousId);
     this.#runStatusByChat.set(id, AI_CHAT_RUN_STATUS.STREAMING);
     return {
       chatId: id,
@@ -388,6 +388,16 @@ class ChatGPTBrowserAIChatService extends AIChatService {
 
   async #current(descriptor) {
     await this.#ensureOpen(descriptor);
+    // A chat that has never been sent owns no conversation. Whatever the shared
+    // browser is rendering belongs to some other chat, so reading it here is
+    // what made a brand-new chat open showing the previous transcript. If the
+    // browser has genuinely landed on a conversation since — Send completed, or
+    // the user drove the page directly — adopt it instead.
+    if (!CHAT_ID_PATTERN.test(descriptor.id)) {
+      const routeId = conversationId(this.#webContents.getURL?.());
+      if (routeId && routeId !== descriptor.previousConversationId) this.#adopt(descriptor, routeId);
+      else return this.#emptySnapshot(descriptor);
+    }
     const [content, run] = await Promise.all([
       this.#browser.readChatSnapshot(),
       this.#browser.readRunStatus(),
@@ -440,6 +450,60 @@ class ChatGPTBrowserAIChatService extends AIChatService {
         configuration: { ...descriptor.configuration },
       },
     };
+  }
+
+  // Every chat shares one browser, so the route can move between creating a
+  // chat and sending its first message. Typing from a conversation route would
+  // append this message to somebody else's conversation and then wait forever
+  // for a new conversation that can never appear, so the fresh-chat route is
+  // re-established first.
+  async #ensureFreshChat(descriptor) {
+    if (!descriptor.requiresNewConversation || CHAT_ID_PATTERN.test(descriptor.id)) return;
+    const routeId = conversationId(this.#webContents.getURL?.());
+    if (!routeId) return;
+    if (typeof this.#browser.startNewChat === 'function') {
+      const started = await this.#browser.startNewChat(descriptor.workspaceId);
+      if (!started?.activated) {
+        throw new AIChatError(
+          AI_CHAT_ERROR_CODE.CONTROL_UNAVAILABLE,
+          'ChatGPT did not expose its New chat control.',
+        );
+      }
+    } else {
+      await this.#browser.navigate(descriptor.workspaceId ? workspaceUrl(descriptor.workspaceId) : CHATGPT_HOME);
+    }
+    descriptor.previousConversationId = routeId;
+  }
+
+  #emptySnapshot(descriptor) {
+    descriptor.title = null;
+    return {
+      id: descriptor.id,
+      title: null,
+      messages: [],
+      thinkingSummary: null,
+      attachments: [...(this.#attachmentsByChat.get(descriptor.id) || [])].map((item) => ({ ...item })),
+      run: {
+        status: AI_CHAT_RUN_STATUS.UNKNOWN,
+        error: null,
+        configuration: { ...descriptor.configuration },
+      },
+    };
+  }
+
+  #adopt(descriptor, id) {
+    const previousId = descriptor.id;
+    descriptor.id = id;
+    descriptor.requiresNewConversation = false;
+    descriptor.previousConversationId = null;
+    if (this.#attachmentsByChat.has(previousId)) {
+      this.#attachmentsByChat.set(id, this.#attachmentsByChat.get(previousId));
+      this.#attachmentsByChat.delete(previousId);
+    }
+    const runStatus = this.#runStatusByChat.get(previousId);
+    this.#runStatusByChat.delete(previousId);
+    if (runStatus) this.#runStatusByChat.set(id, runStatus);
+    return id;
   }
 
   async #ensureOpen(descriptor) {

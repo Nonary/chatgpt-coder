@@ -167,6 +167,10 @@ function registerIpc() {
     emit({ type: 'task-prepared', task: publicTask(task) });
     emit({
       type: 'git-summary-started',
+      // Carrying the task lets the renderer open its view right away, so the
+      // run is watchable while it happens instead of only once it finishes.
+      task: publicTask(task),
+      taskId: task.taskId,
       repositoryPath: status.repository.path,
       message: `Packaging ${status.changes.length} uncommitted change${status.changes.length === 1 ? '' : 's'} for Git Summary…`,
     });
@@ -397,7 +401,9 @@ function registerIpc() {
     chatController.enqueue(() => chatController.sendSessionMessage(text, configuration))
   ));
   ipcMain.handle('session:chat-stop', async () => chatController.enqueue(() => chatController.stopSessionChat()));
-  ipcMain.handle('session:chat-new', async () => chatController.enqueue(() => chatController.newSessionChat()));
+  ipcMain.handle('session:chat-new', async (_event, configuration = null) => (
+    chatController.enqueue(() => chatController.newSessionChat(configuration))
+  ));
   ipcMain.handle('task:set-target', async (_event, taskId, input = {}) => {
     const task = await taskService.getTask(taskId);
     const writableRepositories = (Array.isArray(task.repositories) ? task.repositories : [])

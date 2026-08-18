@@ -1733,6 +1733,205 @@ test('AIChat keeps a newly sent chat streaming until ChatGPT renders a run statu
   assert.equal((await chat.current()).run.status, 'streaming');
 });
 
+test('a chat that has never been sent shows an empty transcript, not the page’s last conversation', async () => {
+  const previousId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const adoptedId = '7b91fbd0-2761-4bfb-9710-bec522c925cd';
+  let url = `${CHATGPT_URL}c/${previousId}`;
+  const browser = {
+    startNewChat: async () => { url = CHATGPT_URL; return { activated: true, action: 'new-chat' }; },
+    installConfigurationPicker: async ({ model, reasoning }) => ({ model, reasoning }),
+    readChatSnapshot: async () => ({
+      messages: [{ id: 'm1', role: 'assistant', content: 'Answer from the chat that was left behind.' }],
+      attachments: [],
+    }),
+    readRunStatus: async () => ({ status: 'completed' }),
+  };
+  const service = new ChatGPTBrowserAIChatService({
+    getURL: () => url,
+    getTitle: () => 'Old conversation',
+    navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+  }, browser);
+
+  const chat = await service.createChat({ model: 'luna' });
+  const fresh = await chat.current();
+  assert.deepEqual(fresh.messages, [], 'a fresh chat does not inherit the previous transcript');
+  assert.equal(fresh.run.status, 'unknown');
+  assert.deepEqual(fresh.run.configuration, { model: 'luna', reasoning: 'default' });
+
+  // Driving the shared browser to a real conversation adopts it.
+  url = `${CHATGPT_URL}c/${adoptedId}`;
+  const adopted = await chat.current();
+  assert.equal(adopted.id, adoptedId);
+  assert.equal(adopted.messages.length, 1);
+});
+
+test('a first message never lands in whatever conversation the shared browser drifted to', async () => {
+  // Reproduces the real failure: the session view opens a fresh chat, the
+  // background result monitor then pulls the one browser to a submitted task's
+  // conversation, and the user's first message is typed there instead.
+  const strandedId = '6a810bf3-f0ec-83ea-96f7-00e7e7294a86';
+  const createdId = '7b91fbd0-2761-4bfb-9710-bec522c925cd';
+  let url = `${CHATGPT_URL}c/${strandedId}`;
+  const newChatActivations = [];
+  const browser = {
+    startNewChat: async (workspaceId) => {
+      newChatActivations.push(workspaceId ?? null);
+      url = CHATGPT_URL;
+      return { activated: true, action: 'new-chat' };
+    },
+    dismissBlockingNotice: async () => ({ resolved: false }),
+    hasComposer: async () => true,
+    installConfigurationPicker: async ({ model, reasoning }) => ({ model, reasoning }),
+    readConfigurationPicker: async () => null,
+    insertPrompt: async () => ({ present: true }),
+    promptState: async () => ({ present: true }),
+    interceptNextConversationRequest: async () => ({ wait: async () => {}, dispose: async () => {} }),
+    sendState: async () => ({ enabled: true }),
+    clickSend: async () => { url = `${CHATGPT_URL}c/${createdId}`; return { enabled: true }; },
+    readChatSnapshot: async () => ({ messages: [], attachments: [] }),
+    readRunStatus: async () => ({ status: 'streaming' }),
+  };
+  const service = new ChatGPTBrowserAIChatService({
+    getURL: () => url,
+    getTitle: () => 'New chat',
+    navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+  }, browser);
+
+  const chat = await service.createChat();
+  assert.equal(newChatActivations.length, 1);
+
+  // Background monitoring drags the shared browser onto a task conversation.
+  url = `${CHATGPT_URL}c/${strandedId}`;
+
+  const run = await chat.send({ text: 'hello' });
+  assert.equal(newChatActivations.length, 2, 'the fresh-chat route is re-established before typing');
+  assert.equal(run.chatId, createdId, 'the message starts a new conversation');
+  assert.notEqual(run.chatId, strandedId);
+});
+
+test('a chat that has not been sent yet keeps the shared browser to itself', async () => {
+  const pendingId = 'pending:4cece4dc-c571-4fd2-ac3c-a8ab94f68676';
+  const task = {
+    taskId: '7e5a7de4-dda4-4f51-9cb2-a58cd6b99d18',
+    state: 'submitted',
+    conversationId: '6a810bf3-f0ec-83ea-96f7-00e7e7294a86',
+    chatStatus: 'completed',
+    submittedAt: '2026-08-17T23:00:00.000Z',
+  };
+  const checked = [];
+  const restored = [];
+  const view = {
+    visible: false,
+    activeMerge: null,
+    activeChatMode: 'session',
+    activeTask: null,
+    sessionChat: { id: pendingId },
+    activeChat: { id: pendingId },
+    sessionChatPollTimer: null,
+    pendingDownload: null,
+    dismissedNoticeEvents: new Map(),
+    knownTasks: new Map([[task.taskId, task]]),
+    view: { webContents: { isDestroyed: () => false, getURL: () => CHATGPT_URL } },
+    chatService: { recoverSession: async () => ({ resolved: false, notice: null }) },
+    onEvent: async () => {},
+    checkConversationStatus: async (candidate) => { checked.push(candidate.conversationId); },
+    checkForResult: async () => false,
+    restoreFocusedConversation: async (id) => { restored.push(id); },
+  };
+  view.focusedConversationId = () => ChatGPTView.prototype.focusedConversationId.call(view);
+  view.focusedConversationIsStreaming = () => ChatGPTView.prototype.focusedConversationIsStreaming.call(view);
+  view.focusedConversationIsBusy = () => ChatGPTView.prototype.focusedConversationIsBusy.call(view);
+
+  await ChatGPTView.prototype.monitorPage.call(view);
+  assert.deepEqual(checked, [], 'a fresh chat is never interrupted for a background result check');
+  assert.deepEqual(restored, []);
+});
+
+test('a conversation that never yields a result stops pulling the browser back every sweep', async () => {
+  const task = {
+    taskId: 'c651dfcf-0214-43ec-b17e-e9f80e487052',
+    state: 'submitted',
+    conversationId: '6a810bf3-f0ec-83ea-96f7-00e7e7294a86',
+    chatStatus: 'completed',
+  };
+  let downloads = 0;
+  const view = {
+    monitorBusy: false,
+    visible: false,
+    pendingDownload: null,
+    processingTasks: new Set(),
+    resultAttempts: new Map(),
+    resultMisses: new Map(),
+    knownTasks: new Map([[task.taskId, task]]),
+    activeChat: null,
+    view: { webContents: { isDestroyed: () => false } },
+    onEvent: async () => {},
+    backgroundChat: async () => ({
+      current: async () => ({ run: { status: 'completed' } }),
+      downloadAttachment: async () => { downloads += 1; return false; },
+    }),
+    emitTaskChatSnapshot: async () => true,
+    updateTaskChatPolling: () => {},
+  };
+
+  assert.equal(await ChatGPTView.prototype.checkForResult.call(view, { task }), false);
+  assert.equal(downloads, 1);
+  assert.equal(view.resultMisses.get(task.taskId), 1);
+  // The next sweep arrives inside the widened retry window and is skipped.
+  assert.equal(await ChatGPTView.prototype.checkForResult.call(view, { task }), false);
+  assert.equal(downloads, 1, 'a missed result is not retried on the very next sweep');
+});
+
+test('the page picker only overrides a chat’s configuration when the user changed it there', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const build = (picker) => {
+    const intercepted = [];
+    let url = CHATGPT_URL;
+    let chatKey = null;
+    const browser = {
+      startNewChat: async () => ({ activated: true }),
+      dismissBlockingNotice: async () => ({ resolved: false }),
+      hasComposer: async () => true,
+      installConfigurationPicker: async (input) => {
+        chatKey = input.chatKey;
+        return { model: input.model, reasoning: input.reasoning };
+      },
+      readConfigurationPicker: async () => picker(chatKey),
+      insertPrompt: async () => ({ present: true }),
+      promptState: async () => ({ present: true }),
+      interceptNextConversationRequest: async (configuration) => {
+        intercepted.push(configuration);
+        return { wait: async () => {}, dispose: async () => {} };
+      },
+      sendState: async () => ({ enabled: true }),
+      clickSend: async () => { url = `${CHATGPT_URL}c/${conversationId}`; return { enabled: true }; },
+      readChatSnapshot: async () => ({ messages: [], attachments: [] }),
+      readRunStatus: async () => ({ status: 'streaming' }),
+    };
+    const service = new ChatGPTBrowserAIChatService({
+      getURL: () => url,
+      getTitle: () => 'New chat',
+      navigationHistory: { canGoBack: () => false, canGoForward: () => false },
+    }, browser);
+    return { service, intercepted };
+  };
+
+  // Patchwork writes the picker itself before every send, so a picker echoing
+  // some other value has no authority over the task's own choice.
+  const echoed = build(() => ({ chatKey: 'stale', model: 'sol', reasoning: 'default', userSelected: false }));
+  const echoedChat = await echoed.service.createChat({ model: 'luna', reasoning: 'high' });
+  const echoedRun = await echoedChat.send({ text: 'Implement this.' });
+  assert.deepEqual(echoedRun.configuration, { model: 'luna', reasoning: 'high' });
+  assert.deepEqual(echoed.intercepted, [{ modelSlug: 'gpt-5-6-t-mini', thinkingEffort: 'extended' }]);
+
+  // A choice the user actually made in the page, for this chat, still wins.
+  const chosen = build((chatKey) => ({ chatKey, model: 'sol', reasoning: 'low', userSelected: true }));
+  const chosenChat = await chosen.service.createChat({ model: 'luna', reasoning: 'high' });
+  const chosenRun = await chosenChat.send({ text: 'Implement this.' });
+  assert.deepEqual(chosenRun.configuration, { model: 'sol', reasoning: 'low' });
+  assert.deepEqual(chosen.intercepted, [{ modelSlug: 'gpt-5-6-thinking', thinkingEffort: 'min' }]);
+});
+
 test('new browser chats activate ChatGPT’s semantic New chat control before sending', async () => {
   const previousId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
   let url = `https://chatgpt.com/c/${previousId}`;
@@ -2746,6 +2945,7 @@ test('background result monitoring never takes the shared browser from a live st
   };
   view.focusedConversationId = () => ChatGPTView.prototype.focusedConversationId.call(view);
   view.focusedConversationIsStreaming = () => ChatGPTView.prototype.focusedConversationIsStreaming.call(view);
+  view.focusedConversationIsBusy = () => ChatGPTView.prototype.focusedConversationIsBusy.call(view);
 
   await ChatGPTView.prototype.monitorPage.call(view);
   assert.deepEqual(checked, [focusedId], 'a streaming conversation keeps the one browser to itself');
@@ -2786,6 +2986,122 @@ test('live snapshots carry ChatGPT’s rendered structure into the native transc
   });
 
   assert.deepEqual(snapshots[0].messages[0].parts, parts);
+});
+
+test('the browser provider dismisses a limit notice rendered as a plain dialog', async () => {
+  const clicks = [];
+  const button = (label) => ({
+    textContent: label,
+    disabled: false,
+    getAttribute: () => null,
+    click: () => clicks.push(label),
+  });
+  const limitDialog = {
+    textContent: 'You’ve reached your current usage limit. Got it',
+    querySelectorAll: () => [button('Got it')],
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => (selector.includes('[role="dialog"]') ? [limitDialog] : []),
+  };
+  const driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, { document }),
+  });
+  const recovery = await driver.dismissBlockingNotice();
+  assert.equal(recovery.resolved, true);
+  assert.equal(recovery.action, 'Got it');
+  assert.deepEqual(clicks, ['Got it']);
+});
+
+test('an unrelated dialog is never dismissed as a limit notice', async () => {
+  const clicks = [];
+  const shareDialog = {
+    textContent: 'Share this chat with anyone who has the link. Cancel Copy link',
+    querySelectorAll: () => [{
+      textContent: 'Cancel',
+      disabled: false,
+      getAttribute: () => null,
+      click: () => clicks.push('Cancel'),
+    }],
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector) => (selector.includes('[role="dialog"]') ? [shareDialog] : []),
+  };
+  const driver = new ChatGPTBrowserDriver({
+    executeJavaScript: async (source) => vm.runInNewContext(source, { document }),
+  });
+  assert.equal((await driver.dismissBlockingNotice()).resolved, false);
+  assert.deepEqual(clicks, []);
+});
+
+test('a blocking notice is dismissed even while the ChatGPT browser is on screen', async () => {
+  const events = [];
+  const view = {
+    visible: true,
+    dismissedNoticeEvents: new Map(),
+    view: { webContents: { isDestroyed: () => false } },
+    chatService: { recoverSession: async () => ({ resolved: true, notice: 'Too many requests' }) },
+    onEvent: async (event) => events.push(event),
+  };
+  assert.equal(await ChatGPTView.prototype.monitorPage.call(view), false);
+  assert.equal(events.at(-1)?.type, 'browser-notice-dismissed');
+});
+
+test('a new session chat clears the old transcript and keeps the chosen model', async () => {
+  const created = [];
+  const emitted = [];
+  const chat = {
+    id: 'pending:11111111-1111-4111-8111-111111111111',
+    configuration: { model: 'luna', reasoning: 'high' },
+    current: async () => ({ id: 'pending:11111111-1111-4111-8111-111111111111', messages: [], run: { status: 'unknown' } }),
+  };
+  const view = {
+    activeChatMode: 'session',
+    activeTask: null,
+    activeMerge: null,
+    sessionChat: { id: '6a80f4cf-1650-83ea-8609-adb411b3e4bc', configuration: { model: 'luna', reasoning: 'high' } },
+    liveChatFingerprints: new Map(),
+    lastSessionChatFingerprint: 'stale',
+    chatAwaitingEmptyTranscript: null,
+    stopTaskChatPolling: () => {},
+    stopSessionChatPolling: () => {},
+    chatService: {
+      createChat: async (configuration) => { created.push(configuration); return chat; },
+    },
+    onEvent: async (event) => emitted.push(event),
+  };
+  view.emitSessionChatSnapshot = (...args) => ChatGPTView.prototype.emitSessionChatSnapshot.apply(view, args);
+
+  const result = await ChatGPTView.prototype.newSessionChat.call(view);
+  assert.deepEqual(created, [{ model: 'luna', reasoning: 'high' }], 'New chat keeps the chosen model');
+  assert.deepEqual(result.snapshot.messages, []);
+  assert.equal(emitted.at(-1)?.type, 'session-chat-snapshot');
+  assert.equal(view.chatAwaitingEmptyTranscript, chat.id);
+
+  // Until ChatGPT's router clears the page, its transcript still belongs to the
+  // conversation that was left behind and must not be painted into the new chat.
+  const snapshots = [];
+  view.emitSessionChatSnapshot = async (snapshot) => { snapshots.push(snapshot); };
+  view.updateSessionChatPolling = () => {};
+  view.knownTasks = new Map();
+  view.activeChat = chat;
+  view.view = { webContents: { getURL: () => CHATGPT_URL, getTitle: () => 'ChatGPT' } };
+  await ChatGPTView.prototype.processBrowserChatSnapshot.call(view, {
+    url: CHATGPT_URL,
+    snapshot: { messages: [{ id: 'old', role: 'assistant', text: 'Answer from the old chat.' }], run: { status: 'completed' } },
+  });
+  assert.deepEqual(snapshots, [], 'stale page content is not painted into the new chat');
+
+  await ChatGPTView.prototype.processBrowserChatSnapshot.call(view, {
+    url: CHATGPT_URL,
+    snapshot: { messages: [], run: { status: 'unknown' } },
+  });
+  await ChatGPTView.prototype.processBrowserChatSnapshot.call(view, {
+    url: CHATGPT_URL,
+    snapshot: { messages: [{ id: 'u1', role: 'user', text: 'First message.' }], run: { status: 'streaming' } },
+  });
+  assert.equal(snapshots.at(-1)?.messages[0]?.text, 'First message.', 'the new chat streams before it has a route');
 });
 
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {
@@ -2867,7 +3183,18 @@ test('task submit persists the confirmed ChatGPT conversation with submitted sta
       current: async () => ({ title: 'Confirmed chat', run: { status: 'streaming' } }),
     },
     installResultWatcher: () => {},
+    lastTaskChatFingerprint: null,
+    taskChatPollTimer: null,
+    taskChatPollTaskId: null,
+    visible: false,
+    view: { webContents: { isDestroyed: () => false, getURL: () => `${CHATGPT_URL}c/${conversationId}` } },
   };
+  const emitted = [];
+  view.onEvent = async (event) => { emitted.push(event); };
+  view.emitTaskChatSnapshot = (...args) => ChatGPTView.prototype.emitTaskChatSnapshot.apply(view, args);
+  view.updateTaskChatPolling = (...args) => ChatGPTView.prototype.updateTaskChatPolling.apply(view, args);
+  view.startTaskChatPolling = (...args) => ChatGPTView.prototype.startTaskChatPolling.apply(view, args);
+  view.stopTaskChatPolling = (...args) => ChatGPTView.prototype.stopTaskChatPolling.apply(view, args);
 
   const submitted = await ChatGPTView.prototype.submit.call(view, task);
   assert.equal(update.state, 'submitted');
@@ -2875,6 +3202,13 @@ test('task submit persists the confirmed ChatGPT conversation with submitted sta
   assert.equal(update.conversationId, conversationId);
   assert.match(update.submittedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(submitted.conversationId, conversationId);
+  // A submitted task shows its running conversation immediately rather than
+  // staying blank until the first background sweep.
+  const snapshotEvent = emitted.find((event) => event.type === 'task-chat-snapshot');
+  assert.equal(snapshotEvent?.taskId, task.taskId);
+  assert.equal(snapshotEvent?.snapshot?.run?.status, 'streaming');
+  assert.ok(view.taskChatPollTimer, 'a streaming task starts following its conversation');
+  ChatGPTView.prototype.stopTaskChatPolling.call(view);
 });
 
 test('task chats own their model and reasoning before the prompt is sent', async () => {
@@ -2914,6 +3248,10 @@ test('task chats own their model and reasoning before the prompt is sent', async
       },
     },
     installResultWatcher: () => {},
+    emitTaskChatSnapshot: async () => true,
+    updateTaskChatPolling: () => {},
+    stopTaskChatPolling: () => {},
+    stopSessionChatPolling: () => {},
   };
 
   await ChatGPTView.prototype.newChat.call(view, null, null, {
