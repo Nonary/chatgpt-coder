@@ -19,13 +19,30 @@ function readChatSnapshotAction() {
   const HEADING_LEVELS = { H1: 1, H2: 2, H3: 3, H4: 4, H5: 5, H6: 6 };
   const MAX_DEPTH = 10;
 
-  const raw = (node) => String(node?.textContent || '').replace(/ /g, ' ').replace(/\r\n?/g, '\n');
+  const raw = (node) => String(node?.textContent || '').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n');
+  // innerText reflects what is actually rendered. textContent also drags in
+  // screen-reader-only labels, collapsed nodes and control text, which is how
+  // page furniture ended up inside mirrored messages.
+  const rendered = (node) => String(node?.innerText ?? node?.textContent ?? '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r\n?/g, '\n');
   const collapse = (value) => String(value || '').replace(/\s+/g, ' ');
   const normalize = (value) => collapse(value).trim();
-  const readable = (element) => raw(element)
+  const readable = (element) => rendered(element)
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+  // ChatGPT's own progress surface: the reasoning disclosure and the status
+  // line shown while it is still working. Neither is part of the answer.
+  const PROGRESS_SELECTOR = [
+    '[data-testid*="reasoning" i]',
+    '[data-testid*="thinking" i]',
+    '[data-testid*="thought" i]',
+    '[class*="reasoning" i]',
+    '[class*="thinking" i]',
+    'details',
+  ].join(',');
 
   const roleFromValue = (value) => {
     const normalized = String(value || '').toLowerCase();
@@ -131,6 +148,7 @@ function readChatSnapshotAction() {
       if (child.nodeType !== 1) continue;
       const tag = child.tagName;
       if (SKIPPED_TAGS.has(tag) || child.getAttribute('aria-hidden') === 'true') continue;
+      if (child.matches?.(PROGRESS_SELECTOR)) continue;
       if (INLINE_TAGS.has(tag)) {
         appendInline(child, BASE_STYLE, buffered);
         continue;
@@ -224,12 +242,32 @@ function readChatSnapshotAction() {
       .join('\n\n');
   }
 
-  const messageParts = (element) => {
+  // An assistant turn with no rendered Markdown has not produced an answer yet;
+  // all it holds is ChatGPT's status label. Reading that as message text is what
+  // put "Thinking" into the transcript as though it were the reply.
+  const messageParts = (element, role) => {
     const markdown = element.querySelector('.markdown, [class*="markdown" i]');
     if (markdown) return parseBlocks(markdown, 0);
     const plain = element.querySelector('.whitespace-pre-wrap');
-    const text = readable(plain || element);
+    if (plain) {
+      const text = readable(plain);
+      return text ? [{ type: 'text', text }] : [];
+    }
+    if (role === 'assistant') return [];
+    const text = readable(element);
     return text ? [{ type: 'text', text }] : [];
+  };
+
+  // What ChatGPT is doing right now, read from the turn in progress so an older
+  // turn's reasoning block is never mistaken for current activity.
+  const progressOf = (element) => {
+    if (!element) return null;
+    const disclosed = [...element.querySelectorAll(PROGRESS_SELECTOR)]
+      .map((node) => readable(node))
+      .filter(Boolean);
+    if (disclosed.length) return disclosed[disclosed.length - 1];
+    if (element.querySelector('.markdown, [class*="markdown" i]')) return null;
+    return readable(element) || null;
   };
 
   const scope = document.querySelector('main') || document.body || document;
@@ -241,7 +279,7 @@ function readChatSnapshotAction() {
       const role = roleFromElement(element)
         || roleFromElement(element.querySelector?.('[data-message-author-role], [data-role], [data-author]'));
       if (!role || element.parentElement?.closest?.('[data-message-author-role]')) continue;
-      const parts = messageParts(element);
+      const parts = messageParts(element, role);
       const content = blocksText(parts, '');
       if (!content) continue;
       const id = element.getAttribute('data-message-id')
@@ -279,10 +317,10 @@ function readChatSnapshotAction() {
     }
   }
 
-  const progress = queryAll('[data-testid*="reasoning" i], [data-testid*="thinking" i], details')
-    .map((element) => readable(element))
-    .filter(Boolean);
-  const thinkingSummary = progress.length ? progress[progress.length - 1] : null;
+  const lastTurn = primary[primary.length - 1] || null;
+  const thinkingSummary = lastTurn?.getAttribute?.('data-message-author-role') === 'assistant'
+    ? progressOf(lastTurn)
+    : null;
   const attachments = queryAll('[data-testid*="attachment" i], a[download]')
     .map((element) => normalize(element.getAttribute('download') || element.textContent || element.getAttribute('aria-label')))
     .filter((name) => name && name.length <= 180)

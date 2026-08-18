@@ -1809,6 +1809,44 @@ test('a first message never lands in whatever conversation the shared browser dr
   assert.notEqual(run.chatId, strandedId);
 });
 
+test('the mirrored browser is never parked in a state that stops its compositor', async () => {
+  // A WebContentsView that is marked invisible or given empty bounds stops
+  // being composited, and an uncomposited frame runs no requestAnimationFrame
+  // callbacks at all. ChatGPT reveals streamed tokens through rAF, so parking
+  // it that way froze the mirrored reply mid-answer.
+  const calls = [];
+  const view = {
+    visible: false,
+    mainWindow: { getContentBounds: () => ({ x: 0, y: 0, width: 1200, height: 800 }) },
+    view: {
+      setBounds: (bounds) => calls.push({ kind: 'bounds', bounds }),
+      setVisible: (visible) => calls.push({ kind: 'visible', visible }),
+    },
+  };
+
+  view.parkedBounds = () => ChatGPTView.prototype.parkedBounds.call(view);
+
+  ChatGPTView.prototype.setVisible.call(view, false);
+  assert.deepEqual(
+    calls.filter((call) => call.kind === 'visible').map((call) => call.visible),
+    [true],
+    'the view is never marked invisible',
+  );
+  const parked = calls.filter((call) => call.kind === 'bounds').at(-1).bounds;
+  assert.ok(parked.width > 0 && parked.height > 0, 'parked bounds keep a real viewport');
+  assert.equal(parked.y, 799, 'only the top pixel row stays inside the window');
+
+  calls.length = 0;
+  ChatGPTView.prototype.setBounds.call(view, { x: 10, y: 20, width: 640, height: 480 });
+  const hiddenBounds = calls.at(-1).bounds;
+  assert.ok(hiddenBounds.width > 0 && hiddenBounds.height > 0, 'a hidden browser is parked, not collapsed');
+
+  view.visible = true;
+  calls.length = 0;
+  ChatGPTView.prototype.setBounds.call(view, { x: 10, y: 20, width: 640, height: 480 });
+  assert.deepEqual(calls.at(-1).bounds, { x: 10, y: 20, width: 640, height: 480 });
+});
+
 test('a chat that has not been sent yet keeps the shared browser to itself', async () => {
   const pendingId = 'pending:4cece4dc-c571-4fd2-ac3c-a8ab94f68676';
   const task = {
@@ -1994,6 +2032,13 @@ test('native Patchwork chat surfaces stream transcript responses and preserve mo
   assert.match(transcript, /data-testid\*="conversation-turn"/);
   assert.match(driver, /startNewChatAction/);
   assert.match(transcript, /const messages = collect\(primary\)/);
+  // Progress markup is ChatGPT's status surface, never message content.
+  assert.match(transcript, /PROGRESS_SELECTOR/);
+  assert.match(transcript, /if \(role === 'assistant'\) return \[\];/);
+  assert.match(transcript, /const rendered = \(node\) => String\(node\?\.innerText/);
+  // The mirrored browser must stay composited while it is being scraped.
+  assert.match(view, /parkedBounds\(\)/);
+  assert.doesNotMatch(view, /setBounds\(\{ x: 0, y: 0, width: 0, height: 0 \}\)/);
   // One transcript reader serves both the live path and the polling fallback.
   assert.doesNotMatch(driver, /const messages = collect\(primary\)/);
   assert.doesNotMatch(browserPreload, /const messages = collect\(primary\)/);

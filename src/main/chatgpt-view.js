@@ -172,7 +172,11 @@ class PatchworkAIChatController {
     });
     this.mainWindow.contentView.addChildView(this.view);
     this.view.setBackgroundColor('#11130f');
-    this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    this.view.setBounds(this.parkedBounds());
+    this.view.setVisible(true);
+    this.mainWindow.on('resize', () => {
+      if (!this.visible) this.view.setBounds(this.parkedBounds());
+    });
     const browserDriver = new ChatGPTBrowserDriver(this.view.webContents, {
       onWorkspaceStatus: ({ message, recovery }) => this.onEvent({
         type: 'project-browser-status',
@@ -652,20 +656,44 @@ class PatchworkAIChatController {
     }
   }
 
+  // Where the browser sits while Patchwork is mirroring it instead of showing
+  // it: full size, so ChatGPT lays out and renders exactly as it would on
+  // screen, shifted down until only its top pixel row is inside the window.
+  //
+  // It is deliberately never given empty bounds and never marked invisible.
+  // Either one makes Chromium stop compositing the frame, and a frame that is
+  // not composited runs no requestAnimationFrame callbacks at all. ChatGPT
+  // reveals streamed tokens through rAF, so a suspended frame freezes
+  // mid-answer and only catches up when the run finishes. That is what made a
+  // mirrored reply show a garbled fragment, sit still, then jump to the
+  // finished text.
+  parkedBounds() {
+    const { width, height } = this.mainWindow.getContentBounds();
+    return {
+      x: 0,
+      y: Math.max(0, Math.round(height) - 1),
+      width: Math.max(1, Math.round(width)),
+      height: Math.max(1, Math.round(height)),
+    };
+  }
+
   setBounds(bounds) {
-    const next = {
+    if (!this.visible) {
+      this.view.setBounds(this.parkedBounds());
+      return;
+    }
+    this.view.setBounds({
       x: Math.max(0, Math.round(bounds.x || 0)),
       y: Math.max(0, Math.round(bounds.y || 0)),
-      width: Math.max(0, Math.round(bounds.width || 0)),
-      height: Math.max(0, Math.round(bounds.height || 0)),
-    };
-    this.view.setBounds(this.visible ? next : { x: 0, y: 0, width: 0, height: 0 });
+      width: Math.max(1, Math.round(bounds.width || 0)),
+      height: Math.max(1, Math.round(bounds.height || 0)),
+    });
   }
 
   setVisible(visible) {
     this.visible = Boolean(visible);
-    this.view.setVisible(this.visible);
-    if (!this.visible) this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    this.view.setVisible(true);
+    if (!this.visible) this.view.setBounds(this.parkedBounds());
   }
 
   async prepare(task) {
