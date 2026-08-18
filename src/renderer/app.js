@@ -17,6 +17,7 @@ const state = {
   promptLibrarySearch: '',
   editingPromptId: null,
   chatgptProjects: [],
+  projectRecoveryUsed: false,
   projectSelection: undefined,
   conflictResolutionTaskId: null,
   gitSummaryBusy: false,
@@ -36,7 +37,7 @@ const PROMPT_LIBRARY_STORAGE_KEY = 'patchwork.prompt-library';
 const TASK_NEW_TREE_VALUE = '__new__';
 const MAX_PROMPTS = 100;
 const MAX_PROMPT_CONTENT_LENGTH = 12_000;
-const PROJECT_REFRESH_TIMEOUT_MILLISECONDS = 30_000;
+const PROJECT_REFRESH_TIMEOUT_MILLISECONDS = 50_000;
 
 const elements = Object.fromEntries(
   [
@@ -60,7 +61,7 @@ const elements = Object.fromEntries(
     'task-model-select', 'task-reasoning-select',
     'chatgpt-project-select', 'new-project-fields', 'new-project-name',
     'refresh-projects-button', 'project-list-status',
-    'trees-project-select', 'trees-refresh-projects-button',
+    'trees-project-select', 'trees-refresh-projects-button', 'trees-project-status',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
     'import-result-button', 'delete-task-button', 'result-card', 'result-summary', 'patch-list',
@@ -738,7 +739,8 @@ function closeConflictResolutionModal() {
   elements['conflict-resolution-instructions'].value = '';
   elements['conflict-resolution-submit-button'].disabled = false;
   if (!elements['task-view'].classList.contains('hidden')) {
-    window.patchwork.setBrowserVisible(false);
+    window.patchwork.setBrowserVisible(true);
+    requestAnimationFrame(() => requestAnimationFrame(syncBrowserBounds));
   }
 }
 
@@ -793,11 +795,21 @@ function renderTreesProjectSelection() {
   else select.value = '';
 }
 
+function setProjectListStatus(message, tone = null) {
+  for (const id of ['project-list-status', 'trees-project-status']) {
+    const status = elements[id];
+    if (!status) continue;
+    status.textContent = message;
+    status.classList.toggle('error', tone === 'error');
+    status.classList.toggle('recovery', tone === 'recovery');
+  }
+}
+
 async function refreshChatGPTProjects(showErrors = false) {
   elements['refresh-projects-button'].disabled = true;
   elements['trees-refresh-projects-button'].disabled = true;
-  elements['project-list-status'].classList.remove('error');
-  elements['project-list-status'].textContent = 'Loading ChatGPT projects through the existing browser session…';
+  state.projectRecoveryUsed = false;
+  setProjectListStatus('Loading ChatGPT projects through the shared embedded browser…');
   try {
     let timeoutId;
     const timeout = new Promise((_, reject) => {
@@ -816,15 +828,15 @@ async function refreshChatGPTProjects(showErrors = false) {
     restoreTaskProjectSelection();
     renderChatGPTProjects();
     renderTreesProjectSelection();
-    elements['project-list-status'].textContent = state.chatgptProjects.length
-      ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available · no page refresh used.`
-      : 'No ChatGPT projects found. No page refresh was used; you can create one below.';
+    const navigation = state.projectRecoveryUsed ? 'recovery page navigation used' : 'in-app navigation used';
+    setProjectListStatus(state.chatgptProjects.length
+      ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available · ${navigation}.`
+      : `No ChatGPT projects found · ${navigation}. You can create one below.`);
   } catch (error) {
     state.chatgptProjects = [];
     renderChatGPTProjects();
     renderTreesProjectSelection();
-    elements['project-list-status'].classList.add('error');
-    elements['project-list-status'].textContent = error.message;
+    setProjectListStatus(error.message, 'error');
     if (showErrors) showToast(error.message, true);
   } finally {
     elements['refresh-projects-button'].disabled = false;
@@ -2412,6 +2424,10 @@ window.patchwork.onTaskEvent((event) => {
   }
   if (event.type === 'browser-title' && event.title) {
     elements['session-browser-title'].textContent = event.title;
+  }
+  if (event.type === 'project-browser-status' && event.message) {
+    if (event.recovery) state.projectRecoveryUsed = true;
+    setProjectListStatus(event.message, event.recovery ? 'recovery' : null);
   }
   if (event.type === 'browser-login-required') showToast(event.message, true);
   if (event.type === 'tree-created' || event.type === 'tree-removed' || event.type === 'tree-merged') {

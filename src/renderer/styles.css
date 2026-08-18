@@ -239,6 +239,8 @@ textarea::placeholder { color: #606659; }
 .trees-project-heading .icon-button { width: 24px; height: 24px; padding: 0; }
 .trees-project-picker .field-control { padding: 8px 9px; font-size: 10px; }
 .trees-project-picker small { display: block; margin-top: 6px; color: #737a6c; font-size: 8px; line-height: 1.35; }
+.trees-project-picker small.error { color: #ff9c8f; }
+.trees-project-picker small.recovery, .field-help.recovery { color: #d9ad67; }
 .trees-list { max-width: 1050px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 14px; }
 .trees-list.empty-state { min-height: 230px; grid-template-columns: 1fr; place-items: center; align-content: center; }
 .tree-card { padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }

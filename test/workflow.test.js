@@ -1759,9 +1759,18 @@ test('workspace automation serializes behind active chat work on the persistent 
     name: 'Same session',
   }]);
   assert.equal(workspaceRead, true);
+
+  const main = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
+  assert.match(main, /projects:list[^\n]+chatController\.listProjects\(\)/);
+  assert.doesNotMatch(main, /projects:list[^\n]+chatController\.enqueue/);
 });
 
 test('the browser provider opens Projects through ChatGPT in-app navigation without a hard refresh', async () => {
+  const location = {
+    href: 'https://chatgpt.com/',
+    pathname: '/',
+    search: '',
+  };
   const projectLink = {
     textContent: 'Patchwork',
     href: 'https://chatgpt.com/g/g-p-1234567890abcdef1234567890abcdef-patchwork/project',
@@ -1772,10 +1781,15 @@ test('the browser provider opens Projects through ChatGPT in-app navigation with
   };
   const projectsControl = {
     textContent: 'Projects',
+    href: 'https://chatgpt.com/library?tab=projects',
     disabled: false,
-    getAttribute: () => null,
-    matches: () => false,
-    click: () => { projectsControl.clicked += 1; },
+    getAttribute: (name) => (name === 'href' ? '/library?tab=projects' : null),
+    click: () => {
+      projectsControl.clicked += 1;
+      location.href = projectsControl.href;
+      location.pathname = '/library';
+      location.search = '?tab=projects';
+    },
     clicked: 0,
   };
   const document = {
@@ -1783,7 +1797,7 @@ test('the browser provider opens Projects through ChatGPT in-app navigation with
     documentElement: { scrollHeight: 600, scrollTop: 0, clientHeight: 600 },
     scrollingElement: { scrollHeight: 600, scrollTop: 0, clientHeight: 600 },
     querySelectorAll: (selector) => {
-      if (selector === 'a[href]') return [projectLink];
+      if (selector === 'a[href]') return [projectLink, projectsControl];
       if (selector === 'button, a, [role="button"], [role="alert"]') return [projectsControl];
       if (selector === 'button, [role="button"], a') return [projectsControl];
       if (selector === 'a[href], button, [role="button"]') return [projectsControl];
@@ -1796,11 +1810,7 @@ test('the browser provider opens Projects through ChatGPT in-app navigation with
     executeJavaScript: async (source) => vm.runInNewContext(source, {
       URL,
       document,
-      location: {
-        href: 'https://chatgpt.com/',
-        pathname: '/',
-        search: '',
-      },
+      location,
     }),
   });
 
@@ -1884,14 +1894,19 @@ test('the browser provider detects project authentication requirements from rend
 
 test('the project browser waits for ChatGPT-owned project data after the page shell renders', async () => {
   let reads = 0;
+  let projectsActivated = false;
   const driver = new ChatGPTBrowserDriver({
     loadURL: async () => {},
     executeJavaScript: async (source) => {
-      if (source.includes('function openWorkspaceIndexAction')) return { activated: true };
+      if (source.includes('function openWorkspaceIndexAction')) {
+        projectsActivated = true;
+        return { activated: true };
+      }
       if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
       reads += 1;
       return {
         ready: true,
+        projectsPage: projectsActivated,
         empty: false,
         authenticationRequired: false,
         error: null,
@@ -1915,6 +1930,9 @@ test('project browser automation cannot read credentials or call authenticated C
   const source = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-driver.js'), 'utf8');
   const pageActions = source.slice(
     source.indexOf('function readWorkspaceIndexAction'),
+    source.indexOf('function navigateChatGPTRouteAction'),
+  ) + source.slice(
+    source.indexOf('function advanceWorkspaceIndexAction'),
     source.indexOf('async function installConfigurationPickerAction'),
   );
   const workspaceMethods = source.slice(
@@ -1929,12 +1947,12 @@ test('project browser automation cannot read credentials or call authenticated C
   assert.doesNotMatch(projectAutomation, /api\/auth|backend-api|authorization|access.?token|document\.cookie|localStorage/i);
   assert.match(projectAutomation, /Project name|unable to load projects/i);
   assert.match(projectAutomation, /Network\.getResponseBody/);
-  assert.match(projectAutomation, /history\.pushState/);
+  assert.doesNotMatch(projectAutomation, /history\.pushState/);
   const listMethod = source.slice(
     source.indexOf('async listWorkspaces()'),
     source.indexOf('async createWorkspace(name)'),
   );
-  assert.doesNotMatch(listMethod, /#loadBrowserSurface\(CHATGPT_PROJECTS_URL\)/);
+  assert.match(listMethod, /#reportWorkspaceStatus\([\s\S]+Recovery:[\s\S]+#loadBrowserSurface\(CHATGPT_PROJECTS_URL\)/);
   const createMethod = source.slice(
     source.indexOf('async createWorkspace(name)'),
     source.indexOf('installConfigurationPicker(configuration)'),
@@ -1945,41 +1963,28 @@ test('project browser automation cannot read credentials or call authenticated C
   assert.match(serviceSource, /#browser\.navigate/);
 });
 
-test('project discovery changes the local ChatGPT route when no Projects control is rendered', async () => {
+test('project discovery waits for ChatGPT to hydrate its Projects control', async () => {
   const navigations = [];
-  const routeChanges = [];
-  let localRouteActivated = false;
+  let navigationAttempts = 0;
+  let projectsActivated = false;
   const driver = new ChatGPTBrowserDriver({
     loadURL: async (url) => { navigations.push(url); },
     executeJavaScript: async (source) => {
       if (source.includes('function openWorkspaceIndexAction')) {
-        const location = { href: 'https://chatgpt.com/', pathname: '/', search: '' };
-        const history = {
-          state: { existing: true },
-          pushState: (_state, _title, route) => {
-            routeChanges.push(route);
-            localRouteActivated = true;
-          },
-        };
-        return vm.runInNewContext(source, {
-          URL,
-          document: { querySelectorAll: () => [] },
-          history,
-          location,
-          PopStateEvent: class PopStateEvent { constructor(type, options) { this.type = type; this.state = options.state; } },
-          window: { dispatchEvent: () => true },
-        });
+        navigationAttempts += 1;
+        projectsActivated = navigationAttempts >= 4;
+        return { activated: projectsActivated, renderedControl: projectsActivated };
       }
       if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
       return {
-        ready: localRouteActivated,
-        projectsPage: localRouteActivated,
+        ready: projectsActivated,
+        projectsPage: projectsActivated,
         empty: false,
         authenticationRequired: false,
         error: null,
-        workspaces: localRouteActivated ? [{
+        workspaces: projectsActivated ? [{
           id: 'g-p-00112233445566778899aabbccddeeff',
-          name: 'Local Route Project',
+          name: 'Hydrated Project',
         }] : [],
       };
     },
@@ -1989,25 +1994,69 @@ test('project discovery changes the local ChatGPT route when no Projects control
   assert.equal(result.ok, true);
   assert.deepEqual(result.workspaces, [{
     id: 'g-p-00112233445566778899aabbccddeeff',
-    name: 'Local Route Project',
+    name: 'Hydrated Project',
   }]);
   assert.deepEqual(navigations, ['https://chatgpt.com/']);
-  assert.deepEqual(routeChanges, ['/library?tab=projects']);
+  assert.equal(navigationAttempts, 4);
 });
 
-test('project discovery blocks a Projects control from starting a document navigation', async () => {
+test('sidebar project data cannot masquerade as a successful Projects navigation', async () => {
+  const navigations = [];
+  const statuses = [];
+  let recoveryLoaded = false;
+  const driver = new ChatGPTBrowserDriver({
+    loadURL: async (url) => {
+      navigations.push(url);
+      if (url.includes('/library?tab=projects')) recoveryLoaded = true;
+    },
+    executeJavaScript: async (source) => {
+      if (source.includes('function openWorkspaceIndexAction')) return { activated: true };
+      if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
+      return {
+        ready: true,
+        projectsPage: recoveryLoaded,
+        empty: false,
+        authenticationRequired: false,
+        error: null,
+        workspaces: [{
+          id: 'g-p-aabbccddeeff00112233445566778899',
+          name: 'Sidebar Project',
+        }],
+      };
+    },
+  }, {
+    onWorkspaceStatus: ({ message, recovery }) => {
+      if (recovery) statuses.push(message);
+    },
+  });
+
+  const result = await driver.listWorkspaces();
+  assert.equal(result.ok, true);
+  assert.deepEqual(navigations, [
+    'https://chatgpt.com/',
+    'https://chatgpt.com/library?tab=projects',
+  ]);
+  assert.equal(statuses.length, 1);
+  assert.deepEqual(result.workspaces, [{
+    id: 'g-p-aabbccddeeff00112233445566778899',
+    name: 'Sidebar Project',
+  }]);
+});
+
+test('project discovery reports recovery before using a document navigation', async () => {
   const webContents = new EventEmitter();
-  let localRouteActivated = false;
+  const timeline = [];
+  let recoveryLoaded = false;
   let preventedDocumentNavigations = 0;
   let documentLoads = 0;
   webContents.getURL = () => 'https://chatgpt.com/';
-  webContents.loadURL = async () => { documentLoads += 1; };
+  webContents.loadURL = async () => {
+    timeline.push('document-load');
+    recoveryLoaded = true;
+    documentLoads += 1;
+  };
   webContents.executeJavaScript = async (source) => {
     if (source.includes('function openWorkspaceIndexAction')) {
-      if (source.includes('"localRouteOnly":true')) {
-        localRouteActivated = true;
-        return { activated: true, renderedControl: false };
-      }
       webContents.emit('will-navigate', {
         preventDefault: () => { preventedDocumentNavigations += 1; },
       }, 'https://chatgpt.com/library?tab=projects');
@@ -2015,30 +2064,63 @@ test('project discovery blocks a Projects control from starting a document navig
     }
     if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
     return {
-      ready: localRouteActivated,
-      projectsPage: localRouteActivated,
+      ready: recoveryLoaded,
+      projectsPage: recoveryLoaded,
       empty: false,
       authenticationRequired: false,
       error: null,
-      workspaces: localRouteActivated ? [{
+      workspaces: recoveryLoaded ? [{
         id: 'g-p-ffeeddccbbaa99887766554433221100',
-        name: 'Preserved Browser Project',
+        name: 'Recovery Project',
       }] : [],
     };
   };
 
-  const result = await new ChatGPTBrowserDriver(webContents).listWorkspaces();
+  const result = await new ChatGPTBrowserDriver(webContents, {
+    onWorkspaceStatus: ({ message, recovery }) => {
+      if (recovery) timeline.push(`recovery:${message}`);
+    },
+  }).listWorkspaces();
   assert.equal(result.ok, true);
   assert.equal(preventedDocumentNavigations, 1);
-  assert.equal(documentLoads, 0);
+  assert.equal(documentLoads, 1);
+  assert.match(timeline[0], /^recovery:/);
+  assert.equal(timeline[1], 'document-load');
   assert.deepEqual(result.workspaces, [{
     id: 'g-p-ffeeddccbbaa99887766554433221100',
-    name: 'Preserved Browser Project',
+    name: 'Recovery Project',
   }]);
+});
+
+test('project-browser progress and recovery are visible in both native project pickers', async () => {
+  const [view, renderer, html] = await Promise.all([
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8'),
+  ]);
+  assert.match(view, /onWorkspaceStatus[\s\S]+project-browser-status/);
+  assert.match(renderer, /event\.type === 'project-browser-status'/);
+  assert.match(renderer, /state\.projectRecoveryUsed = true/);
+  assert.match(renderer, /recovery page navigation used/);
+  assert.match(html, /id="project-list-status"/);
+  assert.match(html, /id="trees-project-status"/);
+});
+
+test('chat and projects share one embedded Electron browser and one service queue', async () => {
+  const [view, service] = await Promise.all([
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8'),
+    fs.readFile(path.join(__dirname, '../src/main/chatgpt-browser-ai-chat-service.js'), 'utf8'),
+  ]);
+  assert.equal((view.match(/new ChatGPTBrowserDriver\(/g) || []).length, 1);
+  assert.doesNotMatch(view, /workspaceWindow|new BrowserWindow/);
+  assert.doesNotMatch(service, /workspaceBrowser|workspaceOperations/);
+  assert.match(service, /listWorkspaces\(\)\s*{\s*return this\.#operations\.run/);
+  assert.match(service, /createWorkspace\(input\)\s*{\s*return this\.#operations\.run/);
 });
 
 test('the project browser reads ChatGPT-initiated project responses from Chromium cache', async () => {
   let attached = false;
+  let projectsActivated = false;
   const commands = [];
   const navigations = [];
   const debuggerApi = new EventEmitter();
@@ -2080,6 +2162,7 @@ test('the project browser reads ChatGPT-initiated project responses from Chromiu
     },
     executeJavaScript: async (source) => {
       if (source.includes('function openWorkspaceIndexAction')) {
+        projectsActivated = true;
         debuggerApi.emit('message', {}, 'Network.responseReceived', {
           requestId: 'project-response',
           response: {
@@ -2095,6 +2178,7 @@ test('the project browser reads ChatGPT-initiated project responses from Chromiu
         ? { acted: false, action: null }
         : {
         ready: false,
+        projectsPage: projectsActivated,
         workspaces: [],
         authenticationRequired: false,
         error: null,
@@ -2123,15 +2207,20 @@ test('project discovery falls back to the rendered library when Chromium observa
     return {};
   };
   let reads = 0;
+  let projectsActivated = false;
   const driver = new ChatGPTBrowserDriver({
     debugger: debuggerApi,
     loadURL: async () => {},
     executeJavaScript: async (source) => {
-      if (source.includes('function openWorkspaceIndexAction')) return { activated: true };
+      if (source.includes('function openWorkspaceIndexAction')) {
+        projectsActivated = true;
+        return { activated: true };
+      }
       if (source.includes('function advanceWorkspaceIndexAction')) return { acted: false, action: null };
       reads += 1;
       return {
         ready: reads > 1,
+        projectsPage: projectsActivated,
         empty: false,
         authenticationRequired: false,
         error: null,
@@ -2466,8 +2555,9 @@ test('a completed AI chat run stops the task timer and persists the completion s
   assert.ok(Number.isFinite(Date.parse(current.chatFinishedAt)));
   assert.ok(Date.parse(current.chatFinishedAt) >= Date.parse(task.submittedAt));
   assert.equal(view.activeTask.chatStatus, 'completed');
-  assert.equal(events.at(-1).type, 'task-chat-status');
-  assert.equal(events.at(-1).chatStatus, 'completed');
+  const statusEvent = events.findLast((event) => event.type === 'task-chat-status');
+  assert.equal(statusEvent?.chatStatus, 'completed');
+  assert.equal(events.at(-1).type, 'task-chat-snapshot');
 });
 
 test('unconfirmed submitted tasks are restored to prepared state', async (context) => {

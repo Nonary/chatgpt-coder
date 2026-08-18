@@ -4,6 +4,7 @@ const { WebContentsView, clipboard, dialog, shell } = require('electron');
 const { mergeResultFilename } = require('./worktree-service');
 const { AI_CHAT_ERROR_CODE, AI_CHAT_RUN_STATUS } = require('./ai-chat-service');
 const { ChatGPTBrowserAIChatService } = require('./chatgpt-browser-ai-chat-service');
+const { ChatGPTBrowserDriver } = require('./chatgpt-browser-driver');
 const { SerialOperationQueue } = require('./serial-operation-queue');
 
 const CHATGPT_URL = 'https://chatgpt.com/';
@@ -136,7 +137,17 @@ class PatchworkAIChatController {
     this.mainWindow.contentView.addChildView(this.view);
     this.view.setBackgroundColor('#11130f');
     this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
-    this.chatService = new ChatGPTBrowserAIChatService(this.view.webContents);
+    const browserDriver = new ChatGPTBrowserDriver(this.view.webContents, {
+      onWorkspaceStatus: ({ message, recovery }) => this.onEvent({
+        type: 'project-browser-status',
+        message,
+        recovery,
+      }),
+    });
+    this.chatService = new ChatGPTBrowserAIChatService(
+      this.view.webContents,
+      browserDriver,
+    );
     this.operations = new SerialOperationQueue();
     this.installNavigationHandlers();
     this.installDownloadListener();
@@ -525,10 +536,12 @@ class PatchworkAIChatController {
   }
 
   async listProjects() {
+    await this.ready;
     return this.chatService.listWorkspaces();
   }
 
   async createProject(name) {
+    await this.ready;
     const projectName = String(name || '').trim();
     if (!projectName) throw new Error('Enter a name for the new ChatGPT project.');
     const workspace = await this.chatService.createWorkspace({ name: projectName });

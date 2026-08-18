@@ -11,8 +11,10 @@ const COMPOSER_SELECTOR = [
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|excess usage|extra usage|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_HOME_URL = 'https://chatgpt.com/';
+const CHATGPT_PROJECTS_URL = 'https://chatgpt.com/library?tab=projects';
 const BROWSER_NAVIGATION_TIMEOUT_MILLISECONDS = 15_000;
 const BROWSER_ACTION_TIMEOUT_MILLISECONDS = 5_000;
+const WORKSPACE_NAVIGATION_WAIT_ATTEMPTS = 24;
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -159,46 +161,29 @@ function readWorkspaceIndexAction() {
   };
 }
 
-function openWorkspaceIndexAction(input) {
-  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+function openWorkspaceIndexAction() {
   const roots = [document];
   const visited = new Set();
-  const controls = [];
+  const links = [];
   while (roots.length) {
     const root = roots.shift();
     if (!root || visited.has(root)) continue;
     visited.add(root);
-    controls.push(...root.querySelectorAll('a[href], button, [role="button"]'));
+    links.push(...root.querySelectorAll('a[href]'));
     for (const element of root.querySelectorAll('*')) if (element.shadowRoot) roots.push(element.shadowRoot);
   }
-  const projectControl = input.localRouteOnly ? null : controls.find((node) => {
+  const projectControl = links.find((node) => {
     try {
-      if (node.matches('a[href]')) {
-        const url = new URL(node.getAttribute('href') || node.href || '', location.href);
-        if (url.pathname === '/library' && url.searchParams.get('tab') === 'projects') return true;
-      }
+      const url = new URL(node.getAttribute('href') || node.href || '', location.href);
+      return url.pathname === '/library' && url.searchParams.get('tab') === 'projects';
     } catch {}
-    const label = normalize([
-      node.textContent,
-      node.getAttribute?.('aria-label'),
-      node.getAttribute?.('title'),
-    ].filter(Boolean).join(' '));
-    return /^projects$/i.test(label);
+    return false;
   });
   if (projectControl && !projectControl.disabled && projectControl.getAttribute('aria-disabled') !== 'true') {
     projectControl.click();
     return { activated: true, renderedControl: true };
   }
-  // ChatGPT's router observes same-document history transitions. This changes
-  // only the local route; it neither reloads the document nor issues a request.
-  const route = '/library?tab=projects';
-  try {
-    history.pushState(history.state, '', route);
-    window.dispatchEvent(new PopStateEvent('popstate', { state: history.state }));
-    return { activated: true, renderedControl: false };
-  } catch {
-    return { activated: false, renderedControl: false };
-  }
+  return { activated: false, renderedControl: false };
 }
 
 function navigateChatGPTRouteAction(input) {
@@ -700,9 +685,12 @@ function downloadAttachmentAction(input) {
 }
 
 class ChatGPTBrowserDriver {
-  constructor(webContents) {
+  constructor(webContents, options = {}) {
     if (!webContents) throw new TypeError('ChatGPTBrowserDriver requires Electron webContents.');
     this.webContents = webContents;
+    this.onWorkspaceStatus = typeof options.onWorkspaceStatus === 'function'
+      ? options.onWorkspaceStatus
+      : () => {};
   }
 
   hasComposer() { return this.#execute(hasComposerAction, { composerSelector: COMPOSER_SELECTOR }); }
@@ -810,9 +798,10 @@ class ChatGPTBrowserDriver {
     let captureError = null;
     let initialState = null;
     try {
+      await this.#reportWorkspaceStatus('Checking the shared embedded ChatGPT browser…');
       // Reuse the one persistent ChatGPT document and authenticated session.
-      // The initial about:blank load is the only point where this helper needs
-      // to create the first ChatGPT document for that persistent WebContents.
+      // A newly-created hidden browser starts at about:blank and needs one real
+      // document before Chromium observation is available.
       const currentUrl = String(this.webContents.getURL?.() || '');
       if (!currentUrl || currentUrl === 'about:blank') {
         await this.#loadBrowserSurface(CHATGPT_HOME_URL);
@@ -821,7 +810,7 @@ class ChatGPTBrowserDriver {
           ok: false,
           workspaces: [],
           authenticationRequired: false,
-          message: 'The project browser is outside ChatGPT. Patchwork did not reload it; retry after restoring the ChatGPT session.',
+          message: 'The shared ChatGPT browser is outside ChatGPT. Restore the embedded session and retry.',
         };
       }
       initialState = await this.#executeWorkspaceAction(readWorkspaceIndexAction, {}, 'reading projects');
@@ -849,54 +838,75 @@ class ChatGPTBrowserDriver {
       if (!initialState?.projectsPage) {
         let activated = false;
         let documentNavigationBlocked = false;
-        const preventDocumentNavigation = (event) => {
-          documentNavigationBlocked = true;
-          event.preventDefault?.();
-        };
-        this.webContents.on?.('will-navigate', preventDocumentNavigation);
-        try {
-          const navigation = await this.#executeWorkspaceAction(
-            openWorkspaceIndexAction,
-            { localRouteOnly: false },
-            'opening projects',
-          );
-          activated = Boolean(navigation?.activated);
-          // Keep the guard through the browser's default-navigation turn. If
-          // ChatGPT did not intercept its own control as an SPA transition,
-          // cancel the document load and apply the same-document route.
-          await delay(50);
-        } catch (error) {
-          captureError ||= error;
-        } finally {
-          this.webContents.removeListener?.('will-navigate', preventDocumentNavigation);
-        }
-        if (documentNavigationBlocked) {
+        await this.#reportWorkspaceStatus('Waiting for ChatGPT’s Projects control…');
+        for (let attempt = 0; attempt < WORKSPACE_NAVIGATION_WAIT_ATTEMPTS; attempt += 1) {
+          const preventDocumentNavigation = (event) => {
+            documentNavigationBlocked = true;
+            event.preventDefault?.();
+          };
+          this.webContents.on?.('will-navigate', preventDocumentNavigation);
           try {
-            const localNavigation = await this.#executeWorkspaceAction(
+            const navigation = await this.#executeWorkspaceAction(
               openWorkspaceIndexAction,
-              { localRouteOnly: true },
-              'changing the local Projects route',
+              {},
+              'opening projects',
             );
-            activated = Boolean(localNavigation?.activated);
+            activated = Boolean(navigation?.activated);
+            await delay(50);
           } catch (error) {
             captureError ||= error;
-            activated = false;
+          } finally {
+            this.webContents.removeListener?.('will-navigate', preventDocumentNavigation);
+          }
+          if (activated || documentNavigationBlocked) break;
+          await delay(200);
+        }
+        if (activated && !documentNavigationBlocked) {
+          await this.#reportWorkspaceStatus('Opening Projects inside ChatGPT…');
+          // Clicking a control is not proof of navigation. Wait until the
+          // shared browser itself reports the canonical Projects route.
+          activated = false;
+          for (let attempt = 0; attempt < 12; attempt += 1) {
+            const routeState = await this.#executeWorkspaceAction(
+              readWorkspaceIndexAction,
+              {},
+              'confirming the Projects route',
+            );
+            if (routeState?.authenticationRequired) {
+              await browserCapture?.dispose().catch(() => {});
+              return { ok: false, workspaces: [], authenticationRequired: true, message: null };
+            }
+            if (routeState?.projectsPage) {
+              initialState = routeState;
+              activated = true;
+              break;
+            }
+            await delay(100);
           }
         }
-        if (activated) {
-          // ChatGPT handles this as its normal in-app route transition.
-          await delay(100);
-        } else {
-          await browserCapture?.dispose().catch(() => {});
-          return {
-            ok: false,
-            workspaces: [],
-            authenticationRequired: false,
-            message: 'ChatGPT did not expose in-app Projects navigation. Patchwork did not reload the browser.',
-          };
+        if (!activated || documentNavigationBlocked) {
+          // Raw history mutation does not activate ChatGPT's private router.
+          // Make the reliable document-navigation fallback explicit to the
+          // native UI before using it as recovery.
+          await this.#reportWorkspaceStatus(
+            'Recovery: loading Projects as a new page in the shared ChatGPT browser…',
+            true,
+          );
+          try {
+            await this.#loadBrowserSurface(CHATGPT_PROJECTS_URL);
+          } catch (error) {
+            await browserCapture?.dispose().catch(() => {});
+            return {
+              ok: false,
+              workspaces: [],
+              authenticationRequired: false,
+              message: String(error?.message || error || 'The Projects recovery navigation failed.').slice(0, 240),
+            };
+          }
         }
       }
     }
+    await this.#reportWorkspaceStatus('Reading projects rendered by ChatGPT…');
     const workspaces = new Map();
     let ready = false;
     let unchangedReads = 0;
@@ -906,6 +916,10 @@ class ChatGPTBrowserDriver {
         const state = await this.#executeWorkspaceAction(readWorkspaceIndexAction, {}, 'reading projects');
         if (state?.authenticationRequired) {
           return { ok: false, workspaces: [], authenticationRequired: true, message: null };
+        }
+        if (!state?.projectsPage) {
+          await delay(250);
+          continue;
         }
         for (const workspace of [
           ...(browserCapture?.workspaces.values() || []),
@@ -958,8 +972,8 @@ class ChatGPTBrowserDriver {
           workspaces: [],
           authenticationRequired: false,
           message: captureError
-            ? `ChatGPT did not render Projects after in-app navigation. Patchwork did not reload the browser. ${String(captureError?.message || captureError).slice(0, 120)}`
-            : 'ChatGPT did not render Projects after in-app navigation. Patchwork did not reload the browser.',
+            ? `ChatGPT did not render Projects after navigation. ${String(captureError?.message || captureError).slice(0, 160)}`
+            : 'ChatGPT did not render Projects after navigation.',
         };
     } finally {
       await browserCapture?.dispose().catch(() => {});
@@ -1257,7 +1271,7 @@ class ChatGPTBrowserDriver {
       const pending = this.#withTimeout(
         debuggerApi.sendCommand('Network.getResponseBody', { requestId }),
         BROWSER_ACTION_TIMEOUT_MILLISECONDS,
-        'The project browser timed out while reading its response cache.',
+        'The shared ChatGPT browser timed out while reading its response cache.',
       ).then((response) => {
         for (const workspace of projectsFromBrowserResponse(response?.body, response?.base64Encoded)) {
           workspaces.set(workspace.id, workspace);
@@ -1287,7 +1301,7 @@ class ChatGPTBrowserDriver {
       await this.#withTimeout(
         debuggerApi.sendCommand('Network.enable'),
         BROWSER_ACTION_TIMEOUT_MILLISECONDS,
-        'The project browser timed out while enabling its response cache observer.',
+        'The shared ChatGPT browser timed out while enabling its response cache observer.',
       );
       return {
         workspaces,
@@ -1298,7 +1312,7 @@ class ChatGPTBrowserDriver {
             await this.#withTimeout(
               debuggerApi.sendCommand('Network.disable'),
               BROWSER_ACTION_TIMEOUT_MILLISECONDS,
-              'The project browser timed out while closing its response observer.',
+              'The shared ChatGPT browser timed out while closing its response observer.',
             ).catch(() => {});
           }
           if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
@@ -1332,8 +1346,14 @@ class ChatGPTBrowserDriver {
     return this.#withTimeout(
       this.#execute(action, input),
       BROWSER_ACTION_TIMEOUT_MILLISECONDS,
-      `The project browser timed out while ${description}.`,
+      `The shared ChatGPT browser timed out while ${description}.`,
     );
+  }
+
+  async #reportWorkspaceStatus(message, recovery = false) {
+    try {
+      await this.onWorkspaceStatus({ message, recovery });
+    } catch {}
   }
 
   #withTimeout(promise, milliseconds, message) {
