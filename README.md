@@ -47,7 +47,15 @@ Then open <http://127.0.0.1:8787/install> and pick one:
 bundle. Keep the agent running while you use Patchwork — every Git and filesystem
 operation goes through it.
 
-Patchwork's dock opens on the right of the page. `Alt+P` toggles it.
+Patchwork's dock opens on the right of the page and makes room for itself, so
+ChatGPT reflows instead of being covered. `Alt+P` toggles it, and the header's layout
+button switches to overlay if you prefer.
+
+Patchwork also replaces ChatGPT's model control in the composer with its own
+**Sol · Auto** picker offering GPT-5.6 Sol/Luna and Auto/Instant/Low/Medium/High/Extra
+High. That picker is part of the page, not the dock — it is there whether Patchwork is
+open or closed, works for ordinary chats, and whatever it shows when you press Send is
+what the request is sent with.
 
 ## Workflow
 

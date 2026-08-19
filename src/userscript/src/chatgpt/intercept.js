@@ -64,9 +64,13 @@ function installInterceptor() {
     }
     if (typeof text !== 'string') return nativeFetch(input, init);
 
+    // Resolved per request, not once up front, so a change made in the composer's
+    // Patchwork picker after the task was created still wins.
+    let configuration;
     let rewritten;
     try {
-      rewritten = rewriteConversationRequestBody(text, enforcement.configuration);
+      configuration = enforcement.resolveConfiguration();
+      rewritten = rewriteConversationRequestBody(text, configuration);
     } catch (error) {
       if (isConversation) enforcement.settle({ ok: false, error: error.message });
       return nativeFetch(input, init);
@@ -102,9 +106,9 @@ function installInterceptor() {
         ok: true,
         model: rewritten.model,
         thinkingEffort: rewritten.thinkingEffort,
-        selectedModel: enforcement.configuration.model,
-        selectedReasoningMode: enforcement.configuration.reasoningMode,
-        selectionSource: 'patchwork-task',
+        selectedModel: configuration.model,
+        selectedReasoningMode: configuration.reasoningMode,
+        selectionSource: configuration.source || 'patchwork-task',
         // The reply is an event stream whose first events already name the
         // conversation, so submission is confirmed without waiting for the SPA
         // route to catch up.
@@ -149,12 +153,13 @@ function readConversationId(response) {
 }
 
 function beginEnforcement({ configuration, packageFilename = null }) {
+  const resolveConfiguration = typeof configuration === 'function' ? configuration : () => configuration;
   installInterceptor();
   let settled = false;
   let resolveResult;
   const resultPromise = new Promise((resolve) => { resolveResult = resolve; });
   enforcement = {
-    configuration,
+    resolveConfiguration,
     packageFilename,
     settle(result) {
       if (settled) return;

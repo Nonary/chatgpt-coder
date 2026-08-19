@@ -494,3 +494,89 @@ test('project listing matches the sidebar shape a real session returns', async (
     delete require.cache[require.resolve('../src/userscript/src/chatgpt/api')];
   }
 });
+
+test('the composer picker maps every menu choice to the slug ChatGPT expects', () => {
+  const picker = require('../src/userscript/src/chatgpt/model-picker');
+
+  assert.equal(picker.displayLabel({ model: 'default', reasoningMode: 'default' }), 'Sol · Auto');
+  assert.equal(picker.displayLabel({ model: 'luna', reasoningMode: 'high' }), 'Luna · High');
+  assert.equal(picker.displayLabel({ model: 'sol', reasoningMode: 'extra-high' }), 'Sol · Extra High');
+
+  assert.equal(picker.selectedSlug({ model: 'default', reasoningMode: 'default' }), 'gpt-5-6');
+  assert.equal(picker.selectedSlug({ model: 'sol', reasoningMode: 'instant' }), 'gpt-5-6-instant');
+  assert.equal(picker.selectedSlug({ model: 'sol', reasoningMode: 'high' }), 'gpt-5-6-thinking');
+  assert.equal(picker.selectedSlug({ model: 'luna', reasoningMode: 'instant' }), 'gpt-5-6-mini');
+  assert.equal(picker.selectedSlug({ model: 'luna', reasoningMode: 'medium' }), 'gpt-5-6-t-mini');
+
+  const current = { model: 'default', reasoningMode: 'default' };
+  assert.equal(picker.isChecked('model:sol', current), true, 'default resolves to Sol in the menu');
+  assert.equal(picker.isChecked('model:luna', current), false);
+  assert.equal(picker.isChecked('reasoning:default', current), true);
+  picker.applyChoice('model:luna', current);
+  picker.applyChoice('reasoning:extra-high', current);
+  assert.deepEqual(current, { model: 'luna', reasoningMode: 'extra-high' });
+  assert.equal(picker.isChecked('model:luna', current), true);
+
+  const choices = picker.MENU_ITEMS.filter((item) => item.choice).map((item) => item.choice);
+  assert.deepEqual(choices, [
+    'model:sol', 'model:luna',
+    'reasoning:default', 'reasoning:instant', 'reasoning:low',
+    'reasoning:medium', 'reasoning:high', 'reasoning:extra-high',
+  ]);
+});
+
+test('the picker recognizes ChatGPT model controls without matching ordinary buttons', () => {
+  const { NATIVE_PICKER_LABEL, NATIVE_PICKER_SELECTOR } = require('../src/userscript/src/chatgpt/model-picker');
+  for (const label of ['ChatGPT', 'ChatGPT 5.6', 'GPT-5.6 Sol', '5.6 Luna', 'Thinking', 'Thinking mini', 'Auto', 'Pro', 'Instant']) {
+    assert.equal(NATIVE_PICKER_LABEL.test(label), true, `${label} should be recognized`);
+  }
+  for (const label of ['Send', 'Attach files', 'Share', 'New chat', 'Sol Invictus', 'ChatGPT said:']) {
+    assert.equal(NATIVE_PICKER_LABEL.test(label), false, `${label} should not be recognized`);
+  }
+  assert.match(NATIVE_PICKER_SELECTOR, /model-switcher-dropdown/);
+  assert.match(NATIVE_PICKER_SELECTOR, /composer-intelligence-button/);
+});
+
+test('the request enforcer reads the picker at send time, not at task creation', async () => {
+  const { beginEnforcement } = require('../src/userscript/src/chatgpt/intercept');
+  const { taskRequestConfiguration } = require('../src/shared/chatgpt');
+
+  const live = { model: 'sol', reasoningMode: 'low' };
+  const previous = { window: global.window, location: global.location };
+  global.location = { origin: 'https://chatgpt.com' };
+  let sent = null;
+  global.window = {
+    fetch: async (url, init) => {
+      sent = { url: String(url), body: init.body };
+      return new Response('data: {}', { status: 200 });
+    },
+  };
+  try {
+    const enforcement = beginEnforcement({
+      configuration: () => ({
+        ...taskRequestConfiguration(live.model, live.reasoningMode),
+        source: 'patchwork-selector',
+      }),
+    });
+    // The user switches to Luna Extra High in the composer after the task existed.
+    live.model = 'luna';
+    live.reasoningMode = 'extra-high';
+
+    await window.fetch('https://chatgpt.com/backend-api/f/conversation', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-4o', messages: [] }),
+    });
+    const verified = await enforcement.wait(1_000);
+    enforcement.dispose();
+
+    assert.equal(JSON.parse(sent.body).model, 'gpt-5-6-t-mini', 'the live Luna choice is what goes out');
+    assert.equal(JSON.parse(sent.body).thinking_effort, 'max');
+    assert.equal(verified.selectedModel, 'luna');
+    assert.equal(verified.selectedReasoningMode, 'extra-high');
+    assert.equal(verified.selectionSource, 'patchwork-selector');
+  } finally {
+    global.window = previous.window;
+    global.location = previous.location;
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  }
+});

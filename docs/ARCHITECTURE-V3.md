@@ -40,7 +40,7 @@ those becomes a first-class operation:
 | DOM hunting for the generated-file anchor   | `GET /backend-api/conversation/:id` → file pointers |
 | Electron `will-download` interception       | `GET /backend-api/files/:id/download` → fetch text  |
 | Shadow-DOM selector walk for the composer   | same page, same JS realm, React state reachable     |
-| Custom model-picker web component           | request-level model/effort control, no UI surgery   |
+| Model picker injected as a script string     | same picker, as ordinary in-page code               |
 
 ## Components
 
@@ -68,6 +68,14 @@ confirmations become in-page modals.
 A single bundled `patchwork.user.js`. It mounts a resizable dock into a shadow root
 so Patchwork's CSS and ChatGPT's CSS can never collide, and drives ChatGPT through
 its own endpoints.
+
+The dock reserves room rather than covering the page: while it is open a CSSOM rule
+puts a `margin-right` of the dock's width on `<html>`, so ChatGPT reflows into the
+space that is left and nothing is clipped. Closing the dock removes it, and a header
+control switches to overlay for layouts where pushing is unwelcome.
+
+Not everything Patchwork adds lives in the dock. The composer's model picker is
+deliberately part of ChatGPT's own UI, present for the whole session.
 
 Constructible stylesheets (`new CSSStyleSheet()` + `adoptedStyleSheets`) are used
 instead of `<style>` tags. chatgpt.com's `style-src` does allow `'unsafe-inline'`
@@ -140,10 +148,21 @@ Everything that can be an API call is an API call:
 - **Attachments** — bytes come from the agent as an `ArrayBuffer`, become a real
   `File`, and are handed to ChatGPT's own upload path via `DataTransfer` on the
   composer's file input. No disk path, no CDP.
-- **Model and reasoning effort** — a `window.fetch` wrapper rewrites `model` and
-  `thinking_effort` on the outgoing `POST /backend-api/f/conversation` body and
-  verifies the ZIP is actually attached before the request leaves, which is exactly
-  what v2 needed the CDP debugger for.
+- **Model and reasoning effort** — Patchwork replaces ChatGPT's own model control in
+  the composer with a `patchwork-model-selector` offering GPT-5.6 Sol/Luna and
+  Auto/Instant/Low/Medium/High/Extra High. It is installed on boot and stays for the
+  whole session, so the composer offers it whether or not the dock is open; the
+  native control is hidden and swapped for an equally sized invisible slot so the
+  composer's layout does not reflow, and a MutationObserver plus a short interval
+  re-applies it through ChatGPT's re-renders. The choice is mirrored both ways with
+  the dock's own model and reasoning controls and written back to
+  `/backend-api/settings/user_last_used_model_config`.
+
+  A `window.fetch` wrapper then rewrites `model` and `thinking_effort` on the
+  outgoing `POST /backend-api/f/conversation` body and verifies the ZIP is actually
+  attached before the request leaves — exactly what v2 needed the CDP debugger for.
+  The configuration is resolved *per request* rather than when the task was created,
+  so whatever the picker shows at the moment Send fires is what goes out.
 - **Send** — deliberately still the real composer + Send control. The session capture
   shows `POST /backend-api/f/conversation` carrying
   `openai-sentinel-chat-requirements-token`, `openai-sentinel-proof-token`,

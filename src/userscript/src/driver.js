@@ -1,6 +1,7 @@
 const chatgpt = require('./chatgpt/api');
 const composer = require('./chatgpt/composer');
 const navigate = require('./chatgpt/navigate');
+const modelPicker = require('./chatgpt/model-picker');
 const notices = require('./chatgpt/notices');
 const resultScan = require('./chatgpt/result-scan');
 const { beginEnforcement } = require('./chatgpt/intercept');
@@ -88,9 +89,26 @@ class Driver {
       throw new Error('ChatGPT is not ready. Sign in and try again.');
     }
 
-    const configuration = taskRequestConfiguration(task.model, task.reasoningMode);
+    // The composer's Patchwork picker is the live source of truth: whatever it
+    // shows when Send fires is what the request is rewritten to.
+    modelPicker.setSelection({ model: task.model, reasoningMode: task.reasoningMode });
+    await modelPicker.installWhenReady({
+      taskId: task.taskId,
+      model: task.model,
+      reasoningMode: task.reasoningMode,
+      keepSelection: true,
+    }).catch((error) => {
+      this.report({ type: 'automation-progress', taskId: task.taskId, message: error.message });
+    });
+
     const enforcement = beginEnforcement({
-      configuration,
+      configuration: () => {
+        const selected = modelPicker.currentSelection();
+        return {
+          ...taskRequestConfiguration(selected.model, selected.reasoningMode),
+          source: modelPicker.isInstalled() ? 'patchwork-selector' : 'saved-task',
+        };
+      },
       packageFilename: packageFilename(task),
     });
 
@@ -122,7 +140,7 @@ class Driver {
     this.report({
       type: 'task-request-verified',
       taskId: task.taskId,
-      message: `Verified ChatGPT request: ${verified.model}${verified.thinkingEffort ? ` · ${verified.thinkingEffort}` : ''}.`,
+      message: `Verified ChatGPT request from ${verified.selectionSource === 'patchwork-selector' ? 'the composer picker' : 'the saved task'}: ${verified.model}${verified.thinkingEffort ? ` · ${verified.thinkingEffort}` : ''}.`,
     });
 
     // ChatGPT's own send request answers with an event stream that names the new

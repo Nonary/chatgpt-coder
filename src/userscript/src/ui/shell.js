@@ -6,6 +6,22 @@ const {
 const HOST_ID = 'patchwork-root';
 const WIDTH_KEY = 'patchwork.dock-width';
 const OPEN_KEY = 'patchwork.dock-open';
+const LAYOUT_KEY = 'patchwork.dock-layout';
+
+// Reserving room on <html> makes ChatGPT reflow into the remaining width instead
+// of being covered by the dock. Applied through CSSOM so the page's style-src
+// policy has no say, and reversible the moment the dock closes.
+const PAGE_LAYOUT_CSS = `
+html.patchwork-pushed {
+  margin-right: var(--patchwork-dock-width, 0px) !important;
+  width: auto !important;
+  max-width: none !important;
+  overflow-x: hidden !important;
+}
+html.patchwork-pushed body {
+  max-width: 100% !important;
+}
+`;
 
 const ICONS = {
   tasks: 'M4 6h16M4 12h16M4 18h10',
@@ -15,6 +31,7 @@ const ICONS = {
   close: 'M6 6l12 12M18 6L6 18',
   expand: 'M8 3H3v5M16 21h5v-5M21 8V3h-5M3 16v5h5',
   refresh: 'M3 12a9 9 0 0 1 15-6.7L21 8M21 12a9 9 0 0 1-15 6.7L3 16M21 3v5h-5M3 21v-5h5',
+  layout: 'M3 5h18v14H3zM15 5v14',
 };
 
 function readStorage(key, fallback) {
@@ -78,6 +95,11 @@ class Shell {
         h('div', { class: 'brand-text' }, h('strong', {}, 'Patchwork'), this.statusDot),
       ),
       h('div', { class: 'spacer' }),
+      this.layoutButton = h('button', {
+        class: 'icon-button',
+        title: 'Dock covers the page instead',
+        onclick: () => this.toggleLayoutMode(),
+      }, svg(ICONS.layout, { size: 14 })),
       h('button', {
         class: 'icon-button', title: 'Toggle wide view', onclick: () => this.toggleExpanded(),
       }, svg(ICONS.expand, { size: 14 })),
@@ -93,10 +115,42 @@ class Shell {
     this.root.append(this.launcher, this.dock, this.toast, this.modalHost);
     document.documentElement.append(this.host);
 
+    this.layoutMode = readStorage(LAYOUT_KEY, 'push') === 'overlay' ? 'overlay' : 'push';
+    this.installPageLayout();
     this.applyWidth(Number.parseInt(readStorage(WIDTH_KEY, '460'), 10) || 460);
     this.installResize();
     this.syncTheme();
     if (readStorage(OPEN_KEY, 'true') === 'true') this.open();
+  }
+
+  installPageLayout() {
+    this.pageSheet = new CSSStyleSheet();
+    this.pageSheet.replaceSync(PAGE_LAYOUT_CSS);
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, this.pageSheet];
+  }
+
+  applyPageLayout() {
+    const root = document.documentElement;
+    const pushed = this.layoutMode === 'push' && !this.dock.hidden;
+    root.style.setProperty(
+      '--patchwork-dock-width',
+      pushed ? `${Math.round(this.dock.getBoundingClientRect().width)}px` : '0px',
+    );
+    root.classList.toggle('patchwork-pushed', pushed);
+  }
+
+  setLayoutMode(mode) {
+    this.layoutMode = mode === 'overlay' ? 'overlay' : 'push';
+    writeStorage(LAYOUT_KEY, this.layoutMode);
+    this.applyPageLayout();
+    this.layoutButton?.setAttribute(
+      'title',
+      this.layoutMode === 'push' ? 'Dock covers the page instead' : 'Dock makes room on the page',
+    );
+  }
+
+  toggleLayoutMode() {
+    this.setLayoutMode(this.layoutMode === 'push' ? 'overlay' : 'push');
   }
 
   syncTheme() {
@@ -114,6 +168,7 @@ class Shell {
     const clamped = Math.min(Math.max(width, 360), Math.round(window.innerWidth * 0.96));
     this.dock.style.setProperty('--dock-width', `${clamped}px`);
     writeStorage(WIDTH_KEY, clamped);
+    this.applyPageLayout?.();
   }
 
   installResize() {
@@ -136,18 +191,21 @@ class Shell {
 
   toggleExpanded() {
     this.dock.classList.toggle('expanded');
+    this.applyPageLayout();
   }
 
   open() {
     this.dock.hidden = false;
     this.launcher.hidden = true;
     writeStorage(OPEN_KEY, 'true');
+    this.applyPageLayout();
   }
 
   close() {
     this.dock.hidden = true;
     this.launcher.hidden = false;
     writeStorage(OPEN_KEY, 'false');
+    this.applyPageLayout();
   }
 
   toggle() {
@@ -279,6 +337,9 @@ class Shell {
   }
 
   destroy() {
+    document.documentElement.classList.remove('patchwork-pushed');
+    document.documentElement.style.removeProperty('--patchwork-dock-width');
+    document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== this.pageSheet);
     this.host.remove();
   }
 }

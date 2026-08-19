@@ -1,4 +1,5 @@
 const chatgpt = require('./chatgpt/api');
+const modelPicker = require('./chatgpt/model-picker');
 const navigate = require('./chatgpt/navigate');
 const { Driver } = require('./driver');
 const { Shell } = require('./ui/shell');
@@ -659,6 +660,32 @@ class App {
     };
   }
 
+  // The composer picker belongs to ChatGPT, not to the dock: it is installed on
+  // boot and stays whether or not Patchwork is open.
+  installComposerPicker() {
+    const { composer } = this.store.state;
+    modelPicker.install({
+      model: composer.model,
+      reasoningMode: composer.reasoningMode,
+      onChange: (selection) => {
+        this.store.setComposer(selection, 'silent');
+        this.persist('task-model', selection.model);
+        this.persist('task-reasoning', selection.reasoningMode);
+        this.store.addActivity(`Model set to ${selection.model} · ${selection.reasoningMode} from the composer.`);
+        this.renderActiveView();
+      },
+    });
+    // Keep ChatGPT's composer in step when the choice is made in the dock instead.
+    this.store.subscribe((state, reason) => {
+      if (reason === 'composer' || reason === 'silent') {
+        modelPicker.setSelection({
+          model: state.composer.model,
+          reasoningMode: state.composer.reasoningMode,
+        });
+      }
+    });
+  }
+
   /* -------------------------------------------------------------------- boot */
 
   async start() {
@@ -682,6 +709,7 @@ class App {
       this.store.setComposer({ repositories: composerRepositories }, 'silent');
     }
 
+    this.installComposerPicker();
     this.renderActiveView();
     this.driver.start();
     this.pollEvents().catch(() => {});
