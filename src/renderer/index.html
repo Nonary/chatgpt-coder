@@ -79,14 +79,23 @@
           <div class="source-layout">
             <aside class="source-panel">
               <div class="source-repository-header">
-                <select id="source-repository-select" aria-label="Source control repository"></select>
-                <button id="source-add-repository" class="icon-button" title="Add repository">＋</button>
+                <button id="source-repository-select" class="source-repository-trigger" type="button" aria-haspopup="dialog" aria-label="Choose a source control repository"></button>
                 <button id="source-refresh" class="icon-button" title="Refresh">↻</button>
                 <button id="source-remove-repository" class="icon-button" title="Remove from workspace">×</button>
               </div>
               <div id="source-branch" class="source-branch">No repository selected</div>
 
               <div class="commit-box">
+                <div class="source-project-picker">
+                  <div class="source-project-heading">
+                    <label for="source-chatgpt-project-select">AI Summary project</label>
+                    <button id="source-refresh-projects-button" class="icon-button" type="button" title="Refresh ChatGPT projects" aria-label="Refresh ChatGPT projects">↻</button>
+                  </div>
+                  <select id="source-chatgpt-project-select" class="field-control">
+                    <option value="">New chat (no project)</option>
+                  </select>
+                  <small id="source-project-list-status" class="field-help">Open the ChatGPT session and sign in to load your projects.</small>
+                </div>
                 <label class="sr-only" for="source-commit-message">Commit message</label>
                 <textarea id="source-commit-message" rows="3" placeholder="Commit message"></textarea>
                 <div class="commit-actions">
@@ -241,7 +250,7 @@
                 </div>
                 <button id="add-repository-button" class="secondary">Choose repositories</button>
               </div>
-              <p class="card-copy">Current-working-change tasks can include one or more repositories, including their uncommitted changes. New coding trees still require one clean repository.</p>
+              <p class="card-copy">Current-working-change tasks can include one or more repositories, including their uncommitted changes. Coding trees mirror every selected clean repository and its initialized submodules recursively.</p>
               <div id="repository-list" class="repository-list empty-state">
                 <div class="empty-icon">⌘</div>
                 <strong>No repositories selected</strong>
@@ -397,16 +406,16 @@
 
               <article id="task-target-card" class="card task-target-card hidden">
                 <div class="card-heading"><div><span class="step-number">↳</span><h2>Apply target</h2></div></div>
-                <p class="card-copy">Choose which repository or worktree should receive the validated result. This stays editable while the task is waiting to be applied, including after submission.</p>
-                <label class="field-label" for="task-target-select">Worktree</label>
+                <p class="card-copy">Choose which repositories or coding tree should receive the validated result. This stays editable while the task is waiting to be applied, including after submission.</p>
+                <label class="field-label" for="task-target-select">Coding tree</label>
                 <select id="task-target-select" class="field-control">
-                  <option value="">Use original repository</option>
+                  <option value="">Use original repositories</option>
                   <option value="__new__">Create a new coding tree</option>
                 </select>
                 <div id="task-target-new-fields" class="new-tree-fields hidden">
                   <label class="field-label" for="task-target-tree-name">New tree name</label>
                   <input id="task-target-tree-name" class="field-control" type="text" maxlength="80" placeholder="For example: Fix task target" />
-                  <button id="task-target-create-button" class="secondary" type="button">Create and use worktree</button>
+                  <button id="task-target-create-button" class="secondary" type="button">Create and use coding tree</button>
                 </div>
                 <p id="task-target-status" class="field-help task-target-status"></p>
               </article>
@@ -530,12 +539,12 @@
           <section class="repository-picker-modal" role="dialog" aria-modal="true" aria-labelledby="repository-picker-title">
             <header class="repository-picker-header">
               <div>
-                <p class="eyebrow">TASK REPOSITORIES</p>
+                <p id="repository-picker-eyebrow" class="eyebrow">TASK REPOSITORIES</p>
                 <h2 id="repository-picker-title">Choose repositories</h2>
               </div>
               <button id="repository-picker-close-button" class="icon-button" type="button" aria-label="Close repository picker">×</button>
             </header>
-            <p class="repository-picker-copy">Pick one or more repositories already in your Patchwork workspace, or find a repository used by an earlier task. You can also browse for a new repository.</p>
+            <p id="repository-picker-copy" class="repository-picker-copy">Pick one or more repositories already in your Patchwork workspace, or find a repository used by an earlier task. You can also browse for a new repository.</p>
             <div class="repository-picker-toolbar">
               <label class="sr-only" for="repository-picker-search">Search repositories</label>
               <input id="repository-picker-search" class="field-control" type="search" placeholder="Search by repository name or path" autocomplete="off" />

@@ -276,8 +276,26 @@ class ResultService {
     const applied = [];
     const committed = [];
     try {
-      for (const patch of task.result.patches) {
-        const repository = task.repositories.find((item) => item.id === patch.id);
+      if (task.treeId) {
+        for (const repository of task.repositories.filter((item) => !item.readOnly)) {
+          const current = await inspectRepository(repository.path);
+          if (!current.isClean) {
+            const patch = task.result.patches.find((item) => item.id === repository.id);
+            const body = patch ? await fs.readFile(patch.localPath) : Buffer.alloc(0);
+            if (body.length === 0) {
+              return this.markConflicted(task, repository, new Error(
+                `${repository.name} has new uncommitted or unmerged changes since this task was packaged.`,
+              ), false);
+            }
+          }
+        }
+      }
+      const repositoryById = new Map(task.repositories.map((repository) => [repository.id, repository]));
+      const orderedPatches = [...task.result.patches].sort((left, right) => (
+        (repositoryById.get(left.id)?.depth || 0) - (repositoryById.get(right.id)?.depth || 0)
+      ));
+      for (const patch of orderedPatches) {
+        const repository = repositoryById.get(patch.id);
         const body = await fs.readFile(patch.localPath);
         if (body.length === 0) continue;
         const current = await inspectRepository(repository.path);
@@ -309,17 +327,38 @@ class ResultService {
       }
       if (task.treeId) {
         const commitMessage = validateCommitMessage(task.result.commitMessage);
-        for (const item of applied) {
-          await runGit(item.repository.path, ['add', '-A', '--', '.']);
-          await runGit(item.repository.path, ['commit', '-m', commitMessage]);
-          const { stdout } = await runGit(item.repository.path, ['rev-parse', 'HEAD']);
-          committed.push({ ...item, commit: stdout.trim(), message: commitMessage });
+        const commitIds = new Set(applied.map((item) => item.repository.id));
+        for (const repositoryId of [...commitIds]) {
+          let parentId = repositoryById.get(repositoryId)?.parentRepositoryId || null;
+          while (parentId) {
+            commitIds.add(parentId);
+            parentId = repositoryById.get(parentId)?.parentRepositoryId || null;
+          }
+        }
+        const commitRepositories = task.repositories
+          .filter((repository) => !repository.readOnly && commitIds.has(repository.id))
+          .sort((left, right) => (right.depth || 0) - (left.depth || 0));
+        for (const repository of commitRepositories) {
+          const beforeCommit = await inspectRepository(repository.path);
+          if (beforeCommit.isClean) continue;
+          await runGit(repository.path, ['add', '-A', '--', '.']);
+          const { stdout: staged } = await runGit(repository.path, ['diff', '--cached', '--name-only', '-z']);
+          if (!staged.length) continue;
+          await runGit(repository.path, ['commit', '-m', commitMessage]);
+          const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);
+          const appliedItem = applied.find((item) => item.repository.id === repository.id);
+          committed.push({
+            ...(appliedItem || { repository, patch: null, applyMode: 'submodule-pointer', wasClean: true }),
+            headBefore: beforeCommit.baseCommit,
+            commit: stdout.trim(),
+            message: commitMessage,
+          });
         }
       }
     } catch (error) {
       for (const item of committed.reverse()) {
         try {
-          await runGit(item.repository.path, ['reset', '--hard', `${item.commit}^`]);
+          await runGit(item.repository.path, ['reset', '--hard', item.headBefore || `${item.commit}^`]);
         } catch {
           // Preserve the original error and the worktree for manual recovery.
         }
@@ -382,19 +421,36 @@ class ResultService {
 
   async rebindMissingResolutionTarget(task, requireResolutionTask = true) {
     if (!task?.treeId || (requireResolutionTask && !task?.resolvesTaskId)) return task;
-    const writableRepository = (Array.isArray(task.repositories) ? task.repositories : [])
-      .find((repository) => !repository.readOnly);
-    if (!writableRepository) return task;
-    const current = await inspectRepository(writableRepository.path).catch(() => null);
-    if (current) return task;
-    if (!task.sourceRepositoryPath) {
+    const writableRepositories = (Array.isArray(task.repositories) ? task.repositories : [])
+      .filter((repository) => !repository.readOnly);
+    if (!writableRepositories.length) return task;
+    const currentRepositories = await Promise.all(
+      writableRepositories.map((repository) => inspectRepository(repository.path).catch(() => null)),
+    );
+    if (currentRepositories.every(Boolean)) return task;
+
+    const sourceTargets = writableRepositories.map((repository) => ({
+      ...repository,
+      path: repository.sourcePath || (writableRepositories.length === 1 ? task.sourceRepositoryPath : null),
+    }));
+    if (sourceTargets.some((repository) => !repository.path)) {
       throw new Error('The conflict-resolution worktree is unavailable and no original repository target was saved.');
     }
-    const source = await inspectRepository(task.sourceRepositoryPath).catch(() => null);
-    if (!source) {
+    const sources = await Promise.all(
+      sourceTargets.map((repository) => inspectRepository(repository.path).catch(() => null)),
+    );
+    if (sources.some((repository) => !repository)) {
       throw new Error('The conflict-resolution worktree was deleted and the original repository is unavailable.');
     }
-    return this.taskService.setTarget(task.taskId, { repositoryPath: source.path, tree: null });
+    return this.taskService.setTarget(task.taskId, {
+      tree: null,
+      repositories: sourceTargets.map((repository) => ({
+        path: repository.path,
+        sourcePath: repository.path,
+        treeMemberId: repository.treeMemberId || null,
+        depth: repository.depth || 0,
+      })),
+    });
   }
 
   async markConflicted(task, repository, error, applyAttempted = false) {
@@ -427,19 +483,46 @@ class ResultService {
 
     const reverts = [];
     if (task.result.commits?.length) {
-      for (const item of [...task.result.commits].reverse()) {
+      const commitTargets = [];
+      for (const item of task.result.commits) {
         const repository = task.repositories.find((entry) => entry.id === item.repositoryId);
+        if (!repository) throw new Error('The saved task commit no longer matches a repository target.');
         const current = await inspectRepository(repository.path);
         if (!current.isClean || current.baseCommit !== item.commit) {
           throw new Error('The task target changed after this task was applied; revert it from Source Control instead.');
         }
+        commitTargets.push({ item, repository });
+      }
+      for (const { item, repository } of [...commitTargets].reverse()) {
         await runGit(repository.path, ['revert', '--no-edit', item.commit]);
         const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);
         reverts.push({ repositoryId: repository.id, commit: stdout.trim() });
       }
+      if (task.treeId) {
+        const parentIds = new Set(task.repositories
+          .filter((repository) => repository.parentRepositoryId)
+          .map((repository) => repository.parentRepositoryId));
+        const parents = task.repositories
+          .filter((repository) => !repository.readOnly && parentIds.has(repository.id))
+          .sort((left, right) => (right.depth || 0) - (left.depth || 0));
+        for (const repository of parents) {
+          const current = await inspectRepository(repository.path);
+          if (current.isClean) continue;
+          await runGit(repository.path, ['add', '-A', '--', '.']);
+          const { stdout: staged } = await runGit(repository.path, ['diff', '--cached', '--name-only', '-z']);
+          if (!staged.length) continue;
+          await runGit(repository.path, ['commit', '-m', 'chore(submodules): synchronize rollback pointers']);
+          const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);
+          reverts.push({ repositoryId: repository.id, commit: stdout.trim(), pointerSync: true });
+        }
+      }
     } else {
-      for (const patch of [...task.result.patches].reverse()) {
-        const repository = task.repositories.find((item) => item.id === patch.id);
+      const repositoryById = new Map(task.repositories.map((repository) => [repository.id, repository]));
+      const rollbackPatches = [...task.result.patches].sort((left, right) => (
+        (repositoryById.get(right.id)?.depth || 0) - (repositoryById.get(left.id)?.depth || 0)
+      ));
+      for (const patch of rollbackPatches) {
+        const repository = repositoryById.get(patch.id);
         const body = await fs.readFile(patch.localPath);
         if (body.length === 0) continue;
         await applyPatch(repository.path, patch.localPath, true);

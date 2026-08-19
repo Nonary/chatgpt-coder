@@ -12,6 +12,12 @@ const TASK_MONITOR_INTERVAL_MILLISECONDS = 1_500;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
+const FILE_INPUT_SETTLE_TIMEOUT_MILLISECONDS = 5_000;
+const FILE_INPUT_SETTLE_DELAY_MILLISECONDS = 150;
+const PACKAGE_ATTACHMENT_APPEAR_TIMEOUT_MILLISECONDS = 5_000;
+const PACKAGE_ATTACHMENT_RETRY_DELAY_MILLISECONDS = 250;
+const PACKAGE_ATTACHMENT_RETRY_COUNT = 3;
+const HIDDEN_VIEW_BOUNDS = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
@@ -39,6 +45,13 @@ const TASK_REASONING_PICKER_OPTIONS = {
   high: { label: 'High', thinkingEffort: 'extended' },
   'extra-high': { label: 'Extra High', thinkingEffort: 'max' },
 };
+
+function sameBounds(left, right) {
+  return left.x === right.x
+    && left.y === right.y
+    && left.width === right.width
+    && left.height === right.height;
+}
 
 function taskRequestConfiguration(model, reasoningMode) {
   const requestedModel = String(model || 'default').toLowerCase();
@@ -561,30 +574,32 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
     }
     const selectedByInput = fileInputs.some((input) => [...(input.files || [])]
       .some((file) => file.name === filename));
-    // DOM.setFileInputFiles selected the exact unique package. Treat that as
-    // authoritative before inspecting attachment-chip text: broad page-level
-    // containers also contain the filename and can include unrelated progress
-    // indicators, which would otherwise look like an upload that is busy forever.
-    // clickSend separately waits for ChatGPT to enable submission.
-    if (selectedByInput) return {
-      attached: true,
-      busy: false,
-      duplicateNotice: Boolean(duplicateNotice),
-      dismissedDuplicate,
-    };
+    // A selected file input only proves that the browser accepted the local
+    // file selection. ChatGPT uses React state for composer attachments, so a
+    // stale or newly replaced input can still contain the file even when the
+    // attachment was never registered by the page. Require the attachment
+    // element itself before reporting success.
     // Source Control intentionally keeps the embedded ChatGPT view hidden at
     // zero bounds while a summary runs. Attachment chips still exist in the
     // page DOM in that state, but their client rectangles are empty. The task
     // package filename contains a unique task ID, so DOM presence is the
     // reliable confirmation signal here; rendered geometry is not.
-    const attachment = candidates.find((element) => [
-      element.textContent,
-      element.getAttribute('aria-label'),
-      element.getAttribute('title'),
-    ].filter(Boolean).some((value) => String(value).includes(filename)));
+    const normalizeText = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const attachment = candidates.find((element) => {
+      const text = normalizeText(element.textContent);
+      const labels = [
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.getAttribute('data-testid'),
+      ].filter(Boolean).map(normalizeText);
+      const containsFilename = [text, ...labels].some((value) => value.includes(filename));
+      if (!containsFilename) return false;
+      return text === filename || labels.some((value) => /(?:file|attach|upload)/i.test(value));
+    });
     if (!attachment) return {
       attached: false,
       busy: false,
+      selectedByInput,
       duplicateNotice: Boolean(duplicateNotice),
       dismissedDuplicate,
     };
@@ -595,9 +610,45 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
     return {
       attached: true,
       busy,
+      selectedByInput,
       duplicateNotice: Boolean(duplicateNotice),
       dismissedDuplicate,
     };
+  })()`;
+}
+
+function buildFileInputEventScript(filename) {
+  return `(async () => {
+    const filename = ${JSON.stringify(filename)};
+    const deadline = Date.now() + 2_000;
+    const findInput = () => {
+      const roots = [document];
+      const visited = new Set();
+      while (roots.length) {
+        const root = roots.shift();
+        if (!root || visited.has(root)) continue;
+        visited.add(root);
+        const input = [...root.querySelectorAll('input[type="file"]')]
+          .find((element) => [...(element.files || [])]
+            .some((file) => file.name === filename));
+        if (input) return input;
+        for (const element of root.querySelectorAll('*')) {
+          if (element.shadowRoot) roots.push(element.shadowRoot);
+        }
+      }
+      return null;
+    };
+    while (Date.now() < deadline) {
+      const input = findInput();
+      if (input) {
+        const eventOptions = { bubbles: true, composed: true };
+        input.dispatchEvent(new Event('input', eventOptions));
+        input.dispatchEvent(new Event('change', eventOptions));
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
   })()`;
 }
 
@@ -754,6 +805,10 @@ class ChatGPTView {
     this.dismissedNoticeEvents = new Map();
     this.configurationPickerTimer = null;
     this.visible = false;
+    this.windowFocused = this.mainWindow.isFocused?.() ?? false;
+    this.browserBounds = { ...HIDDEN_VIEW_BOUNDS };
+    this.renderedBrowserVisible = false;
+    this.renderedBrowserBounds = { ...HIDDEN_VIEW_BOUNDS };
     this.view = new WebContentsView({
       webPreferences: {
         partition: PARTITION,
@@ -765,7 +820,16 @@ class ChatGPTView {
     });
     this.mainWindow.contentView.addChildView(this.view);
     this.view.setBackgroundColor('#11130f');
-    this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    this.view.setBounds(HIDDEN_VIEW_BOUNDS);
+    this.view.setVisible(false);
+    this.mainWindow.on('blur', () => {
+      this.windowFocused = false;
+      this.syncViewPresentation();
+    });
+    this.mainWindow.on('focus', () => {
+      this.windowFocused = true;
+      setImmediate(() => this.syncViewPresentation());
+    });
     this.installNavigationHandlers();
     this.installConversationStatusListener();
     this.installDownloadListener();
@@ -784,7 +848,7 @@ class ChatGPTView {
   installNavigationHandlers() {
     const contents = this.view.webContents;
     contents.setWindowOpenHandler(({ url }) => {
-      if (!url.startsWith('https://')) return { action: 'deny' };
+      if (!url.startsWith('https://') || !this.windowFocused) return { action: 'deny' };
       return {
         action: 'allow',
         overrideBrowserWindowOptions: {
@@ -1040,13 +1104,26 @@ class ChatGPTView {
       width: Math.max(0, Math.round(bounds.width || 0)),
       height: Math.max(0, Math.round(bounds.height || 0)),
     };
-    this.view.setBounds(this.visible ? next : { x: 0, y: 0, width: 0, height: 0 });
+    this.browserBounds = next;
+    this.syncViewPresentation();
   }
 
   setVisible(visible) {
     this.visible = Boolean(visible);
-    this.view.setVisible(this.visible);
-    if (!this.visible) this.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    this.syncViewPresentation();
+  }
+
+  syncViewPresentation() {
+    const shouldShow = this.visible && this.windowFocused;
+    const nextBounds = shouldShow ? this.browserBounds : HIDDEN_VIEW_BOUNDS;
+    if (!sameBounds(this.renderedBrowserBounds, nextBounds)) {
+      this.view.setBounds(nextBounds);
+      this.renderedBrowserBounds = { ...nextBounds };
+    }
+    if (this.renderedBrowserVisible !== shouldShow) {
+      this.view.setVisible(shouldShow);
+      this.renderedBrowserVisible = shouldShow;
+    }
   }
 
   async prepare(task) {
@@ -1529,6 +1606,34 @@ class ChatGPTView {
     return 0;
   }
 
+  async waitForFileInputNodeId(timeoutMilliseconds = FILE_INPUT_SETTLE_TIMEOUT_MILLISECONDS) {
+    const startedAt = Date.now();
+    let previousNodeId = 0;
+    let stableChecks = 0;
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const nodeId = await this.findFileInputNodeId().catch(() => 0);
+      if (nodeId && nodeId === previousNodeId) {
+        stableChecks += 1;
+        if (stableChecks >= 2) return nodeId;
+      } else {
+        previousNodeId = nodeId;
+        stableChecks = nodeId ? 1 : 0;
+      }
+      await delay(FILE_INPUT_SETTLE_DELAY_MILLISECONDS);
+    }
+    return stableChecks >= 2 ? previousNodeId : 0;
+  }
+
+  async waitForPackageAttachmentToAppear(filename, timeoutMilliseconds = PACKAGE_ATTACHMENT_APPEAR_TIMEOUT_MILLISECONDS) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMilliseconds) {
+      const status = await this.packageAttachmentStatus(filename, true);
+      if (status.attached) return true;
+      await delay(200);
+    }
+    return false;
+  }
+
   async uploadPackage(packagePath) {
     const filename = path.basename(packagePath);
     const existingAttachment = await this.packageAttachmentStatus(filename, true);
@@ -1540,7 +1645,7 @@ class ChatGPTView {
         debuggerApi.attach('1.3');
         attachedHere = true;
       }
-      let nodeId = await this.findFileInputNodeId();
+      let nodeId = await ChatGPTView.prototype.waitForFileInputNodeId.call(this, 1_500);
       if (!nodeId) {
         await this.view.webContents.executeJavaScript(`(() => {
           const candidates = [...document.querySelectorAll('button')];
@@ -1553,30 +1658,48 @@ class ChatGPTView {
           if (button) button.click();
           return Boolean(button);
         })()`, true);
-        await delay(500);
-        nodeId = await this.findFileInputNodeId();
+        nodeId = await ChatGPTView.prototype.waitForFileInputNodeId.call(this);
       }
       if (!nodeId) {
         throw new Error('Could not locate ChatGPT’s attachment input. Attach the package manually or reload and retry.');
       }
-      await debuggerApi.sendCommand('DOM.setFileInputFiles', {
-        files: [packagePath],
-        nodeId,
-      });
-      const eventDispatched = await this.view.webContents.executeJavaScript(`(() => {
-        const filename = ${JSON.stringify(filename)};
-        const input = [...document.querySelectorAll('input[type="file"]')]
-          .find((element) => [...element.files].some((file) => file.name === filename));
-        if (!input) return false;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      })()`, true);
-      if (!eventDispatched) throw new Error('ChatGPT did not accept the selected task package. Nothing was submitted.');
+      let lastError = null;
+      let attachmentRendered = false;
+      for (let attempt = 0; attempt < PACKAGE_ATTACHMENT_RETRY_COUNT; attempt += 1) {
+        try {
+          if (attempt > 0) {
+            nodeId = await ChatGPTView.prototype.waitForFileInputNodeId.call(this);
+            if (!nodeId) throw new Error('ChatGPT replaced its attachment input before the file could be selected.');
+          }
+          await debuggerApi.sendCommand('DOM.setFileInputFiles', {
+            files: [packagePath],
+            nodeId,
+          });
+          const eventDispatched = await this.view.webContents.executeJavaScript(
+            buildFileInputEventScript(filename),
+            true,
+          );
+          if (!eventDispatched) throw new Error('ChatGPT did not accept the selected task package.');
+          if (!await this.waitForPackageAttachmentToAppear(filename)) {
+            throw new Error('ChatGPT did not render the selected task package in the composer.');
+          }
+          attachmentRendered = true;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (attempt + 1 < PACKAGE_ATTACHMENT_RETRY_COUNT) {
+            await delay(PACKAGE_ATTACHMENT_RETRY_DELAY_MILLISECONDS);
+          }
+        }
+      }
+      if (!attachmentRendered) {
+        throw new Error(`ChatGPT did not confirm the attachment ${filename}. ${lastError?.message || 'Nothing was submitted.'} Reload the embedded browser and try again.`);
+      }
+      await this.waitForPackageAttachment(filename);
+      return true;
     } finally {
       if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
     }
-    await this.waitForPackageAttachment(path.basename(packagePath));
   }
 
   async uploadAttachments(attachments = []) {
@@ -2041,6 +2164,7 @@ module.exports = {
   chatGPTProjectUrl,
   buildLimitNoticeDismissalScript,
   buildPackageAttachmentStatusScript,
+  buildFileInputEventScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   buildConversationStatusScript,

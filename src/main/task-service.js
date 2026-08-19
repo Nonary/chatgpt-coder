@@ -7,6 +7,7 @@ const {
   createSnapshotBundle,
   createWorkingSnapshotBundle,
   inspectRepository,
+  inspectRepositoryGraph,
 } = require('./git');
 const { SkillService } = require('./skill-service');
 
@@ -89,6 +90,7 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Extrac
 4. In each clone, check out \`baseCommit\` and create a working branch named \`patchwork/${taskId}\`.
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
 6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.
+7. Repository entries may represent recursively discovered submodules. When \`parentRepositoryId\` and \`submodulePath\` are present, preserve that hierarchy and return changes for each repository in its own patch.
 
 ## Inspect supplied working changes
 
@@ -231,9 +233,62 @@ class TaskService {
   }
 
   async inspectRepositories(selectedPaths) {
-    const repositories = await Promise.all(selectedPaths.map(inspectRepository));
-    const unique = new Map(repositories.map((repository) => [repository.path, repository]));
-    return [...unique.values()];
+    return inspectRepositoryGraph(selectedPaths);
+  }
+
+  async expandRepositorySelections(selectedRepositories) {
+    const selections = Array.isArray(selectedRepositories) ? selectedRepositories : [];
+    const explicitByPath = new Map();
+    for (const item of selections) {
+      if (!item?.path) continue;
+      explicitByPath.set(await fs.realpath(item.path), item);
+    }
+
+    const expanded = new Map();
+    for (const item of selections) {
+      if (!item?.path) continue;
+      const rootPath = await fs.realpath(item.path);
+      const graph = await inspectRepositoryGraph([rootPath]);
+      for (const repository of graph) {
+        const explicit = explicitByPath.get(repository.path) || {};
+        const candidate = {
+          ...repository,
+          readOnly: Boolean(item.readOnly),
+          sourcePath: explicit.sourcePath ? await fs.realpath(explicit.sourcePath).catch(() => path.resolve(explicit.sourcePath)) : repository.path,
+          treeMemberId: explicit.treeMemberId || null,
+          depth: Number.isInteger(explicit.depth) ? explicit.depth : repository.depth,
+        };
+        const current = expanded.get(repository.path);
+        if (!current) {
+          expanded.set(repository.path, candidate);
+          continue;
+        }
+        const useCandidateRelation = candidate.depth > current.depth || (!current.parentPath && Boolean(candidate.parentPath));
+        expanded.set(repository.path, {
+          ...current,
+          ...(useCandidateRelation ? {
+            parentPath: candidate.parentPath,
+            submodulePath: candidate.submodulePath,
+            submoduleName: candidate.submoduleName,
+            configuredBranch: candidate.configuredBranch,
+            depth: candidate.depth,
+            rootPath: candidate.rootPath,
+          } : {}),
+          readOnly: current.readOnly && candidate.readOnly,
+          sourcePath: explicit.sourcePath ? candidate.sourcePath : current.sourcePath,
+          treeMemberId: explicit.treeMemberId || current.treeMemberId,
+        });
+      }
+    }
+
+    const repositories = [...expanded.values()].sort((left, right) => (
+      left.depth - right.depth || left.path.localeCompare(right.path)
+    ));
+    const byPath = new Map(repositories.map((repository) => [repository.path, repository]));
+    return repositories.map((repository) => ({
+      ...repository,
+      parentRepositoryId: repository.parentPath ? byPath.get(repository.parentPath)?.id || null : null,
+    }));
   }
 
   async createTask(input) {
@@ -245,15 +300,47 @@ class TaskService {
     const model = normalizeTaskModel(input.model);
     const reasoningMode = normalizeReasoningMode(input.reasoningMode);
 
-    const repositories = await this.inspectRepositories(input.repositories.map((item) => item.path));
+    let repositorySelections = input.repositories;
+    if (input.tree) {
+      const treeMembers = Array.isArray(input.tree.repositories) && input.tree.repositories.length
+        ? input.tree.repositories
+        : (input.tree.path ? [{ path: input.tree.path, repositoryPath: input.tree.repositoryPath }] : []);
+      const memberByTreePath = new Map();
+      for (const member of treeMembers) {
+        if (!member?.path || !member?.repositoryPath) continue;
+        const resolvedPath = await fs.realpath(member.path).catch(() => path.resolve(member.path));
+        memberByTreePath.set(resolvedPath, member);
+      }
+      const suppliedPaths = new Set();
+      repositorySelections = await Promise.all(input.repositories.map(async (repository) => {
+        if (!repository.path) return repository;
+        const resolvedPath = await fs.realpath(repository.path).catch(() => path.resolve(repository.path));
+        suppliedPaths.add(resolvedPath);
+        const member = memberByTreePath.get(resolvedPath);
+        if (!member) return repository;
+        return {
+          ...repository,
+          sourcePath: repository.sourcePath || member.repositoryPath,
+          treeMemberId: repository.treeMemberId || member.repositoryId || null,
+          depth: Number.isInteger(repository.depth) ? repository.depth : member.depth || 0,
+        };
+      }));
+      for (const [resolvedPath, member] of memberByTreePath) {
+        if (suppliedPaths.has(resolvedPath)) continue;
+        repositorySelections.push({
+          path: member.path,
+          sourcePath: member.repositoryPath,
+          treeMemberId: member.repositoryId || null,
+          depth: member.depth || 0,
+        });
+      }
+    }
+
+    const repositories = await this.expandRepositorySelections(repositorySelections);
     const skillRepositoryPaths = Array.isArray(input.skillRepositoryPaths) && input.skillRepositoryPaths.length
       ? input.skillRepositoryPaths
-      : input.repositories.map((item) => item.path);
+      : repositories.map((item) => item.path);
     const selectedSkills = await this.skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
-    const requestedRepositories = new Map(await Promise.all(input.repositories.map(async (item) => [
-      await fs.realpath(item.path),
-      item,
-    ])));
     const taskId = crypto.randomUUID();
     const taskDir = this.taskDirectory(taskId);
     const bundlesDir = path.join(taskDir, 'repositories');
@@ -319,7 +406,7 @@ class TaskService {
     const publicRepositories = [];
     const taskRepositories = [];
     for (const repository of repositories) {
-      const readOnly = Boolean(requestedRepositories.get(repository.path)?.readOnly);
+      const readOnly = Boolean(repository.readOnly);
       const bundleFile = `repositories/${repository.id}.bundle`;
       const bundlePath = path.join(taskDir, bundleFile);
       let taskRepository;
@@ -379,6 +466,9 @@ class TaskService {
         workingStatus: taskRepository.workingStatus,
         bundleFile,
         readOnly,
+        parentRepositoryId: taskRepository.parentRepositoryId || null,
+        submodulePath: taskRepository.submodulePath || null,
+        depth: taskRepository.depth || 0,
       });
     }
 
@@ -443,7 +533,12 @@ class TaskService {
       chatFinishedAt: null,
       resultFilename: `chatgpt-ide-result-${taskId}.txt`,
       sourceRepositoryPath: input.tree?.repositoryPath
-        || (taskRepositories.length === 1 ? taskRepositories[0].path : null),
+        || (taskRepositories.filter((repository) => !repository.readOnly && !repository.parentRepositoryId).length === 1
+          ? taskRepositories.find((repository) => !repository.readOnly && !repository.parentRepositoryId)?.sourcePath || null
+          : null),
+      sourceRepositoryPaths: [...new Set(taskRepositories
+        .filter((repository) => !repository.readOnly && !repository.parentRepositoryId)
+        .map((repository) => repository.sourcePath || repository.path))],
       chatgptProject: input.chatgptProject?.id ? {
         id: String(input.chatgptProject.id),
         shortUrl: input.chatgptProject.shortUrl ? String(input.chatgptProject.shortUrl) : null,
@@ -485,27 +580,70 @@ class TaskService {
     }
     const writableRepositories = (Array.isArray(task.repositories) ? task.repositories : [])
       .filter((repository) => !repository.readOnly);
-    if (writableRepositories.length !== 1) {
-      throw new Error('Worktree selection is only available for tasks with one writable repository.');
+    if (writableRepositories.length === 0) {
+      throw new Error('This task has no writable repository target.');
     }
-    const repositoryPath = String(target.repositoryPath || '').trim();
-    if (!repositoryPath) throw new Error('Choose a valid task target.');
-    const repository = await inspectRepository(repositoryPath);
+
     const targetTree = target.tree || null;
-    const writableId = writableRepositories[0].id;
-    const repositories = task.repositories.map((entry) => (entry.id === writableId
-      ? {
+    let requestedTargets = Array.isArray(target.repositories) ? target.repositories : [];
+    if (requestedTargets.length === 0 && Array.isArray(targetTree?.repositories)) {
+      requestedTargets = targetTree.repositories.map((repository) => ({
+        sourcePath: repository.repositoryPath,
+        path: repository.path,
+      }));
+    }
+    if (requestedTargets.length === 0 && target.repositoryPath && writableRepositories.length === 1) {
+      requestedTargets = [{
+        sourcePath: writableRepositories[0].sourcePath || task.sourceRepositoryPath || writableRepositories[0].path,
+        path: target.repositoryPath,
+      }];
+    }
+
+    const targetsBySource = new Map();
+    for (const item of requestedTargets) {
+      if (!item?.path) continue;
+      const sourcePath = item.sourcePath || item.repositoryPath || item.path;
+      const resolvedSource = await fs.realpath(sourcePath).catch(() => path.resolve(sourcePath));
+      targetsBySource.set(resolvedSource, item.path);
+    }
+
+    const repositories = [];
+    for (const entry of task.repositories) {
+      if (entry.readOnly) {
+        repositories.push(entry);
+        continue;
+      }
+      const sourcePath = entry.sourcePath
+        || (writableRepositories.length === 1 ? task.sourceRepositoryPath : null)
+        || entry.path;
+      const resolvedSource = await fs.realpath(sourcePath).catch(() => path.resolve(sourcePath));
+      const targetPath = targetsBySource.get(resolvedSource) || (!targetTree ? resolvedSource : null);
+      if (!targetPath) {
+        throw new Error(`The selected coding tree does not contain ${entry.name}.`);
+      }
+      const repository = await inspectRepository(targetPath);
+      repositories.push({
         ...entry,
         name: repository.name,
         path: repository.path,
         branch: repository.branch,
+        sourcePath: resolvedSource,
         readOnly: false,
-      }
-      : entry));
+      });
+    }
+
     return this.updateTask(taskId, {
       treeId: targetTree?.id || null,
       treeName: targetTree?.name || null,
-      sourceRepositoryPath: task.sourceRepositoryPath || targetTree?.repositoryPath || repository.path,
+      sourceRepositoryPath: task.sourceRepositoryPath
+        || task.sourceRepositoryPaths?.[0]
+        || writableRepositories[0]?.sourcePath
+        || writableRepositories[0]?.path
+        || null,
+      sourceRepositoryPaths: task.sourceRepositoryPaths?.length
+        ? task.sourceRepositoryPaths
+        : [...new Set(writableRepositories.filter((repository) => !repository.parentRepositoryId)
+          .map((repository) => repository.sourcePath || repository.path))],
       repositories,
     });
   }

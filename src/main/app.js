@@ -39,6 +39,32 @@ function taskTitle(task) {
   return firstLine.length > 80 ? `${firstLine.slice(0, 79)}…` : firstLine;
 }
 
+function treeRepositoryInputs(tree) {
+  const members = Array.isArray(tree?.repositories) && tree.repositories.length
+    ? tree.repositories
+    : (tree?.path ? [{
+      repositoryId: tree.repositoryId,
+      repositoryPath: tree.repositoryPath,
+      path: tree.path,
+      depth: 0,
+    }] : []);
+  return members.map((repository) => ({
+    path: repository.path,
+    sourcePath: repository.repositoryPath,
+    treeMemberId: repository.repositoryId,
+    depth: repository.depth || 0,
+  }));
+}
+
+function treeSourceInputs(tree, readOnly = false) {
+  const members = Array.isArray(tree?.repositories) && tree.repositories.length
+    ? tree.repositories
+    : (tree?.repositoryPath ? [{ repositoryPath: tree.repositoryPath, parentRepositoryId: null }] : []);
+  return members
+    .filter((repository) => !repository.parentRepositoryId)
+    .map((repository) => ({ path: repository.repositoryPath, readOnly }));
+}
+
 function buildConflictResolutionTaskText(task, conflict, additionalInstructions = '') {
   const base = `Resolve the failed Patchwork result application described below. Inspect the current coding tree, including any conflict markers, and the original result patch in CONFLICTS.md. Preserve the intended changes from both the original task and the returned result, then complete the work and verify the final diff.\n\nOriginal task:\n${task.taskText}\n\nApply failure:\n${conflict.error || task.error || 'The result could not be applied cleanly.'}`;
   const extra = String(additionalInstructions || '').replaceAll('\r\n', '\n').trim().slice(0, 12_000);
@@ -214,7 +240,7 @@ function registerIpc() {
       type: 'warning',
       title: 'Discard coding tree?',
       message: `Discard “${tree.name}” and all commits that have not been merged?`,
-      detail: 'This removes the worktree and its Patchwork branch. This action cannot be undone from Patchwork.',
+      detail: 'This removes every worktree in the coding tree and its Patchwork branches. This action cannot be undone from Patchwork.',
       buttons: ['Cancel', 'Discard tree'],
       defaultId: 0,
       cancelId: 0,
@@ -242,18 +268,18 @@ function registerIpc() {
       type: 'question',
       title: 'Resolve merge with ChatGPT?',
       message: `Ask ChatGPT to resolve the failed merge for “${tree.name}”?`,
-      detail: 'Patchwork will send the coding tree as the writable repository and a read-only snapshot of the original checkout, including its local changes.',
+      detail: 'Patchwork will send the coding-tree repositories as writable context and read-only snapshots of the original checkouts, including local changes.',
       buttons: ['Cancel', 'Submit resolution task'],
       defaultId: 1,
       cancelId: 0,
     });
     if (confirmation.response !== 1) return null;
-    const taskText = `Resolve the failed coding-tree merge described below. Use the read-only original-checkout snapshot to understand the target state and local changes. Make every required resolution in the writable coding-tree repository only, preserve both sides' intended changes, and verify the result.\n\nMerge failure:\n${tree.mergeError || 'The coding tree could not be merged.'}`;
+    const taskText = `Resolve the failed coding-tree merge described below. Use the read-only original-checkout snapshots to understand the target state and local changes. Make every required resolution in the writable coding-tree repositories only, preserve both sides' intended changes, and verify the result.\n\nMerge failure:\n${tree.mergeError || 'The coding tree could not be merged.'}`;
     const task = await taskService.createTask({
       taskText,
       repositories: [
-        { path: tree.path },
-        { path: tree.repositoryPath, readOnly: true },
+        ...treeRepositoryInputs(tree),
+        ...treeSourceInputs(tree, true),
       ],
       tree,
       chatgptProject: tree.chatgptProject || null,
@@ -279,20 +305,20 @@ function registerIpc() {
       const inspected = await worktreeService.inspect(tree);
       if (!inspected.available) throw new Error(inspected.error);
       if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
-      skillRepositoryPaths = [tree.path];
+      skillRepositoryPaths = treeRepositoryInputs(inspected).map((repository) => repository.path);
     } else if (input.createTree) {
-      if (!Array.isArray(input.repositories) || input.repositories.length !== 1) {
-        throw new Error('Choose exactly one repository when creating a coding tree.');
+      if (!Array.isArray(input.repositories) || input.repositories.length === 0) {
+        throw new Error('Choose at least one repository when creating a coding tree.');
       }
       await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
       const suggestedName = String(input.treeName || input.taskText || '').split('\n')[0].trim();
-      tree = await worktreeService.create(input.repositories[0].path, suggestedName);
+      tree = await worktreeService.create(input.repositories.map((repository) => repository.path), suggestedName);
     }
     if (!input.createTree) await skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
     const task = await taskService.createTask({
       ...input,
       skillRepositoryPaths,
-      repositories: tree ? [{ path: tree.path }] : input.repositories,
+      repositories: tree ? treeRepositoryInputs(tree) : input.repositories,
       tree,
       autoApply: true,
     });
@@ -346,37 +372,46 @@ function registerIpc() {
     if (['applied', 'rolled-back', 'resolved'].includes(task.state)) {
       throw new Error('This task can no longer change its apply target.');
     }
-    if (writableRepositories.length !== 1) {
-      throw new Error('Worktree selection is only available for tasks with one writable repository.');
+    if (writableRepositories.length === 0) {
+      throw new Error('This task has no writable repository target.');
     }
 
     const previousTreeId = task.treeId || null;
     const selection = input && typeof input === 'object' ? input : {};
+    const sourcePathForRepository = (repository) => repository.sourcePath
+      || (writableRepositories.length === 1 ? task.sourceRepositoryPath : null)
+      || repository.path;
+    const sourcePaths = [...new Set((task.sourceRepositoryPaths?.length
+      ? task.sourceRepositoryPaths
+      : writableRepositories.filter((repository) => !repository.parentRepositoryId)
+        .map(sourcePathForRepository)).filter(Boolean))];
     let tree = null;
-    let repositoryPath = task.sourceRepositoryPath || writableRepositories[0].path;
+    let repositoryTargets = writableRepositories.map((repository) => ({
+      sourcePath: sourcePathForRepository(repository),
+      path: sourcePathForRepository(repository),
+    }));
 
     if (selection.createTree) {
-      tree = await worktreeService.create(repositoryPath, selection.treeName);
-      repositoryPath = tree.path;
+      tree = await worktreeService.create(sourcePaths, selection.treeName);
+      repositoryTargets = treeRepositoryInputs(tree);
     } else if (selection.treeId) {
       const candidate = await worktreeService.get(String(selection.treeId));
       tree = await worktreeService.inspect(candidate);
       if (!tree.available) throw new Error(tree.error || 'The selected coding tree is unavailable.');
       if (tree.mergeState === 'submitted') throw new Error('The selected coding tree is already being merged.');
-      const sourcePath = task.sourceRepositoryPath || writableRepositories[0].path;
-      const [expectedRoot, selectedRoot] = await Promise.all([
-        fs.realpath(sourcePath).catch(() => path.resolve(sourcePath)),
-        fs.realpath(tree.repositoryPath).catch(() => path.resolve(tree.repositoryPath)),
-      ]);
-      if (expectedRoot !== selectedRoot) {
-        throw new Error('Choose a worktree from the same repository as this task.');
+      const expectedSources = new Set(await Promise.all(writableRepositories.map((repository) => (
+        fs.realpath(sourcePathForRepository(repository)).catch(() => path.resolve(sourcePathForRepository(repository)))
+      ))));
+      const selectedSources = new Set(await Promise.all(tree.repositories.map((repository) => (
+        fs.realpath(repository.repositoryPath).catch(() => path.resolve(repository.repositoryPath))
+      ))));
+      if (![...expectedSources].every((repositoryPath) => selectedSources.has(repositoryPath))) {
+        throw new Error('Choose a coding tree containing the same repositories and submodules as this task.');
       }
-      repositoryPath = tree.path;
-    } else if (task.sourceRepositoryPath) {
-      repositoryPath = task.sourceRepositoryPath;
+      repositoryTargets = treeRepositoryInputs(tree);
     }
 
-    const updated = await taskService.setTarget(taskId, { repositoryPath, tree });
+    const updated = await taskService.setTarget(taskId, { tree, repositories: repositoryTargets });
     if (previousTreeId && previousTreeId !== tree?.id) {
       await worktreeService.detachTask(previousTreeId, taskId).catch(() => {});
     }
@@ -386,10 +421,11 @@ function registerIpc() {
     emit({
       type: 'task-target-changed',
       task: publicTask(updated),
-      message: tree ? `Task target changed to ${tree.name}.` : 'Task target changed to the original repository.',
+      message: tree ? `Task target changed to ${tree.name}.` : 'Task target changed to the original repositories.',
     });
     return publicTask(updated);
   });
+
   ipcMain.handle('task:retry-apply', async (_event, taskId) => {
     const task = await taskService.getTask(taskId);
     if (task.state !== 'conflicted' || !task.result?.patches?.length) {
@@ -402,11 +438,15 @@ function registerIpc() {
     if (task.state !== 'conflicted' || !task.result?.patches?.length) {
       throw new Error('This task does not have a result conflict to resolve.');
     }
+    task = await resultService.rebindMissingResolutionTarget(task, false);
     task = await retryTaskApplication(task);
     if (task.state === 'applied') return publicTask(task);
     if (task.state !== 'conflicted') {
       throw new Error('The result could not be retried before conflict resolution.');
     }
+    const conflict = task.result.conflicts?.[0] || {};
+    await resultService.prepareConflictResolution(task.taskId);
+    task = await taskService.getTask(task.taskId);
     let tree = null;
     if (task.treeId) {
       const candidate = await worktreeService.get(task.treeId).catch(() => null);
@@ -420,20 +460,19 @@ function registerIpc() {
       .filter((repository) => !repository.readOnly)
       .map((repository) => ({ path: repository.path }));
     let repositories = tree
-      ? [{ path: tree.path }]
+      ? treeRepositoryInputs(tree)
       : writableRepositories;
     if (!tree && task.sourceRepositoryPath && writableRepositories.length === 1) {
       repositories = [{ path: task.sourceRepositoryPath }];
     }
     if (repositories.length === 0) throw new Error('This conflicted task has no writable repository to resolve.');
-    const conflict = task.result.conflicts?.[0] || {};
-    await resultService.prepareConflictResolution(task.taskId);
     const resolutionOptions = options && typeof options === 'object' ? options : {};
     const resolutionTask = await taskService.createTask({
       taskText: buildConflictResolutionTaskText(task, conflict, resolutionOptions.additionalInstructions),
       repositories,
       attachments: task.attachments || [],
       tree,
+      chatgptProject: task.chatgptProject || tree?.chatgptProject || null,
       autoApply: true,
       model: Object.prototype.hasOwnProperty.call(resolutionOptions, 'model') ? resolutionOptions.model : task.model,
       reasoningMode: Object.prototype.hasOwnProperty.call(resolutionOptions, 'reasoningMode')
@@ -496,10 +535,12 @@ app.whenReady().then(async () => {
   resultService = new ResultService(taskService, async (event) => {
     if (event.type === 'task-applied' && event.task?.mergeResolution && event.task.treeId
       && event.task.result?.commits?.length) {
-      const sourceContext = event.task.repositories.find((repository) => repository.readOnly);
+      const resolvedSourceFingerprints = Object.fromEntries(event.task.repositories
+        .filter((repository) => repository.readOnly && repository.snapshotFingerprint)
+        .map((repository) => [repository.id, repository.snapshotFingerprint]));
       await worktreeService.clearMergeFailure(
         event.task.treeId,
-        sourceContext?.snapshotFingerprint || null,
+        resolvedSourceFingerprints,
       );
       emit(event);
       try {

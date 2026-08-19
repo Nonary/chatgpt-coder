@@ -21,16 +21,16 @@ Patchwork deliberately does not expose discard, hard reset, or forced checkout a
 
 ## Coding trees
 
-Coding trees are optional task targets. A tree runs in a real Git worktree on its own `patchwork/…` branch. The original checkout must have a commit, be on a branch, and be clean before a tree is created. The **Coding trees** workspace lets you:
+Coding trees are optional task targets. A tree runs in real Git worktrees on a shared `patchwork/…` branch name. Every selected root repository and each initialized Git submodule discovered beneath it recursively receives a matching worktree. Selected root checkouts must have a commit, be on a branch, and be clean before a tree is created; submodules may start detached as long as Patchwork can resolve the local branch that owns their pinned commit. The **Coding trees** workspace lets you:
 
-- create a named tree from a repository;
+- create one named tree spanning multiple repositories and their recursive submodules;
 - discover existing linked worktrees directly from repositories in the workspace;
 - attach follow-up tasks to an existing tree while opening a fresh ChatGPT chat each time;
 - inspect the tree in Source Control, reveal its directory, and see its task and commit counts;
 - discard a tree through an explicit confirmation; or
 - choose the ChatGPT project used by **Merge tree**, with the selected destination retained as the tree's default; then ask ChatGPT to summarize all tree commits and produce an improved Conventional Commit message.
 
-Coding-tree task results are never applied to the original checkout. After validation, Patchwork applies the patch to the selected tree, stages it, and commits it using the Conventional Commit message included in ChatGPT's plain-text result. Tasks that target current working changes apply directly to the selected repository without creating a new commit. A tree merge is first tested and committed in a temporary integration worktree. The original branch is fast-forwarded only if it stayed clean and unchanged; Patchwork then removes the task worktree and its branch.
+Coding-tree task results are never applied directly to the original checkout. After validation, Patchwork applies each repository patch to the selected tree and commits changed submodules before their parents so every parent commit records the new gitlink pointer. Tasks that target current working changes apply directly to the selected repositories without creating new commits. A tree merge is first tested in temporary integration worktrees from the deepest submodules upward. Patchwork creates the merged submodule commits, updates parent gitlinks to those merged commits, and fast-forwards every resolved original branch only if all participating source repositories stayed clean and unchanged; it then removes the whole coding-tree group and its branches.
 
 ## Task history
 
@@ -49,13 +49,13 @@ The task composer includes a local **Prompt library** dropdown directly below mo
 ## Current workflow
 
 1. Patchwork opens directly to the embedded ChatGPT session. Sign in there before creating a task; the persistent session is reused afterward.
-2. Choose **New task**, then select one or more repositories for current-working-change work, create a coding tree from one clean, committed Git repository, or attach the task to an existing tree. The repository picker includes saved workspace repositories and repositories found in prior task history, with search and a browse fallback. The task target, repository selection, model, reasoning mode, and ChatGPT project selection stay sticky between task selections and are restored after application restarts.
+2. Choose **New task**, then select one or more repositories for current-working-change work, create one coding tree spanning the selected clean, committed repositories and their initialized submodules, or attach the task to an existing tree. The repository picker includes saved workspace repositories and repositories found in prior task history, with search and a browse fallback. The task target, repository selection, model, reasoning mode, and ChatGPT project selection stay sticky between task selections and are restored after application restarts.
 3. Describe the software task, optionally select saved prompt instructions, local reference files, or skills, and choose where ChatGPT should launch it. A task can use a normal new chat, an existing ChatGPT project, or a newly created project. Patchwork copies attachments into the task record and embeds them in the task package under `attachments/`.
 4. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, and the selected repositories or coding tree Git bundles under `repositories/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
 5. Patchwork opens the selected ChatGPT destination in the same embedded browser, injects the instructions, attaches the ZIP package plus any user-selected reference files, waits for the attachments to finish processing, and clicks ChatGPT's Send button.
 6. ChatGPT follows the embedded protocol and attaches `chatgpt-ide-result-<task-id>.txt`, containing a marked `PATCHWORK_RESULT_V1` JSON envelope with base64-encoded `git diff --binary` patches. The envelope is not printed in the chat.
 7. Patchwork's application-level monitor activates that exact download, reads the text file locally, verifies the task ID, repository set, base commits, size limits, and base64 integrity, then applies the patch to the task target. Coding-tree tasks also verify the Conventional Commit message and commit the patch. If the target's `HEAD` advanced, Patchwork first tries a clean contextual apply and then Git's three-way merge.
-8. When **Merge tree** is chosen, Patchwork opens another fresh ChatGPT chat with the tree's commit history and diff summary. It reads the returned merge envelope, creates one squash commit on the original branch through a temporary integration worktree, and removes the coding tree.
+8. When **Merge tree** is chosen, Patchwork opens another fresh ChatGPT chat with the commit history and diff summary for every changed member of the tree. It reads the returned merge envelope, creates squash commits for changed submodules and their parent gitlink updates through temporary integration worktrees, fast-forwards every participating original branch, and removes the coding tree.
 
 If Git reports conflicts, Patchwork leaves the conflict markers and unmerged files in the target, reports the affected files, and offers **Retry apply**. It also offers **Resolve with ChatGPT** when the task has a writable target, which opens a new ChatGPT task containing the current dirty target, `CONFLICTS.md`, the original result patch, and the original task attachments.
 
@@ -86,14 +86,14 @@ pnpm dist
 
 ## Safety boundaries
 
-- Coding trees can only be created from clean repositories with an existing `HEAD`, which keeps concurrent workstreams anchored to an unambiguous commit. Current-working-change tasks can package dirty repositories without creating a tree.
+- Coding trees can only be created from clean repositories with an existing `HEAD`, which keeps concurrent workstreams anchored to unambiguous commits. Initialized submodules are included recursively and may be detached when Patchwork can resolve their local destination branch. Current-working-change tasks can package dirty repositories without creating a tree.
 - Each follow-up task is pinned to the coding tree's current `HEAD`.
 - Each result must name the original task and exact base commit.
 - Plain-text envelopes have strict markers, schemas, size limits, repository IDs, and base64-integrity checks. Legacy ZIP paths are treated as untrusted input and are never extracted wholesale.
 - All patches are checked before the first repository is modified.
 - A multi-repository failure triggers a best-effort reversal of patches already applied.
-- Applied task changes are committed only on Patchwork worktree branches. Patchwork never pushes or rewrites published history.
-- Squash merging runs in a temporary worktree first and updates the original branch only by fast-forwarding the verified integration commit.
+- Applied task changes are committed only on Patchwork worktree branches. Submodule commits are created before parent gitlink commits. Patchwork never pushes or rewrites published history.
+- Squash merging runs in temporary worktrees first, resolves submodules deepest-first, updates parent gitlinks to the merged child commits, and updates each original branch only by fast-forwarding its verified integration commit.
 
 ## Browser automation boundary
 

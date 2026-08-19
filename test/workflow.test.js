@@ -13,6 +13,7 @@ const {
   buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
   buildPackageAttachmentStatusScript,
+  buildFileInputEventScript,
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   conversationIdFromRouteUrl,
@@ -49,6 +50,45 @@ async function createRepository(root) {
   await runGit(repositoryPath, ['add', 'hello.txt']);
   await runGit(repositoryPath, ['commit', '-m', 'Initial commit']);
   return repositoryPath;
+}
+
+async function createNamedRepository(root, name, filename, contents) {
+  const repositoryPath = path.join(root, name);
+  await fs.mkdir(repositoryPath, { recursive: true });
+  await runGit(repositoryPath, ['init', '-b', 'main']);
+  await runGit(repositoryPath, ['config', 'user.email', 'patchwork@example.invalid']);
+  await runGit(repositoryPath, ['config', 'user.name', 'Patchwork Test']);
+  await fs.writeFile(path.join(repositoryPath, filename), contents);
+  await runGit(repositoryPath, ['add', filename]);
+  await runGit(repositoryPath, ['commit', '-m', 'Initial commit']);
+  return repositoryPath;
+}
+
+async function createNestedSubmoduleRepository(root) {
+  const leafPath = await createNamedRepository(root, 'leaf-repository', 'leaf.txt', 'leaf\n');
+  const childPath = await createNamedRepository(root, 'child-repository', 'child.txt', 'child\n');
+  await runGit(childPath, [
+    '-c', 'protocol.file.allow=always', 'submodule', 'add', leafPath, 'deps/leaf',
+  ]);
+  await runGit(path.join(childPath, 'deps/leaf'), ['config', 'user.email', 'patchwork@example.invalid']);
+  await runGit(path.join(childPath, 'deps/leaf'), ['config', 'user.name', 'Patchwork Test']);
+  await runGit(childPath, ['commit', '-am', 'Add leaf submodule']);
+
+  const parentPath = await createNamedRepository(root, 'parent-repository', 'parent.txt', 'parent\n');
+  await runGit(parentPath, [
+    '-c', 'protocol.file.allow=always', 'submodule', 'add', childPath, 'modules/child',
+  ]);
+  await runGit(parentPath, [
+    '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '--recursive',
+  ]);
+  const checkedOutChild = path.join(parentPath, 'modules/child');
+  const checkedOutLeaf = path.join(checkedOutChild, 'deps/leaf');
+  for (const repositoryPath of [checkedOutChild, checkedOutLeaf]) {
+    await runGit(repositoryPath, ['config', 'user.email', 'patchwork@example.invalid']);
+    await runGit(repositoryPath, ['config', 'user.name', 'Patchwork Test']);
+  }
+  await runGit(parentPath, ['commit', '-am', 'Add child submodule']);
+  return parentPath;
 }
 
 async function ingestDownloadedText(results, tasks, task, text) {
@@ -155,6 +195,11 @@ test('Source Control summaries prepare a normal Luna Medium task and reuse stand
   assert.match(renderer, /useActiveGitSummary/);
   assert.match(renderer, /source-commit-message'\]\.value = completed\.result\.commitMessage/);
   assert.doesNotMatch(renderer, /source-commit-message'\]\.value = result\.commitMessage/);
+  assert.match(renderer, /source-chatgpt-project-select/);
+  assert.match(renderer, /source-chatgpt-project-select'\]\.addEventListener\('change'[\s\S]*persistTaskProjectSelection\(event\)/);
+  assert.match(renderer, /function renderSourceChatGPTProjectSelection\(\)/);
+  assert.match(markup, /id="source-chatgpt-project-select"/);
+  assert.match(markup, /id="source-refresh-projects-button"/);
   assert.match(markup, /id="use-git-summary-button"[^>]*>Use in Source Control<\/button>/);
   assert.match(preload, /gitSummary: \(repositoryPath, customPrompt, chatgptProject\)/);
   assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
@@ -822,6 +867,60 @@ test('result downloads match ChatGPT filenames including duplicate suffixes', ()
   assert.equal(resultTaskId('unrelated.txt'), null);
 });
 
+test('background browser activity stays hidden while the app is unfocused', () => {
+  const applied = [];
+  const browserBounds = { x: 24, y: 18, width: 760, height: 620 };
+  const view = Object.create(ChatGPTView.prototype);
+  view.visible = true;
+  view.windowFocused = false;
+  view.browserBounds = { ...browserBounds };
+  view.renderedBrowserVisible = true;
+  view.renderedBrowserBounds = { ...browserBounds };
+  view.view = {
+    setBounds: (bounds) => applied.push(['bounds', bounds]),
+    setVisible: (visible) => applied.push(['visible', visible]),
+  };
+
+  view.syncViewPresentation();
+  assert.deepEqual(applied, [
+    ['bounds', { x: 0, y: 0, width: 0, height: 0 }],
+    ['visible', false],
+  ]);
+
+  applied.length = 0;
+  view.setBounds({ x: 36, y: 22, width: 810, height: 640 });
+  assert.deepEqual(applied, []);
+  assert.deepEqual(view.browserBounds, { x: 36, y: 22, width: 810, height: 640 });
+
+  view.windowFocused = true;
+  view.syncViewPresentation();
+  assert.deepEqual(applied, [
+    ['bounds', { x: 36, y: 22, width: 810, height: 640 }],
+    ['visible', true],
+  ]);
+});
+
+test('background browser popups are denied while the app is unfocused', () => {
+  const handlers = [];
+  const contents = new EventEmitter();
+  contents.setWindowOpenHandler = (handler) => handlers.push(handler);
+  const view = Object.create(ChatGPTView.prototype);
+  view.windowFocused = false;
+  view.mainWindow = {};
+  view.view = { webContents: contents };
+  view.onEvent = () => {};
+  view.installResultWatcher = () => {};
+  view.scheduleTaskConfigurationPicker = () => {};
+
+  view.installNavigationHandlers();
+  const openHandler = handlers[0];
+  assert.equal(openHandler({ url: 'https://chatgpt.com/' }).action, 'deny');
+
+  view.windowFocused = true;
+  assert.equal(openHandler({ url: 'https://example.com/' }).action, 'allow');
+  assert.equal(openHandler({ url: 'file:///tmp/example.html' }).action, 'deny');
+});
+
 test('opening a task loads its saved ChatGPT conversation', async () => {
   const loaded = [];
   const events = [];
@@ -1057,6 +1156,102 @@ test('coding trees commit task results, accept follow-ups, and squash merge', as
   const { stdout: restoredStatus } = await runGit(repositoryPath, ['status', '--porcelain=v1']);
   assert.match(restoredStatus, /^A  local-staged\.txt$/m);
   assert.match(restoredStatus, /^\?\? local-untracked\.txt$/m);
+  assert.equal((await trees.list()).length, 0);
+});
+
+test('coding trees mirror recursive submodules across selected repositories and merge every pointer', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-submodules-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const parentPath = await createNestedSubmoduleRepository(path.join(root, 'nested'));
+  const secondRootPath = await createNamedRepository(
+    path.join(root, 'second'),
+    'second-repository',
+    'second.txt',
+    'second\n',
+  );
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+
+  const tree = await trees.create([parentPath, secondRootPath], 'Recursive repository group');
+  assert.equal(tree.repositoryCount, 4);
+  assert.equal(tree.rootRepositoryPaths.length, 2);
+  const resolvedParentPath = await fs.realpath(parentPath);
+  const leafMember = tree.repositories.find((repository) => repository.depth === 2);
+  const childMember = tree.repositories.find((repository) => repository.depth === 1);
+  const parentMember = tree.repositories.find((repository) => (
+    repository.depth === 0 && repository.repositoryPath === resolvedParentPath
+  ));
+  assert.ok(leafMember);
+  assert.ok(childMember);
+  assert.ok(parentMember);
+  assert.equal(path.dirname(leafMember.path), path.join(childMember.path, 'deps'));
+  assert.equal(childMember.path, path.join(parentMember.path, 'modules/child'));
+
+  const task = await tasks.createTask({
+    taskText: 'Change the recursive leaf repository.',
+    repositories: tree.repositories.map((repository) => ({
+      path: repository.path,
+      sourcePath: repository.repositoryPath,
+      treeMemberId: repository.repositoryId,
+      depth: repository.depth,
+    })),
+    tree,
+    autoApply: true,
+  });
+  assert.equal(task.repositories.length, 4);
+  const leafTaskRepository = task.repositories.find((repository) => repository.sourcePath === leafMember.repositoryPath);
+  assert.ok(leafTaskRepository);
+  assert.ok(leafTaskRepository.parentRepositoryId);
+
+  await fs.writeFile(path.join(leafMember.path, 'leaf.txt'), 'changed leaf\n');
+  const { stdout: leafPatch } = await runGit(leafMember.path, [
+    'diff', '--binary', leafTaskRepository.baseCommit, '--', '.',
+  ]);
+  await runGit(leafMember.path, ['restore', '--', 'leaf.txt']);
+  const responseText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Changed a recursively discovered submodule.',
+    commitMessage: 'feat(submodules): update recursive leaf',
+    repositories: task.repositories.map((repository) => ({
+      id: repository.id,
+      baseCommit: repository.baseCommit,
+      patchEncoding: 'base64',
+      patch: repository.id === leafTaskRepository.id ? Buffer.from(leafPatch).toString('base64') : '',
+    })),
+  })}\nPATCHWORK_RESULT_END`;
+  const applied = await ingestDownloadedText(new ResultService(tasks), tasks, task, responseText);
+  assert.equal(applied.state, 'applied');
+  assert.equal(applied.result.commits.length, 3);
+
+  const childTreeHead = (await runGit(childMember.path, ['rev-parse', 'HEAD'])).stdout.trim();
+  const leafTreeHead = (await runGit(leafMember.path, ['rev-parse', 'HEAD'])).stdout.trim();
+  assert.equal((await runGit(parentMember.path, ['rev-parse', 'HEAD:modules/child'])).stdout.trim(), childTreeHead);
+  assert.equal((await runGit(childMember.path, ['rev-parse', 'HEAD:deps/leaf'])).stdout.trim(), leafTreeHead);
+
+  const mergeRequest = await trees.buildMergeRequest(tree.id);
+  assert.match(mergeRequest.prompt, /leaf-repository/);
+  assert.match(mergeRequest.prompt, /child-repository/);
+  assert.match(mergeRequest.prompt, /parent-repository/);
+  const mergeText = `PATCHWORK_MERGE_V1\n${JSON.stringify({
+    schemaVersion: 1,
+    treeId: tree.id,
+    summary: 'Update the recursive submodule chain.',
+    commitMessage: 'feat(submodules): merge recursive leaf update',
+  })}\nPATCHWORK_MERGE_END`;
+  const merged = await trees.mergeFromText(tree.id, mergeText);
+  assert.equal(merged.commits.length, 3);
+
+  const childSourceHead = (await runGit(childMember.repositoryPath, ['rev-parse', 'HEAD'])).stdout.trim();
+  const leafSourceHead = (await runGit(leafMember.repositoryPath, ['rev-parse', 'HEAD'])).stdout.trim();
+  assert.equal((await runGit(parentMember.repositoryPath, ['rev-parse', 'HEAD:modules/child'])).stdout.trim(), childSourceHead);
+  assert.equal((await runGit(childMember.repositoryPath, ['rev-parse', 'HEAD:deps/leaf'])).stdout.trim(), leafSourceHead);
+  assert.equal(await fs.readFile(path.join(leafMember.repositoryPath, 'leaf.txt'), 'utf8'), 'changed leaf\n');
+  assert.equal(await fs.readFile(path.join(secondRootPath, 'second.txt'), 'utf8'), 'second\n');
   assert.equal((await trees.list()).length, 0);
 });
 
@@ -1440,6 +1635,8 @@ test('conflict resolution preserves the original configuration by default and su
   assert.match(renderer, /reasoningMode: elements\['conflict-resolution-reasoning-select'\]\.value/);
   assert.match(appSource, /Object\.prototype\.hasOwnProperty\.call\(resolutionOptions, 'reasoningMode'\)/);
   assert.match(appSource, /resolve-conflict[\s\S]*reasoningMode: Object\.prototype\.hasOwnProperty\.call\(resolutionOptions, 'reasoningMode'\)/);
+  assert.match(appSource, /resolve-conflict[\s\S]*chatgptProject: task\.chatgptProject \|\| tree\?\.chatgptProject \|\| null/);
+  assert.match(appSource, /resolve-conflict[\s\S]*chatGPTView\.prepare\(resolutionTask\)[\s\S]*chatGPTView\.submit\(resolutionTask\)/);
 });
 
 test('conflict resolution reapplies the original patch before creating the resolution task', async () => {
@@ -1479,7 +1676,7 @@ test('task target and conflict fallback wiring is exposed through the task UI', 
   assert.match(renderer, /\['prepared', 'submitted', 'ready', 'failed', 'conflicted'\]/);
   assert.match(renderer, /setTaskTarget\(task\.taskId/);
   assert.match(markup, /id="task-target-card"/);
-  assert.match(markup, /Use original repository/);
+  assert.match(markup, /Use original repositories/);
   assert.match(preload, /setTaskTarget: \(taskId, input\)/);
 });
 
@@ -2041,6 +2238,7 @@ test('task upload selects the composer file input and dispatches its change even
     },
     findFileInputNodeId: async () => 42,
     packageAttachmentStatus: async () => ({ attached: false, busy: false }),
+    waitForPackageAttachmentToAppear: async () => true,
     waitForPackageAttachment: async (filename) => {
       attachmentWaitedFor = filename;
     },
@@ -2052,7 +2250,56 @@ test('task upload selects the composer file input and dispatches its change even
     params: { files: ['/tasks/chatgpt-ide-task-example.txt'], nodeId: 42 },
   });
   assert.match(scripts[0], /dispatchEvent\(new Event\('change'/);
+  assert.match(scripts[0], /composed: true/);
   assert.equal(attachmentWaitedFor, 'chatgpt-ide-task-example.txt');
+});
+
+test('task upload waits for a stable React file input before selecting a package', async () => {
+  const nodeIds = [0, 42, 43, 43];
+  const view = {
+    findFileInputNodeId: async () => nodeIds.shift() || 43,
+  };
+
+  assert.equal(
+    await ChatGPTView.prototype.waitForFileInputNodeId.call(view, 1_000),
+    43,
+  );
+});
+
+test('task upload retries file selection when React does not render the attachment', async () => {
+  const commands = [];
+  let renderAttempt = 0;
+  const debuggerApi = {
+    isAttached: () => true,
+    sendCommand: async (command, params) => {
+      commands.push({ command, params });
+      return {};
+    },
+  };
+  const view = {
+    view: {
+      webContents: {
+        debugger: debuggerApi,
+        executeJavaScript: async () => true,
+      },
+    },
+    findFileInputNodeId: async () => 42,
+    packageAttachmentStatus: async () => ({ attached: false, busy: false }),
+    waitForPackageAttachmentToAppear: async () => {
+      renderAttempt += 1;
+      return renderAttempt > 1;
+    },
+    waitForPackageAttachment: async () => true,
+  };
+
+  assert.equal(
+    await ChatGPTView.prototype.uploadPackage.call(view, '/tasks/chatgpt-ide-task-retry.zip'),
+    true,
+  );
+  assert.equal(
+    commands.filter((item) => item.command === 'DOM.setFileInputFiles').length,
+    2,
+  );
 });
 
 test('task upload reuses an attachment that is already in the composer', async () => {
@@ -2116,7 +2363,7 @@ test('task attachment confirmation finds uploaded packages in a hidden view and 
   assert.equal(result.busy, false);
 });
 
-test('task attachment confirmation trusts the selected input before broad busy page matches', () => {
+test('task attachment confirmation does not treat a selected React input as an uploaded package', () => {
   const filename = 'chatgpt-ide-task-hidden-input.zip';
   const fileInput = { files: [{ name: filename }] };
   const broadPageMatch = {
@@ -2144,8 +2391,16 @@ test('task attachment confirmation trusts the selected input before broad busy p
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
   });
 
-  assert.equal(result.attached, true);
+  assert.equal(result.attached, false);
   assert.equal(result.busy, false);
+  assert.equal(result.selectedByInput, true);
+});
+
+test('task upload event dispatch traverses React shadow roots for the selected file input', () => {
+  const script = buildFileInputEventScript('chatgpt-ide-task-shadow-root.zip');
+  assert.match(script, /element\.shadowRoot/);
+  assert.match(script, /composed: true/);
+  assert.match(script, /input\[type="file"\]/);
 });
 
 test('task attachments upload after the package and before ChatGPT is sent', async () => {

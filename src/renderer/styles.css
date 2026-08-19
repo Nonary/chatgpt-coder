@@ -280,7 +280,7 @@ textarea::placeholder { color: #606659; }
 .tree-card-heading small { margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #777f71; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .tree-state { padding: 5px 7px; border-radius: 999px; color: var(--accent); background: #29311e; font-size: 8px; font-weight: 800; text-transform: uppercase; }
 .tree-state.dirty { color: var(--warning); background: #342d18; }
-.tree-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 16px 0; }
+.tree-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 16px 0; }
 .tree-stat { padding: 10px; border: 1px solid var(--line-soft); border-radius: 9px; background: #131510; }
 .tree-stat strong, .tree-stat small { display: block; }
 .tree-stat strong { font-size: 12px; }
@@ -321,13 +321,26 @@ textarea::placeholder { color: #606659; }
 .task-history-actions .danger { color: #ff9c8f; }
 .source-layout { height: 100%; display: grid; grid-template-columns: clamp(390px, 32vw, 480px) minmax(0, 1fr); }
 .source-panel { min-height: 0; overflow-y: auto; background: #141712; border-right: 1px solid var(--line); }
-.source-repository-header { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 7px; padding: 12px 14px; background: #141712; border-bottom: 1px solid var(--line-soft); }
-.source-repository-header select { min-width: 0; padding: 8px 10px; color: var(--text); background: #0e100d; border: 1px solid #343a2f; border-radius: 8px; outline: none; font-size: 11px; }
+.source-repository-header { position: sticky; top: 0; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; padding: 12px 14px; background: #141712; border-bottom: 1px solid var(--line-soft); }
+.source-repository-trigger { min-width: 0; display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 6px 9px; border: 1px solid #343a2f; border-radius: 8px; background: #0e100d; color: var(--text); text-align: left; }
+.source-repository-trigger:hover { border-color: #59614e; background: #151812; }
+.source-repository-trigger .repo-icon { width: 28px; height: 28px; border-radius: 7px; font-size: 10px; }
+.source-repository-trigger-copy { min-width: 0; }
+.source-repository-trigger-copy strong, .source-repository-trigger-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-repository-trigger-copy strong { font-size: 10px; }
+.source-repository-trigger-copy small { margin-top: 3px; color: #72796b; font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.source-repository-trigger-chevron { color: #7c8474; font-size: 13px; line-height: 1; }
 .icon-button { width: 32px; height: 32px; padding: 0; border: 1px solid #343a2f; border-radius: 8px; background: #1b1f18; color: #a5ac9c; }
 .icon-button:hover { color: var(--text); border-color: #59614e; }
 .source-branch { padding: 11px 16px; color: #8f9787; border-bottom: 1px solid var(--line-soft); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .source-branch::before { content: '⑂'; margin-right: 7px; color: var(--accent); }
 .commit-box { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.source-project-picker { margin-bottom: 12px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: #131510; }
+.source-project-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.source-project-heading label { color: #8d9585; font-size: 10px; font-weight: 750; }
+.source-project-heading .icon-button { width: 24px; height: 24px; padding: 0; }
+.source-project-picker .field-control { padding: 8px 9px; font-size: 10px; }
+.source-project-picker small { display: block; margin-top: 6px; color: #737a6c; font-size: 8px; line-height: 1.35; }
 .commit-box textarea { min-height: 70px; padding: 10px 11px; border-radius: 8px; font-size: 11px; }
 .commit-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.45fr); gap: 7px; margin-top: 8px; }
 .commit-actions button { margin-top: 0; }

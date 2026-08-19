@@ -3,6 +3,7 @@ const state = {
   workspaceRepositories: [],
   repositoryPickerSearch: '',
   repositoryPickerPaths: new Set(),
+  repositoryPickerMode: 'task',
   tasks: [],
   trees: [],
   activeTask: null,
@@ -43,8 +44,9 @@ const elements = Object.fromEntries(
     'history-view', 'task-history-button', 'task-history-count', 'task-history-list',
     'task-history-search', 'task-history-state',
     'add-repository-button', 'repository-list', 'task-text', 'auto-apply',
-    'repository-picker-modal', 'repository-picker-title', 'repository-picker-close-button', 'repository-picker-cancel-button',
-    'repository-picker-search', 'repository-picker-browse-button', 'repository-picker-list', 'repository-picker-status',
+    'repository-picker-modal', 'repository-picker-eyebrow', 'repository-picker-title', 'repository-picker-copy',
+    'repository-picker-close-button', 'repository-picker-cancel-button', 'repository-picker-search',
+    'repository-picker-browse-button', 'repository-picker-list', 'repository-picker-status',
     'repository-picker-apply-button',
     'add-attachment-button', 'attachment-list', 'configure-skills-button', 'skill-selection-label', 'skill-selection-summary',
     'skills-modal', 'skills-close-button', 'skills-refresh-button', 'skills-search', 'skills-list', 'skills-selection-status', 'skills-done-button',
@@ -60,6 +62,7 @@ const elements = Object.fromEntries(
     'task-model-select', 'task-reasoning-select',
     'chatgpt-project-select', 'new-project-fields', 'new-project-name',
     'refresh-projects-button', 'project-list-status',
+    'source-chatgpt-project-select', 'source-refresh-projects-button', 'source-project-list-status',
     'trees-project-select', 'trees-refresh-projects-button',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
@@ -72,7 +75,7 @@ const elements = Object.fromEntries(
     'session-reload-button', 'session-new-chat-button', 'session-browser-title',
     'session-browser-status', 'session-status-dot',
     'source-control-button', 'source-count', 'source-repository-select',
-    'source-add-repository', 'source-refresh', 'source-remove-repository',
+    'source-refresh', 'source-remove-repository',
     'source-branch', 'source-commit-message', 'source-commit-button', 'source-ai-summary-button', 'source-git-summary-prompt-button', 'source-git-summary-status',
     'staged-count', 'unstaged-count', 'staged-files', 'unstaged-files',
     'stage-all-button', 'unstage-all-button', 'commit-history',
@@ -530,8 +533,13 @@ function repositoryPickerCandidates() {
 }
 
 function toggleRepositoryPickerPath(repositoryPath) {
-  if (state.repositoryPickerPaths.has(repositoryPath)) state.repositoryPickerPaths.delete(repositoryPath);
-  else state.repositoryPickerPaths.add(repositoryPath);
+  if (state.repositoryPickerMode === 'source') {
+    state.repositoryPickerPaths = new Set([repositoryPath]);
+  } else if (state.repositoryPickerPaths.has(repositoryPath)) {
+    state.repositoryPickerPaths.delete(repositoryPath);
+  } else {
+    state.repositoryPickerPaths.add(repositoryPath);
+  }
   renderRepositoryPicker();
 }
 
@@ -539,6 +547,7 @@ function renderRepositoryPicker() {
   const container = elements['repository-picker-list'];
   const query = state.repositoryPickerSearch.trim().toLowerCase();
   const { workspace, history } = repositoryPickerCandidates();
+  const sourceMode = state.repositoryPickerMode === 'source';
   const matches = (repository) => {
     if (!query) return true;
     return [
@@ -584,16 +593,25 @@ function renderRepositoryPicker() {
   }
 
   const count = state.repositoryPickerPaths.size;
-  elements['repository-picker-status'].textContent = count
-    ? `${count} ${count === 1 ? 'repository' : 'repositories'} selected.`
-    : 'No repositories selected.';
+  elements['repository-picker-eyebrow'].textContent = sourceMode ? 'SOURCE CONTROL' : 'TASK REPOSITORIES';
+  elements['repository-picker-title'].textContent = sourceMode ? 'Choose source repository' : 'Choose repositories';
+  elements['repository-picker-copy'].textContent = sourceMode
+    ? 'Pick the repository to inspect in Source Control, or find one from a previous task. You can also browse for a new repository.'
+    : 'Pick one or more repositories already in your Patchwork workspace, or find a repository used by an earlier task. You can also browse for a new repository.';
+  elements['repository-picker-status'].textContent = sourceMode
+    ? (count ? '1 repository selected.' : 'No source repository selected.')
+    : (count ? `${count} ${count === 1 ? 'repository' : 'repositories'} selected.` : 'No repositories selected.');
+  elements['repository-picker-apply-button'].textContent = sourceMode ? 'Use repository' : 'Use selected repositories';
   elements['repository-picker-apply-button'].disabled = count === 0;
 }
 
-function openRepositoryPicker() {
+function openRepositoryPicker(mode = 'task') {
+  state.repositoryPickerMode = mode;
   state.repositoryPickerSearch = '';
   elements['repository-picker-search'].value = '';
-  state.repositoryPickerPaths = new Set(selectedRepositoryPaths());
+  state.repositoryPickerPaths = mode === 'source'
+    ? new Set(state.selectedGitPath ? [state.selectedGitPath] : [])
+    : new Set(selectedRepositoryPaths());
   renderRepositoryPicker();
   elements['repository-picker-modal'].classList.remove('hidden');
   requestAnimationFrame(() => elements['repository-picker-search'].focus());
@@ -603,6 +621,22 @@ function closeRepositoryPicker() {
   elements['repository-picker-modal'].classList.add('hidden');
   state.repositoryPickerSearch = '';
   state.repositoryPickerPaths = new Set();
+  state.repositoryPickerMode = 'task';
+}
+
+async function resolveRepositoryPickerSelections(selectedPaths) {
+  const workspacePaths = new Set(state.workspaceRepositories.map((repository) => repository.path));
+  const historicalPaths = selectedPaths.filter((repositoryPath) => !workspacePaths.has(repositoryPath));
+  if (historicalPaths.length > 0) {
+    await window.patchwork.addWorkspaceRepositories(historicalPaths);
+    state.workspaceRepositories = await window.patchwork.listWorkspaceRepositories();
+  }
+  const workspaceByPath = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
+  const selectedRepositories = selectedPaths.map((repositoryPath) => workspaceByPath.get(repositoryPath));
+  if (selectedRepositories.some((repository) => !repository || repository.unavailable)) {
+    throw new Error('One or more selected repositories are no longer available. Browse for them again and retry.');
+  }
+  return selectedRepositories;
 }
 
 async function useSelectedRepositories() {
@@ -611,23 +645,21 @@ async function useSelectedRepositories() {
   const button = elements['repository-picker-apply-button'];
   button.disabled = true;
   try {
-    const workspacePaths = new Set(state.workspaceRepositories.map((repository) => repository.path));
-    const historicalPaths = selectedPaths.filter((repositoryPath) => !workspacePaths.has(repositoryPath));
-    if (historicalPaths.length > 0) {
-      await window.patchwork.addWorkspaceRepositories(historicalPaths);
-      state.workspaceRepositories = await window.patchwork.listWorkspaceRepositories();
+    const selectedRepositories = await resolveRepositoryPickerSelections(selectedPaths);
+    if (state.repositoryPickerMode === 'source') {
+      const repository = selectedRepositories[0];
+      state.selectedGitPath = repository.path;
+      closeRepositoryPicker();
+      renderSourceRepositories();
+      await loadGitStatus(repository.path);
+    } else {
+      state.repositories = selectedRepositories;
+      persistTaskRepositorySelection();
+      resetTaskSkills();
+      renderRepositories();
+      renderTaskTreeOptions();
+      closeRepositoryPicker();
     }
-    const workspaceByPath = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
-    const selectedRepositories = selectedPaths.map((repositoryPath) => workspaceByPath.get(repositoryPath));
-    if (selectedRepositories.some((repository) => !repository || repository.unavailable)) {
-      throw new Error('One or more selected repositories are no longer available. Browse for them again and retry.');
-    }
-    state.repositories = selectedRepositories;
-    persistTaskRepositorySelection();
-    resetTaskSkills();
-    renderRepositories();
-    renderTaskTreeOptions();
-    closeRepositoryPicker();
   } catch (error) {
     showToast(error.message, true);
     renderRepositoryPicker();
@@ -780,6 +812,7 @@ function taskSkillRepositoryPaths() {
   const selectedTarget = elements['task-tree-select'].value;
   if (selectedTarget && selectedTarget !== TASK_NEW_TREE_VALUE) {
     const tree = state.trees.find((item) => item.id === selectedTarget);
+    if (tree?.repositories?.length) return tree.repositories.map((repository) => repository.path);
     if (tree?.path) return [tree.path];
   }
   return state.repositories.map((repository) => repository.path).filter(Boolean);
@@ -945,50 +978,64 @@ async function submitConflictResolution() {
 
 function renderChatGPTProjects() {
   const select = elements['chatgpt-project-select'];
-  const previous = select.value;
-  select.innerHTML = '<option value="">New chat (no project)</option>'
-    + state.chatgptProjects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join('')
-    + '<option value="__new__">Create a new ChatGPT project…</option>';
-  const desired = previous === '__new__' ? previous : (state.projectSelection ?? previous ?? '');
-  if ([...select.options].some((option) => option.value === desired)) select.value = desired;
+  renderProjectSelect(select, { emptyLabel: 'New chat (no project)', allowCreate: true });
   const creating = select.value === '__new__';
   elements['new-project-fields'].classList.toggle('hidden', !creating);
   elements['new-project-name'].disabled = !creating;
 }
 
-function renderTreesProjectSelection() {
-  const select = elements['trees-project-select'];
-  if (!select) return;
+function renderProjectSelect(select, { emptyLabel, allowCreate = false } = {}) {
   const previous = select.value;
-  select.innerHTML = '<option value="">No ChatGPT project</option>'
-    + state.chatgptProjects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join('');
-  const desired = state.projectSelection ?? previous ?? '';
+  select.innerHTML = `<option value="">${escapeHtml(emptyLabel || 'New chat (no project)')}</option>`
+    + state.chatgptProjects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join('')
+    + (allowCreate ? '<option value="__new__">Create a new ChatGPT project…</option>' : '');
+  const desired = previous === '__new__' ? previous : (state.projectSelection ?? previous ?? '');
   if ([...select.options].some((option) => option.value === desired)) select.value = desired;
   else select.value = '';
 }
 
+function renderSourceChatGPTProjectSelection() {
+  renderProjectSelect(elements['source-chatgpt-project-select'], { emptyLabel: 'New chat (no project)' });
+}
+
+function renderTreesProjectSelection() {
+  const select = elements['trees-project-select'];
+  if (!select) return;
+  renderProjectSelect(select, { emptyLabel: 'No ChatGPT project' });
+}
+
 async function refreshChatGPTProjects(showErrors = false) {
   elements['refresh-projects-button'].disabled = true;
+  elements['source-refresh-projects-button'].disabled = true;
   elements['trees-refresh-projects-button'].disabled = true;
   elements['project-list-status'].classList.remove('error');
+  elements['source-project-list-status'].classList.remove('error');
   elements['project-list-status'].textContent = 'Loading ChatGPT projects…';
+  elements['source-project-list-status'].textContent = 'Loading ChatGPT projects…';
   try {
     state.chatgptProjects = await window.patchwork.listChatGPTProjects();
     restoreTaskProjectSelection();
     renderChatGPTProjects();
+    renderSourceChatGPTProjectSelection();
     renderTreesProjectSelection();
-    elements['project-list-status'].textContent = state.chatgptProjects.length
+    const status = state.chatgptProjects.length
       ? `${state.chatgptProjects.length} ChatGPT project${state.chatgptProjects.length === 1 ? '' : 's'} available.`
       : 'No ChatGPT projects found. You can create one below.';
+    elements['project-list-status'].textContent = status;
+    elements['source-project-list-status'].textContent = status;
   } catch (error) {
     state.chatgptProjects = [];
     renderChatGPTProjects();
+    renderSourceChatGPTProjectSelection();
     renderTreesProjectSelection();
     elements['project-list-status'].classList.add('error');
+    elements['source-project-list-status'].classList.add('error');
     elements['project-list-status'].textContent = error.message;
+    elements['source-project-list-status'].textContent = error.message;
     if (showErrors) showToast(error.message, true);
   } finally {
     elements['refresh-projects-button'].disabled = false;
+    elements['source-refresh-projects-button'].disabled = state.gitSummaryBusy;
     elements['trees-refresh-projects-button'].disabled = false;
   }
 }
@@ -996,8 +1043,8 @@ async function refreshChatGPTProjects(showErrors = false) {
 function renderTaskTreeOptions() {
   const select = elements['task-tree-select'];
   const previous = select.value;
-  const canCreateTree = state.repositories.length === 1;
-  const treeOption = `<option value="__new__"${canCreateTree ? '' : ' disabled'}>${canCreateTree ? 'Create a new coding tree' : 'Create a new coding tree · choose one repository'}</option>`;
+  const canCreateTree = state.repositories.length > 0;
+  const treeOption = `<option value="__new__"${canCreateTree ? '' : ' disabled'}>${canCreateTree ? 'Create a new coding tree' : 'Create a new coding tree · choose repositories first'}</option>`;
   select.innerHTML = '<option value="">Use current working changes</option>' + treeOption + state.trees
     .filter((tree) => tree.available && tree.mergeState !== 'submitted')
     .map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}${tree.managed === false ? ' · Git worktree' : ''}</option>`)
@@ -1022,7 +1069,28 @@ function canChangeTaskTarget(task) {
   return Boolean(task)
     && !task.summaryOnly
     && ['prepared', 'submitted', 'ready', 'failed', 'conflicted'].includes(task.state)
-    && (task.repositories || []).filter((repository) => !repository.readOnly).length === 1;
+    && (task.repositories || []).some((repository) => !repository.readOnly);
+}
+
+function taskSourceRepositoryPaths(task) {
+  if (Array.isArray(task?.sourceRepositoryPaths) && task.sourceRepositoryPaths.length) {
+    return [...new Set(task.sourceRepositoryPaths)];
+  }
+  const writableRepositories = (task?.repositories || []).filter((repository) => !repository.readOnly);
+  return [...new Set(writableRepositories
+    .filter((repository) => !repository.parentRepositoryId)
+    .map((repository) => repository.sourcePath
+      || (writableRepositories.length === 1 ? task.sourceRepositoryPath : null)
+      || repository.path)
+    .filter(Boolean))];
+}
+
+function treeMatchesTaskSources(tree, task) {
+  const expected = taskSourceRepositoryPaths(task).slice().sort();
+  const actual = (tree.rootRepositoryPaths?.length
+    ? tree.rootRepositoryPaths
+    : [tree.repositoryPath].filter(Boolean)).slice().sort();
+  return expected.length === actual.length && expected.every((value, index) => value === actual[index]);
 }
 
 function renderTaskTargetOptions(task) {
@@ -1035,16 +1103,15 @@ function renderTaskTargetOptions(task) {
   card.classList.remove('hidden');
 
   const select = elements['task-target-select'];
-  const sourcePath = task.sourceRepositoryPath || task.repositories?.find((repository) => !repository.readOnly)?.path || '';
   const availableTrees = state.trees
     .filter((tree) => tree.available && tree.mergeState !== 'submitted')
-    .filter((tree) => !sourcePath || tree.repositoryPath === sourcePath);
+    .filter((tree) => treeMatchesTaskSources(tree, task));
   const currentTree = task.treeId ? state.trees.find((tree) => tree.id === task.treeId) : null;
   const currentValue = currentTree?.available ? task.treeId : '';
   const missingTreeOption = task.treeId && !currentTree?.available
-    ? `<option value="" disabled>Missing worktree: ${escapeHtml(task.treeName || task.treeId)}</option>`
+    ? `<option value="" disabled>Missing coding tree: ${escapeHtml(task.treeName || task.treeId)}</option>`
     : '';
-  select.innerHTML = '<option value="">Use original repository</option>'
+  select.innerHTML = '<option value="">Use original repositories</option>'
     + missingTreeOption
     + '<option value="__new__">Create a new coding tree</option>'
     + availableTrees.map((tree) => `<option value="${escapeHtml(tree.id)}">${escapeHtml(tree.name)} · ${escapeHtml(tree.repositoryName)}${tree.managed === false ? ' · Git worktree' : ''}</option>`).join('');
@@ -1054,11 +1121,11 @@ function renderTaskTargetOptions(task) {
   elements['task-target-tree-name'].disabled = !creating;
 
   if (task.treeId && !currentTree?.available) {
-    elements['task-target-status'].textContent = 'The previous worktree is unavailable. Choose a new one or use the original repository.';
+    elements['task-target-status'].textContent = 'The previous coding tree is unavailable. Choose a new one or use the original repositories.';
   } else if (task.treeName) {
     elements['task-target-status'].textContent = `Changes will apply in ${task.treeName}. You can change this target until the task is applied.`;
   } else {
-    elements['task-target-status'].textContent = 'Changes will apply to the original repository. You can change this target until the task is applied.';
+    elements['task-target-status'].textContent = 'Changes will apply to the original repositories. You can change this target until the task is applied.';
   }
 }
 
@@ -1072,7 +1139,7 @@ async function changeActiveTaskTarget(treeId) {
     upsertTask(updated);
     await refreshTrees();
     showTask(updated);
-    showToast(updated.treeId ? `Task target changed to ${updated.treeName}.` : 'Task target changed to the original repository.');
+    showToast(updated.treeId ? `Task target changed to ${updated.treeName}.` : 'Task target changed to the original repositories.');
   } catch (error) {
     renderTaskTargetOptions(task);
     showToast(error.message, true);
@@ -1125,6 +1192,7 @@ function renderTrees() {
     </div>
     <div class="tree-stats">
       <div class="tree-stat"><strong>${escapeHtml(tree.commitCount || 0)}</strong><small>Tree commits</small></div>
+      <div class="tree-stat"><strong>${escapeHtml(tree.repositoryCount || tree.repositories?.length || 1)}</strong><small>Repositories</small></div>
       <div class="tree-stat"><strong>${escapeHtml((tree.taskIds || []).length)}</strong><small>Tasks</small></div>
     </div>
     <div class="tree-project"><span>Project</span><strong>${escapeHtml(tree.chatgptProject?.name || 'No ChatGPT project')}</strong></div>
@@ -1149,8 +1217,16 @@ function renderTrees() {
   container.querySelectorAll('.tree-source').forEach((button) => button.addEventListener('click', async () => {
     const tree = state.trees.find((item) => item.id === button.dataset.treeId);
     if (!tree) return;
-    if (!state.workspaceRepositories.some((item) => item.path === tree.path)) {
-      state.workspaceRepositories.push({ name: tree.name, path: tree.path, branch: tree.branch });
+    const members = tree.repositories?.length
+      ? tree.repositories
+      : [{ repositoryName: tree.repositoryName, path: tree.path, branch: tree.branch }];
+    for (const member of members) {
+      if (state.workspaceRepositories.some((item) => item.path === member.path)) continue;
+      state.workspaceRepositories.push({
+        name: `${tree.name} · ${member.repositoryName || tree.repositoryName}`,
+        path: member.path,
+        branch: member.branch || tree.branch,
+      });
     }
     state.selectedGitPath = tree.path;
     await showSourceControl();
@@ -1588,8 +1664,11 @@ async function showSourceControl() {
   elements['trees-button'].classList.remove('active');
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
+  restoreTaskProjectSelection();
+  renderSourceChatGPTProjectSelection();
   renderSourceRepositories();
   await loadGitStatus(elements['source-repository-select'].value || state.selectedGitPath);
+  refreshChatGPTProjects().catch(() => {});
 }
 
 function showTrees() {
@@ -1645,18 +1724,22 @@ function syncBrowserBounds() {
   });
 }
 
-async function browseRepositories(selectInTask = false) {
+async function browseRepositories(selectInPicker = false) {
   try {
     const repositories = await window.patchwork.chooseRepositories();
     const workspace = new Map(state.workspaceRepositories.map((repository) => [repository.path, repository]));
     repositories.forEach((repository) => workspace.set(repository.path, repository));
     state.workspaceRepositories = [...workspace.values()];
-    if (selectInTask) {
-      for (const repository of repositories) state.repositoryPickerPaths.add(repository.path);
+    if (selectInPicker) {
+      if (state.repositoryPickerMode === 'source') {
+        state.repositoryPickerPaths = repositories[0]?.path ? new Set([repositories[0].path]) : state.repositoryPickerPaths;
+      } else {
+        for (const repository of repositories) state.repositoryPickerPaths.add(repository.path);
+      }
       renderRepositoryPicker();
     }
     renderRepositories();
-    renderSourceRepositories();
+    if (!(selectInPicker && state.repositoryPickerMode === 'source')) renderSourceRepositories();
     return repositories;
   } catch (error) {
     showToast(error.message, true);
@@ -1677,19 +1760,21 @@ async function chooseAttachments() {
 }
 
 function renderSourceRepositories() {
-  const select = elements['source-repository-select'];
-  const previous = state.selectedGitPath || select.value;
-  select.replaceChildren();
-  for (const repository of state.workspaceRepositories.filter((item) => !item.unavailable)) {
-    const option = document.createElement('option');
-    option.value = repository.path;
-    option.textContent = repository.name;
-    select.append(option);
-  }
-  const availablePaths = [...select.options].map((option) => option.value);
-  select.value = availablePaths.includes(previous) ? previous : (availablePaths[0] || '');
-  state.selectedGitPath = select.value || null;
-  elements['source-remove-repository'].disabled = !select.value;
+  const available = state.workspaceRepositories.filter((item) => !item.unavailable);
+  const selected = available.find((repository) => repository.path === state.selectedGitPath) || available[0] || null;
+  state.selectedGitPath = selected?.path || null;
+  const trigger = elements['source-repository-select'];
+  trigger.innerHTML = selected
+    ? `<span class="repo-icon" aria-hidden="true">${escapeHtml(selected.name?.[0]?.toUpperCase() || 'G')}</span>
+      <span class="source-repository-trigger-copy"><strong>${escapeHtml(selected.name || selected.path)}</strong><small>${escapeHtml(selected.path)}</small></span>
+      <span class="source-repository-trigger-chevron" aria-hidden="true">⌄</span>`
+    : `<span class="repo-icon" aria-hidden="true">G</span>
+      <span class="source-repository-trigger-copy"><strong>Choose a repository</strong><small>Select from your workspace or task history</small></span>
+      <span class="source-repository-trigger-chevron" aria-hidden="true">⌄</span>`;
+  trigger.setAttribute('aria-label', selected
+    ? `Source control repository: ${selected.name || selected.path}`
+    : 'Choose a source control repository');
+  elements['source-remove-repository'].disabled = !selected;
 }
 
 function gitDiffKey(filePath, staged) {
@@ -1937,10 +2022,11 @@ function renderGitStatus() {
     elements['source-count'].classList.add('hidden');
     elements['source-repository-select'].disabled = state.gitSummaryBusy;
     elements['source-refresh'].disabled = state.gitSummaryBusy;
-    elements['source-add-repository'].disabled = state.gitSummaryBusy;
     elements['source-remove-repository'].disabled = state.gitSummaryBusy;
     elements['source-ai-summary-button'].disabled = true;
     elements['source-commit-button'].disabled = true;
+    elements['source-chatgpt-project-select'].disabled = false;
+    elements['source-refresh-projects-button'].disabled = false;
     elements['source-git-summary-prompt-button'].disabled = state.gitSummaryBusy;
     elements['stage-all-button'].disabled = true;
     elements['unstage-all-button'].disabled = true;
@@ -1966,8 +2052,9 @@ function renderGitStatus() {
   elements['source-commit-button'].disabled = staged.length === 0 || state.gitSummaryBusy;
   elements['source-repository-select'].disabled = state.gitSummaryBusy;
   elements['source-refresh'].disabled = state.gitSummaryBusy;
-  elements['source-add-repository'].disabled = state.gitSummaryBusy;
   elements['source-remove-repository'].disabled = state.gitSummaryBusy;
+  elements['source-chatgpt-project-select'].disabled = state.gitSummaryBusy;
+  elements['source-refresh-projects-button'].disabled = state.gitSummaryBusy;
   elements['source-git-summary-prompt-button'].disabled = state.gitSummaryBusy;
   elements['stage-all-button'].disabled = unstaged.length === 0 || state.gitSummaryBusy;
   elements['unstage-all-button'].disabled = staged.length === 0 || state.gitSummaryBusy;
@@ -1988,7 +2075,7 @@ async function loadGitStatus(repositoryPath) {
   const repositoryChanged = Boolean(state.selectedGitPath && state.selectedGitPath !== repositoryPath);
   if (repositoryChanged) resetGitDiffTabs();
   state.selectedGitPath = repositoryPath;
-  elements['source-repository-select'].value = repositoryPath;
+  renderSourceRepositories();
   elements['source-branch'].textContent = 'Refreshing…';
   try {
     state.gitStatus = await window.patchwork.gitStatus(repositoryPath);
@@ -1996,6 +2083,7 @@ async function loadGitStatus(repositoryPath) {
     state.workspaceRepositories = state.workspaceRepositories.map((item) => item.path === updated.path ? updated : item);
     state.repositories = state.repositories.map((item) => item.path === updated.path ? updated : item);
     renderRepositories();
+    renderSourceRepositories();
     renderGitStatus();
     pruneGitDiffTabs();
     const active = state.diffTabs.find((tab) => tab.key === state.selectedDiffKey);
@@ -2255,13 +2343,22 @@ elements['prompt-editor'].addEventListener('submit', savePromptFromEditor);
 elements['chatgpt-project-select'].addEventListener('change', (event) => {
   persistTaskProjectSelection(event);
   renderChatGPTProjects();
+  renderSourceChatGPTProjectSelection();
   renderTreesProjectSelection();
 });
 elements['refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
+elements['source-chatgpt-project-select'].addEventListener('change', (event) => {
+  persistTaskProjectSelection(event);
+  renderChatGPTProjects();
+  renderSourceChatGPTProjectSelection();
+  renderTreesProjectSelection();
+});
+elements['source-refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
 elements['trees-project-select'].addEventListener('change', (event) => {
   persistTaskProjectSelection(event);
   renderTreesProjectSelection();
   renderChatGPTProjects();
+  renderSourceChatGPTProjectSelection();
 });
 elements['trees-refresh-projects-button'].addEventListener('click', () => refreshChatGPTProjects(true));
 elements['add-repository-button'].addEventListener('click', openRepositoryPicker);
@@ -2363,13 +2460,8 @@ function syncDiffVerticalScroll(source, target) {
 elements['diff-before-rows'].addEventListener('scroll', () => syncDiffVerticalScroll(elements['diff-before-rows'], elements['diff-after-rows']), { passive: true });
 elements['diff-after-rows'].addEventListener('scroll', () => syncDiffVerticalScroll(elements['diff-after-rows'], elements['diff-before-rows']), { passive: true });
 
-elements['source-repository-select'].addEventListener('change', (event) => loadGitStatus(event.target.value));
+elements['source-repository-select'].addEventListener('click', () => openRepositoryPicker('source'));
 elements['source-refresh'].addEventListener('click', () => loadGitStatus(state.selectedGitPath));
-elements['source-add-repository'].addEventListener('click', async () => {
-  const added = await browseRepositories(false);
-  renderSourceRepositories();
-  if (added[0]) await loadGitStatus(added[0].path);
-});
 elements['source-remove-repository'].addEventListener('click', async () => {
   if (!state.selectedGitPath) return;
   try {
@@ -2381,7 +2473,7 @@ elements['source-remove-repository'].addEventListener('click', async () => {
     resetGitDiffTabs();
     renderRepositories();
     renderSourceRepositories();
-    await loadGitStatus(elements['source-repository-select'].value);
+    await loadGitStatus(state.selectedGitPath);
   } catch (error) {
     showToast(error.message, true);
   }

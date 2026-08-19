@@ -68,6 +68,88 @@ async function inspectRepository(selectedPath) {
   };
 }
 
+async function listSubmoduleDefinitions(repositoryPath) {
+  try {
+    await fs.access(path.join(repositoryPath, '.gitmodules'));
+  } catch {
+    return [];
+  }
+
+  const { stdout } = await runGit(repositoryPath, [
+    'config', '--file', '.gitmodules', '--get-regexp', '^submodule\\..*\\.(path|branch|url)$',
+  ]).catch(() => ({ stdout: '' }));
+  const definitions = new Map();
+  for (const line of String(stdout || '').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const match = line.match(/^submodule\.(.+)\.(path|branch|url)\s+(.+)$/);
+    if (!match) continue;
+    const [, name, key, value] = match;
+    const definition = definitions.get(name) || { name, path: null, branch: null, url: null };
+    definition[key] = value.trim();
+    definitions.set(name, definition);
+  }
+  return [...definitions.values()].filter((definition) => definition.path);
+}
+
+async function isTrackedGitlink(repositoryPath, relativePath) {
+  const { stdout } = await runGit(repositoryPath, ['ls-files', '--stage', '--', relativePath]);
+  return String(stdout || '').split(/\r?\n/).some((line) => line.startsWith('160000 '));
+}
+
+async function inspectRepositoryGraph(selectedPaths) {
+  const roots = [...new Set((selectedPaths || []).filter(Boolean))];
+  const repositories = new Map();
+
+  const visit = async (selectedPath, relation = {}, ancestors = new Set()) => {
+    const repository = await inspectRepository(selectedPath);
+    const depth = Number.isInteger(relation.depth) ? relation.depth : 0;
+    const existing = repositories.get(repository.path);
+    if (!existing || depth > existing.depth) {
+      repositories.set(repository.path, {
+        ...repository,
+        name: relation.repositoryName || repository.name,
+        parentPath: relation.parentPath || null,
+        submodulePath: relation.submodulePath || null,
+        submoduleName: relation.submoduleName || null,
+        configuredBranch: relation.configuredBranch || null,
+        depth,
+        rootPath: relation.rootPath || repository.path,
+      });
+    }
+
+    if (ancestors.has(repository.path)) return;
+    const nextAncestors = new Set(ancestors);
+    nextAncestors.add(repository.path);
+    const definitions = await listSubmoduleDefinitions(repository.path);
+    for (const definition of definitions) {
+      if (!await isTrackedGitlink(repository.path, definition.path)) continue;
+      const childPath = path.resolve(repository.path, definition.path);
+      let child;
+      try {
+        const resolvedChildPath = await fs.realpath(childPath);
+        child = await inspectRepository(childPath);
+        if (child.path !== resolvedChildPath) throw new Error('Submodule checkout is not initialized.');
+      } catch {
+        throw new Error(`Initialize submodule ${definition.path} in ${repository.name} before using it with Patchwork.`);
+      }
+      await visit(child.path, {
+        parentPath: repository.path,
+        submodulePath: definition.path,
+        submoduleName: definition.name,
+        repositoryName: path.basename(String(definition.url || '').replace(/[\/]+$/, '')).replace(/\.git$/i, '') || child.name,
+        configuredBranch: definition.branch,
+        depth: depth + 1,
+        rootPath: relation.rootPath || repository.path,
+      }, nextAncestors);
+    }
+  };
+
+  for (const root of roots) await visit(root);
+  return [...repositories.values()].sort((left, right) => (
+    left.depth - right.depth || left.path.localeCompare(right.path)
+  ));
+}
+
 async function listSnapshotPaths(repositoryPath) {
   const { stdout } = await runGit(repositoryPath, [
     'ls-files', '-z', '--cached', '--others', '--exclude-standard',
@@ -108,8 +190,11 @@ async function fingerprintRepository(repositoryPath) {
       await updateHashWithFile(hash, absolutePath);
       hash.update('\0');
     } else if (stat.isDirectory()) {
-      // Gitlink/submodule contents are represented by the source HEAD, not copied as ordinary files.
-      hash.update('directory\0');
+      // Gitlinks are represented by the checked-out submodule HEAD. Including
+      // that commit keeps snapshot fingerprints stable across recursive tasks.
+      const { stdout } = await runGit(absolutePath, ['rev-parse', '--verify', 'HEAD'])
+        .catch(() => ({ stdout: '' }));
+      hash.update(stdout.trim() ? `gitlink\0${stdout.trim()}\0` : 'directory\0');
     }
   }
   return hash.digest('hex');
@@ -270,7 +355,9 @@ module.exports = {
   createWorkingSnapshotBundle,
   fingerprintRepository,
   inspectRepository,
+  inspectRepositoryGraph,
   inspectPatch,
+  listSubmoduleDefinitions,
   listConflictedFiles,
   listSnapshotPaths,
   runGit,
