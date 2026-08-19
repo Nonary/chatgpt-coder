@@ -501,3 +501,23 @@ test('the install page embeds the bootstrap instead of loading it from the agent
   assert.match(source, /createObjectURL\(new Blob\(/);
   assert.ok(source.includes(agent.config.token));
 });
+
+test('only one bridge window survives, and an orphaned one closes itself', async (context) => {
+  const agent = await startAgent(context);
+  const page = await (await fetch(`http://127.0.0.1:${agent.port}/bridge`)).text();
+
+  // A window name only dedupes within one browsing context group, so a second
+  // tab could otherwise leave a second bridge behind.
+  assert.match(page, /new BroadcastChannel\('patchwork-bridge'\)/);
+  assert.match(page, /type: 'claim'/);
+  assert.match(page, /event\.data\.id !== instanceId\) window\.close\(\)/);
+  assert.match(page, /window\.opener\.closed/, 'an orphaned bridge closes itself');
+
+  const transport = await fs.readFile(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'transport.js'),
+    'utf8',
+  );
+  assert.match(transport, /addEventListener\('pagehide'/);
+  assert.match(transport, /popup\.close\(\)/);
+  assert.match(transport, /'patchwork-bridge',/, 'the window is named so it is reused, not duplicated');
+});

@@ -114,6 +114,16 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
     else waiter.resolve({ status: message.status, text: message.text ?? null, buffer: message.buffer ?? null });
   });
 
+  // The bridge exists to serve this page; when this page goes away it should not
+  // outlive it as a stray window.
+  window.addEventListener('pagehide', () => {
+    try {
+      if (popup && !popup.closed) popup.close();
+    } catch {
+      // A cross-origin popup that already navigated away cannot be closed here.
+    }
+  });
+
   function open() {
     if (popup && !popup.closed) return ready;
     popup = window.open(

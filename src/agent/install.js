@@ -161,6 +161,39 @@ function bridgePage(config) {
   const params = new URLSearchParams(location.search);
   const token = params.get('token') || '';
 
+  // Exactly one bridge, ever. A window name only dedupes within one browsing
+  // context group, so opening the bookmarklet from a second tab used to leave a
+  // second window behind. The newest instance claims the role over a
+  // BroadcastChannel and every older one closes itself.
+  const instanceId = crypto.randomUUID();
+  let channel = null;
+  try {
+    channel = new BroadcastChannel('patchwork-bridge');
+    channel.addEventListener('message', (event) => {
+      if (event.data?.type === 'claim' && event.data.id !== instanceId) window.close();
+    });
+    channel.postMessage({ type: 'claim', id: instanceId });
+  } catch {
+    // Without BroadcastChannel the orphan check below is the only cleanup.
+  }
+
+  // An orphaned bridge helps nobody: if the tab that opened it is gone, so is
+  // its reason to exist.
+  setInterval(() => {
+    let orphaned = false;
+    try {
+      orphaned = !window.opener || window.opener.closed;
+    } catch {
+      orphaned = false;
+    }
+    if (orphaned) {
+      channel?.close();
+      window.close();
+    }
+  }, 4000);
+
+  window.addEventListener('pagehide', () => channel?.close());
+
   // The opener cannot reach the agent when the page CSP blocks connect-src, so
   // this same-origin page performs the request and relays the answer back.
   async function perform(request) {
