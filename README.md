@@ -76,7 +76,11 @@ pnpm install
 pnpm start
 ```
 
-The embedded ChatGPT session uses a direct Chromium connection by default so OS-level proxy auto-discovery or PAC configuration cannot stall page bootstrap requests. If a network requires its system proxy, launch Patchwork with `PATCHWORK_USE_SYSTEM_PROXY=1` to restore Chromium's normal system-proxy behavior for that session.
+The embedded ChatGPT session uses `HTTPS_PROXY`/`HTTP_PROXY` when available. To avoid corporate-proxy truncation of ChatGPT's Brotli/chunked bootstrap response, top-level documents, ChatGPT API responses, and React-router page data request uncompressed identity encoding while static assets remain compressed. Set `PATCHWORK_USE_SYSTEM_PROXY=1` for Chromium's system/PAC behavior or `PATCHWORK_USE_DIRECT_CONNECTION=1` only where direct egress is permitted.
+
+For a best-effort fix in a normal ChatGPT browser tab, create a bookmark whose URL is the contents of `scripts/chatgpt-proxy-bookmarklet.txt`. Click it after ChatGPT loads. It patches same-origin Tasks/API and React-router `fetch`/XHR calls with `no-transform`, `no-cache`, and `cache: no-store` until the tab refreshes. Browser JavaScript cannot modify `Accept-Encoding`, so this bookmarklet does not repair an already-truncated initial document.
+
+For automatic installation at the earliest page-script phase, import `scripts/chatgpt-proxy-compatibility.user.js` into Tampermonkey. It runs at `document-start` in the page context and patches ChatGPT bootstrap API calls before the application initializes. The initial top-level HTML response is still outside userscript control because it is downloaded before Tampermonkey can execute.
 
 Verify the project:
 

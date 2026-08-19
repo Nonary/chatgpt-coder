@@ -13,9 +13,9 @@ const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const HIDDEN_VIEW_BOUNDS = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
-const USE_SYSTEM_PROXY = process.env.PATCHWORK_USE_SYSTEM_PROXY === '1';
 const CONNECTIVITY_FAILURE_WINDOW_MILLISECONDS = 2_500;
 const CONNECTIVITY_RECOVERY_DELAY_MILLISECONDS = 1_500;
+const CONNECTIVITY_RECOVERY_COOLDOWN_MILLISECONDS = 15_000;
 const RECOVERABLE_NETWORK_ERRORS = new Set([
   'ERR_CONNECTION_CLOSED',
   'ERR_CONNECTION_RESET',
@@ -52,6 +52,65 @@ const TASK_REASONING_PICKER_OPTIONS = {
   high: { label: 'High', thinkingEffort: 'extended' },
   'extra-high': { label: 'Extra High', thinkingEffort: 'max' },
 };
+
+function proxyServerFromEnvironment(environment = process.env) {
+  const value = environment.HTTPS_PROXY
+    || environment.https_proxy
+    || environment.HTTP_PROXY
+    || environment.http_proxy;
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:', 'socks:', 'socks4:', 'socks5:'].includes(url.protocol)) return null;
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return null;
+  }
+}
+
+function browserSessionProxyConfiguration(environment = process.env) {
+  if (environment.PATCHWORK_USE_DIRECT_CONNECTION === '1') {
+    return { kind: 'direct', proxy: { mode: 'direct' } };
+  }
+  if (environment.PATCHWORK_USE_SYSTEM_PROXY === '1') {
+    return { kind: 'system', proxy: { mode: 'system' } };
+  }
+  const proxyServer = proxyServerFromEnvironment(environment);
+  if (proxyServer) {
+    return { kind: 'fixed', proxy: { mode: 'fixed_servers', proxyRules: proxyServer } };
+  }
+  return { kind: 'system', proxy: { mode: 'system' } };
+}
+
+function isProxySensitiveChatGPTRequest(details = {}) {
+  let url;
+  try {
+    url = new URL(String(details.url || ''));
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com') return false;
+  if (url.pathname.startsWith('/ces/v1/telemetry/')) return false;
+  if (details.resourceType === 'mainFrame') return true;
+  if (details.resourceType === 'xhr') return true;
+  if (url.pathname.startsWith('/backend-api/')) return true;
+  const headers = details.requestHeaders || {};
+  const acceptHeader = Object.keys(headers)
+    .find((name) => name.toLowerCase() === 'accept');
+  const accept = String(acceptHeader ? headers[acceptHeader] : '');
+  return /(?:text\/html|text\/x-component)/i.test(accept);
+}
+
+function proxyCompatibleDocumentHeaders(requestHeaders = {}) {
+  const headers = { ...requestHeaders };
+  const encodingHeader = Object.keys(headers)
+    .find((name) => name.toLowerCase() === 'accept-encoding');
+  if (encodingHeader) headers[encodingHeader] = 'identity';
+  else headers['Accept-Encoding'] = 'identity';
+  headers['Cache-Control'] = 'no-transform, no-cache';
+  headers.Pragma = 'no-cache';
+  return headers;
+}
 
 function sameBounds(left, right) {
   return left.x === right.x
@@ -204,6 +263,25 @@ function isChatGPTConversationUrl(value) {
   } catch {
     return false;
   }
+}
+
+function buildChatGPTRouteActivationScript(targetUrl) {
+  return `(() => {
+    const target = new URL(${JSON.stringify(targetUrl)});
+    const normalizePath = (value) => value.replace(/\\/+$/, '') || '/';
+    const targetPath = normalizePath(target.pathname);
+    const link = Array.from(document.querySelectorAll('a[href]')).find((candidate) => {
+      try {
+        const url = new URL(candidate.href, location.href);
+        return url.origin === target.origin && normalizePath(url.pathname) === targetPath;
+      } catch {
+        return false;
+      }
+    });
+    if (!link) return false;
+    link.click();
+    return true;
+  })()`;
 }
 
 function normalizeConversationTitle(value) {
@@ -831,6 +909,7 @@ class ChatGPTView {
     this.configurationPickerTimer = null;
     this.connectivityFailures = [];
     this.connectivityRecoveryTimer = null;
+    this.lastConnectivityRecoveryAt = 0;
     this.visible = false;
     this.windowFocused = this.mainWindow.isFocused?.() ?? false;
     this.browserBounds = { ...HIDDEN_VIEW_BOUNDS };
@@ -839,6 +918,7 @@ class ChatGPTView {
     this.view = new WebContentsView({
       webPreferences: {
         partition: PARTITION,
+        preload: path.join(__dirname, '..', 'chatgpt-preload.js'),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -858,6 +938,7 @@ class ChatGPTView {
       setImmediate(() => this.syncViewPresentation());
     });
     this.installNavigationHandlers();
+    this.installProxyCompatibility();
     this.installConnectivityRecovery();
     this.installConversationStatusListener();
     this.installDownloadListener();
@@ -882,16 +963,18 @@ class ChatGPTView {
   }
 
   async configureBrowserSessionNetwork() {
-    if (USE_SYSTEM_PROXY) return 'system';
+    const browserSession = this.view.webContents.session;
+    const configuration = browserSessionProxyConfiguration();
     try {
-      await this.view.webContents.session.setProxy({ mode: 'direct' });
-      return 'direct';
+      await browserSession.setProxy(configuration.proxy);
+      await browserSession.closeAllConnections();
+      return configuration.kind;
     } catch (error) {
       await this.onEvent({
         type: 'browser-network-warning',
-        message: `Could not bypass the system proxy for ChatGPT: ${error.message}`,
+        message: `Could not configure ChatGPT networking: ${error.message}`,
       });
-      return 'system';
+      throw error;
     }
   }
 
@@ -947,6 +1030,22 @@ class ChatGPTView {
     });
   }
 
+  installProxyCompatibility() {
+    this.proxyCompatibilityListener = (details, callback) => {
+      const isCurrentView = !details.webContentsId
+        || details.webContentsId === this.view.webContents.id;
+      if (!isCurrentView || !isProxySensitiveChatGPTRequest(details)) {
+        callback({ requestHeaders: details.requestHeaders });
+        return;
+      }
+      callback({ requestHeaders: proxyCompatibleDocumentHeaders(details.requestHeaders) });
+    };
+    this.view.webContents.session.webRequest.onBeforeSendHeaders(
+      { urls: ['https://chatgpt.com/*'] },
+      this.proxyCompatibilityListener,
+    );
+  }
+
   installConnectivityRecovery() {
     this.connectivityErrorListener = (details) => {
       if (details.webContentsId && details.webContentsId !== this.view.webContents.id) return;
@@ -975,6 +1074,7 @@ class ChatGPTView {
 
   scheduleConnectivityRecovery() {
     if (!this.canAutomaticallyRecoverConnectivity() || this.connectivityRecoveryTimer) return;
+    if (Date.now() - this.lastConnectivityRecoveryAt < CONNECTIVITY_RECOVERY_COOLDOWN_MILLISECONDS) return;
     this.connectivityRecoveryTimer = setTimeout(() => {
       this.connectivityRecoveryTimer = null;
       this.recoverConnectivity().catch(() => {});
@@ -987,13 +1087,14 @@ class ChatGPTView {
     await this.networkReady;
     const contents = this.view.webContents;
     const currentUrl = contents.getURL();
-    const targetUrl = /^https:\/\/chatgpt\.com\//i.test(currentUrl) ? currentUrl : CHATGPT_URL;
     this.connectivityFailures = [];
+    this.lastConnectivityRecoveryAt = Date.now();
     await this.onEvent({
       type: 'browser-network-recovery',
       message: 'ChatGPT networking stalled. Retrying the embedded page…',
     });
-    await contents.loadURL(targetUrl);
+    if (/^https:\/\/chatgpt\.com\//i.test(currentUrl)) contents.reload();
+    else await contents.loadURL(CHATGPT_URL);
     return true;
   }
 
@@ -1261,7 +1362,7 @@ class ChatGPTView {
       const targetConversationId = conversationIdFromRouteUrl(conversationUrl);
       const conversationAlreadyOpen = currentUrl === conversationUrl
         || Boolean(targetConversationId && currentConversationId === targetConversationId);
-      if (!conversationAlreadyOpen) await this.view.webContents.loadURL(conversationUrl);
+      if (!conversationAlreadyOpen) await this.navigateToConversation(conversationUrl);
     }
     this.installResultWatcher();
   }
@@ -1282,7 +1383,7 @@ class ChatGPTView {
     // streamed thoughts may not be persisted yet, so keep the existing renderer alive when
     // both routes identify the same conversation.
     if (!conversationAlreadyOpen) {
-      await this.view.webContents.loadURL(task.conversationUrl);
+      await this.navigateToConversation(task.conversationUrl);
     }
     this.installResultWatcher();
     await this.onEvent({
@@ -1291,6 +1392,38 @@ class ChatGPTView {
       message: 'Opened this task’s saved ChatGPT conversation.',
     });
     return { opened: true, task };
+  }
+
+  async navigateToConversation(conversationUrl) {
+    const networkKind = await this.networkReady;
+    const contents = this.view.webContents;
+    const currentUrl = contents.getURL();
+    let currentOrigin = '';
+    try {
+      currentOrigin = new URL(currentUrl).origin;
+    } catch {
+      // A missing or malformed current URL requires a normal navigation fallback.
+    }
+
+    // The corporate HTTP/1.1 proxy can leave a pooled connection alive but unusable. In the
+    // captured HAR, a reused conversation connection waited 7.76 seconds while the same
+    // response completed in under one second on a fresh connection. Reset the pool before
+    // ChatGPT starts the route's conversation fetch instead of recovering with a page reload.
+    if (networkKind === 'fixed' && typeof contents.session?.closeAllConnections === 'function') {
+      await contents.session.closeAllConnections().catch(() => {});
+    }
+
+    if (currentOrigin === new URL(conversationUrl).origin
+      && typeof contents.executeJavaScript === 'function') {
+      const activated = await contents.executeJavaScript(
+        buildChatGPTRouteActivationScript(conversationUrl),
+        true,
+      ).catch(() => false);
+      if (activated) return 'in-page';
+    }
+
+    await contents.loadURL(conversationUrl);
+    return 'document';
   }
 
   async newChat(projectId = null, projectShortUrl = null) {
@@ -2131,7 +2264,7 @@ class ChatGPTView {
       const conversationAlreadyOpen = currentUrl === task.conversationUrl
         || Boolean(taskConversationId && currentConversationId === taskConversationId);
       if (!conversationAlreadyOpen) {
-        await this.view.webContents.loadURL(task.conversationUrl);
+        await this.navigateToConversation(task.conversationUrl);
       }
 
       this.resultAttempts.delete(taskId);
@@ -2229,6 +2362,7 @@ class ChatGPTView {
 module.exports = {
   CHATGPT_URL,
   ChatGPTView,
+  browserSessionProxyConfiguration,
   buildTaskConfigurationScript,
   chatGPTProjectUrl,
   buildLimitNoticeDismissalScript,
@@ -2237,11 +2371,15 @@ module.exports = {
   buildMergeResultDetectionScript,
   buildTaskResultDetectionScript,
   buildConversationStatusScript,
+  buildChatGPTRouteActivationScript,
   conversationIdFromRouteUrl,
   conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  isProxySensitiveChatGPTRequest,
   isRecoverableChatGPTNetworkFailure,
+  proxyCompatibleDocumentHeaders,
+  proxyServerFromEnvironment,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,

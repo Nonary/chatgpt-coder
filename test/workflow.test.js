@@ -9,6 +9,8 @@ const AdmZip = require('adm-zip');
 const {
   CHATGPT_URL,
   ChatGPTView,
+  browserSessionProxyConfiguration,
+  buildChatGPTRouteActivationScript,
   buildConversationStatusScript,
   buildTaskConfigurationScript,
   buildLimitNoticeDismissalScript,
@@ -20,7 +22,10 @@ const {
   conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  isProxySensitiveChatGPTRequest,
   isRecoverableChatGPTNetworkFailure,
+  proxyCompatibleDocumentHeaders,
+  proxyServerFromEnvironment,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,
@@ -987,13 +992,155 @@ test('browser connectivity recovery targets ChatGPT bootstrap failures without r
   }), false);
 });
 
-test('embedded ChatGPT networking bypasses the system proxy unless explicitly requested', async () => {
+test('embedded ChatGPT networking uses the proxy with page traffic compression disabled', async () => {
+  assert.deepEqual(browserSessionProxyConfiguration({ HTTPS_PROXY: 'http://proxy.example:8080' }), {
+    kind: 'fixed', proxy: { mode: 'fixed_servers', proxyRules: 'http://proxy.example:8080' },
+  });
+  assert.deepEqual(browserSessionProxyConfiguration({
+    PATCHWORK_USE_DIRECT_CONNECTION: '1', HTTPS_PROXY: 'http://proxy.example:8080',
+  }), { kind: 'direct', proxy: { mode: 'direct' } });
+  assert.deepEqual(browserSessionProxyConfiguration({
+    PATCHWORK_USE_SYSTEM_PROXY: '1', HTTPS_PROXY: 'http://proxy.example:8080',
+  }), { kind: 'system', proxy: { mode: 'system' } });
+  assert.equal(isProxySensitiveChatGPTRequest({
+    url: 'https://chatgpt.com/backend-api/tasks',
+    resourceType: 'xhr',
+    requestHeaders: { Accept: '*/*' },
+  }), true);
+  assert.equal(isProxySensitiveChatGPTRequest({
+    url: 'https://chatgpt.com/g/example/tasks',
+    resourceType: 'xhr',
+    requestHeaders: { Accept: 'text/x-component' },
+  }), true);
+  assert.equal(isProxySensitiveChatGPTRequest({
+    url: 'https://chatgpt.com/ces/v1/projects/oai/settings',
+    resourceType: 'xhr',
+    requestHeaders: { Accept: '*/*' },
+  }), true);
+  assert.equal(isProxySensitiveChatGPTRequest({
+    url: 'https://chatgpt.com/ces/v1/telemetry/intake',
+    resourceType: 'xhr',
+    requestHeaders: { Accept: '*/*' },
+  }), false);
+  assert.equal(isProxySensitiveChatGPTRequest({
+    url: 'https://chatgpt.com/cdn/assets/app.js',
+    resourceType: 'script',
+    requestHeaders: { Accept: '*/*' },
+  }), false);
+  assert.deepEqual(proxyCompatibleDocumentHeaders({
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
+    'User-Agent': 'Patchwork',
+  }), {
+    'Accept-Encoding': 'identity',
+    'Cache-Control': 'no-transform, no-cache',
+    Pragma: 'no-cache',
+    'User-Agent': 'Patchwork',
+  });
   const source = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8');
+  assert.equal(proxyServerFromEnvironment({ HTTPS_PROXY: 'http://proxy.example:8080/path' }), 'http://proxy.example:8080');
+  assert.equal(proxyServerFromEnvironment({ https_proxy: 'socks5://proxy.example:1080' }), 'socks5://proxy.example:1080');
+  assert.equal(proxyServerFromEnvironment({ HTTPS_PROXY: 'file:///tmp/proxy' }), null);
+  assert.equal(proxyServerFromEnvironment({}), null);
   assert.match(source, /PATCHWORK_USE_SYSTEM_PROXY === '1'/);
-  assert.match(source, /session\.setProxy\(\{ mode: 'direct' \}\)/);
+  assert.match(source, /PATCHWORK_USE_DIRECT_CONNECTION === '1'/);
+  assert.match(source, /browserSessionProxyConfiguration\(\)/);
+  assert.match(source, /mode: 'fixed_servers', proxyRules: proxyServer/);
+  assert.match(source, /return \{ kind: 'fixed', proxy: \{ mode: 'fixed_servers', proxyRules: proxyServer \} \}/);
+  assert.match(source, /proxyCompatibleDocumentHeaders/);
+  assert.match(source, /onBeforeSendHeaders/);
+  assert.match(source, /browserSession\.setProxy\(configuration\.proxy\)/);
+  assert.match(source, /browserSession\.closeAllConnections\(\)/);
   assert.match(source, /connectivityFailures\.length < 2/);
+  assert.match(source, /CONNECTIVITY_RECOVERY_COOLDOWN_MILLISECONDS/);
+  assert.match(source, /contents\.reload\(\)/);
   assert.match(source, /activeTask\?\.state !== 'submitted'/);
   assert.match(source, /activeMerge\?\.mergeState !== 'submitted'/);
+});
+
+test('proxy compatibility rewrites documents and task data but leaves assets compressed', () => {
+  let listener;
+  const view = Object.create(ChatGPTView.prototype);
+  view.view = { webContents: {
+    id: 42,
+    session: { webRequest: {
+      onBeforeSendHeaders: (_filter, installed) => { listener = installed; },
+    } },
+  } };
+  view.installProxyCompatibility();
+
+  let documentResult;
+  listener({
+    webContentsId: 42,
+    resourceType: 'mainFrame',
+    url: 'https://chatgpt.com/g/example/tasks',
+    requestHeaders: { 'Accept-Encoding': 'gzip, deflate, br, zstd' },
+  }, (result) => { documentResult = result; });
+  assert.equal(documentResult.requestHeaders['Accept-Encoding'], 'identity');
+  assert.equal(documentResult.requestHeaders['Cache-Control'], 'no-transform, no-cache');
+  assert.equal(documentResult.requestHeaders.Pragma, 'no-cache');
+
+  const apiHeaders = { 'Accept-Encoding': 'gzip, deflate, br, zstd' };
+  let apiResult;
+  listener({
+    webContentsId: 42,
+    resourceType: 'xhr',
+    url: 'https://chatgpt.com/backend-api/tasks',
+    requestHeaders: apiHeaders,
+  }, (result) => { apiResult = result; });
+  assert.equal(apiResult.requestHeaders['Accept-Encoding'], 'identity');
+  assert.equal(apiResult.requestHeaders['Cache-Control'], 'no-transform, no-cache');
+  assert.equal(apiResult.requestHeaders.Pragma, 'no-cache');
+
+  const assetHeaders = { 'Accept-Encoding': 'gzip, deflate, br, zstd' };
+  let assetResult;
+  listener({
+    webContentsId: 42,
+    resourceType: 'script',
+    url: 'https://chatgpt.com/cdn/assets/app.js',
+    requestHeaders: assetHeaders,
+  }, (result) => { assetResult = result; });
+  assert.equal(assetResult.requestHeaders, assetHeaders);
+});
+
+test('ChatGPT connectivity recovery waits for clustered API failures', () => {
+  let recoveryCount = 0;
+  const view = Object.create(ChatGPTView.prototype);
+  view.connectivityFailures = [];
+  view.scheduleConnectivityRecovery = () => { recoveryCount += 1; };
+  const failure = {
+    url: 'https://chatgpt.com/backend-api/conversations',
+    error: 'net::ERR_TIMED_OUT',
+    resourceType: 'xhr',
+  };
+
+  view.handleConnectivityFailure(failure);
+  assert.equal(recoveryCount, 0);
+  view.handleConnectivityFailure(failure);
+  assert.equal(recoveryCount, 1);
+});
+
+test('ChatGPT connectivity recovery uses a normal reload for the current page', async () => {
+  let reloadCount = 0;
+  const loaded = [];
+  const view = Object.create(ChatGPTView.prototype);
+  view.activeTask = null;
+  view.activeMerge = null;
+  view.connectivityFailures = [Date.now()];
+  view.lastConnectivityRecoveryAt = 0;
+  view.networkReady = Promise.resolve('direct');
+  view.onEvent = async () => {};
+  view.view = {
+    webContents: {
+      getURL: () => 'https://chatgpt.com/c/existing',
+      reload: () => { reloadCount += 1; },
+      loadURL: async (url) => loaded.push(url),
+      session: { closeAllConnections: async () => {} },
+    },
+  };
+
+  assert.equal(await view.recoverConnectivity(), true);
+  assert.equal(reloadCount, 1);
+  assert.deepEqual(loaded, []);
 });
 
 test('opening a task loads its saved ChatGPT conversation', async () => {
@@ -1050,6 +1197,53 @@ test('opening an already-live task preserves the streaming conversation page', a
   const result = await view.openTaskConversation(task);
   assert.equal(result.opened, true);
   assert.deepEqual(loaded, []);
+});
+
+test('opening a task uses ChatGPT in-page conversation navigation when available', async () => {
+  const conversationId = '6a80f4cf-1650-83ea-8609-adb411b3e4bc';
+  const task = {
+    taskId: '9f1fae65-e106-4c76-acbe-8ea3928810e7',
+    state: 'submitted',
+    conversationId,
+    conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+  };
+  const loaded = [];
+  const scripts = [];
+  let closedConnections = 0;
+  const view = Object.create(ChatGPTView.prototype);
+  view.networkReady = Promise.resolve('fixed');
+  view.view = {
+    webContents: {
+      getURL: () => CHATGPT_URL,
+      executeJavaScript: async (script) => {
+        scripts.push(script);
+        return true;
+      },
+      loadURL: async (url) => loaded.push(url),
+      session: {
+        closeAllConnections: async () => { closedConnections += 1; },
+      },
+    },
+  };
+  view.activeTask = null;
+  view.activeMerge = null;
+  view.knownTasks = new Map();
+  view.onEvent = async () => {};
+  view.installResultWatcher = () => {};
+
+  await view.openTaskConversation(task);
+
+  assert.equal(scripts.length, 1);
+  assert.equal(closedConnections, 1);
+  assert.match(scripts[0], /querySelectorAll\('a\[href\]'\)/);
+  assert.deepEqual(loaded, []);
+});
+
+test('ChatGPT route activation script targets an exact conversation path', () => {
+  const script = buildChatGPTRouteActivationScript('https://chatgpt.com/c/example');
+  assert.doesNotThrow(() => new vm.Script(script));
+  assert.match(script, /targetPath/);
+  assert.match(script, /link\.click\(\)/);
 });
 
 test('ChatGPT thinking dialogs are not treated as request-limit notices', () => {
