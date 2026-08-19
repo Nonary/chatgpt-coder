@@ -2254,52 +2254,26 @@ test('task upload selects the composer file input and dispatches its change even
   assert.equal(attachmentWaitedFor, 'chatgpt-ide-task-example.txt');
 });
 
-test('task upload waits for a stable React file input before selecting a package', async () => {
-  const nodeIds = [0, 42, 43, 43];
+test('attachment wait redispatches a selected ZIP when ChatGPT hydration missed the first change event', async () => {
+  const statuses = [
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: false, busy: true, selectedByInput: true },
+    { attached: true, busy: false, selectedByInput: true },
+    { attached: true, busy: false, selectedByInput: true },
+  ];
+  let redispatches = 0;
   const view = {
-    findFileInputNodeId: async () => nodeIds.shift() || 43,
+    packageAttachmentStatus: async () => statuses.shift() || { attached: true, busy: false },
+    dispatchSelectedFileInput: async () => { redispatches += 1; return true; },
   };
 
-  assert.equal(
-    await ChatGPTView.prototype.waitForFileInputNodeId.call(view, 1_000),
-    43,
-  );
-});
-
-test('task upload retries file selection when React does not render the attachment', async () => {
-  const commands = [];
-  let renderAttempt = 0;
-  const debuggerApi = {
-    isAttached: () => true,
-    sendCommand: async (command, params) => {
-      commands.push({ command, params });
-      return {};
-    },
-  };
-  const view = {
-    view: {
-      webContents: {
-        debugger: debuggerApi,
-        executeJavaScript: async () => true,
-      },
-    },
-    findFileInputNodeId: async () => 42,
-    packageAttachmentStatus: async () => ({ attached: false, busy: false }),
-    waitForPackageAttachmentToAppear: async () => {
-      renderAttempt += 1;
-      return renderAttempt > 1;
-    },
-    waitForPackageAttachment: async () => true,
-  };
-
-  assert.equal(
-    await ChatGPTView.prototype.uploadPackage.call(view, '/tasks/chatgpt-ide-task-retry.zip'),
-    true,
-  );
-  assert.equal(
-    commands.filter((item) => item.command === 'DOM.setFileInputFiles').length,
-    2,
-  );
+  assert.equal(await ChatGPTView.prototype.waitForPackageAttachment.call(
+    view,
+    'chatgpt-ide-task-hydration.zip',
+    5_000,
+  ), true);
+  assert.equal(redispatches, 1);
 });
 
 test('task upload reuses an attachment that is already in the composer', async () => {
@@ -2392,7 +2366,7 @@ test('task attachment confirmation does not treat a selected React input as an u
   });
 
   assert.equal(result.attached, false);
-  assert.equal(result.busy, false);
+  assert.equal(result.busy, true);
   assert.equal(result.selectedByInput, true);
 });
 

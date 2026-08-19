@@ -12,11 +12,6 @@ const TASK_MONITOR_INTERVAL_MILLISECONDS = 1_500;
 const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
-const FILE_INPUT_SETTLE_TIMEOUT_MILLISECONDS = 5_000;
-const FILE_INPUT_SETTLE_DELAY_MILLISECONDS = 150;
-const PACKAGE_ATTACHMENT_APPEAR_TIMEOUT_MILLISECONDS = 5_000;
-const PACKAGE_ATTACHMENT_RETRY_DELAY_MILLISECONDS = 250;
-const PACKAGE_ATTACHMENT_RETRY_COUNT = 3;
 const HIDDEN_VIEW_BOUNDS = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
@@ -533,6 +528,7 @@ function buildTaskConfigurationScript(model, reasoningMode, taskId = null) {
 function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = false) {
   return `(() => {
     const filename = ${JSON.stringify(filename)};
+    const target = filename.toLowerCase();
     const visible = (element) => {
       if (!element) return false;
       const style = getComputedStyle(element);
@@ -574,39 +570,41 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
     }
     const selectedByInput = fileInputs.some((input) => [...(input.files || [])]
       .some((file) => file.name === filename));
-    // A selected file input only proves that the browser accepted the local
-    // file selection. ChatGPT uses React state for composer attachments, so a
-    // stale or newly replaced input can still contain the file even when the
-    // attachment was never registered by the page. Require the attachment
-    // element itself before reporting success.
     // Source Control intentionally keeps the embedded ChatGPT view hidden at
     // zero bounds while a summary runs. Attachment chips still exist in the
     // page DOM in that state, but their client rectangles are empty. The task
     // package filename contains a unique task ID, so DOM presence is the
     // reliable confirmation signal here; rendered geometry is not.
-    const normalizeText = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
     const attachment = candidates.find((element) => {
-      const text = normalizeText(element.textContent);
       const labels = [
+        element.textContent,
         element.getAttribute('aria-label'),
         element.getAttribute('title'),
-        element.getAttribute('data-testid'),
-      ].filter(Boolean).map(normalizeText);
-      const containsFilename = [text, ...labels].some((value) => value.includes(filename));
-      if (!containsFilename) return false;
-      return text === filename || labels.some((value) => /(?:file|attach|upload)/i.test(value));
+      ].filter(Boolean).map((value) => String(value).replace(/\\s+/g, ' ').trim().toLowerCase());
+      const matchesFilename = labels.some((value) => value.includes(target));
+      if (!matchesFilename) return false;
+      return Boolean(element.closest?.('[data-testid*="file"], [data-testid*="attach"]'))
+        || labels.some((value) => value === target)
+        || /file|attach/i.test([
+          element.getAttribute('data-testid'),
+          element.getAttribute('aria-label'),
+        ].filter(Boolean).join(' '));
     });
     if (!attachment) return {
       attached: false,
-      busy: false,
+      busy: selectedByInput,
       selectedByInput,
       duplicateNotice: Boolean(duplicateNotice),
       dismissedDuplicate,
     };
-    const card = attachment.closest('[data-testid*="file"], [data-testid*="attach"]') || attachment.parentElement;
+    const card = attachment.closest?.('[role="group"][aria-label]')
+      || attachment.closest?.('[data-testid*="file"], [data-testid*="attach"]')
+      || attachment.parentElement
+      || attachment;
     const statusText = [card?.textContent, card?.getAttribute?.('aria-label')].filter(Boolean).join(' ');
     const busy = /uploading|processing|attaching/i.test(statusText)
-      || Boolean(card?.querySelector?.('[role="progressbar"], progress, [aria-busy="true"]'));
+      || Boolean(card?.matches?.('.cursor-wait, [aria-busy="true"]'))
+      || Boolean(card?.querySelector?.('.cursor-wait, [role="progressbar"], progress, [aria-busy="true"]'));
     return {
       attached: true,
       busy,
@@ -616,6 +614,7 @@ function buildPackageAttachmentStatusScript(filename, dismissDuplicateNotice = f
     };
   })()`;
 }
+
 
 function buildFileInputEventScript(filename) {
   return `(async () => {
@@ -1606,34 +1605,6 @@ class ChatGPTView {
     return 0;
   }
 
-  async waitForFileInputNodeId(timeoutMilliseconds = FILE_INPUT_SETTLE_TIMEOUT_MILLISECONDS) {
-    const startedAt = Date.now();
-    let previousNodeId = 0;
-    let stableChecks = 0;
-    while (Date.now() - startedAt < timeoutMilliseconds) {
-      const nodeId = await this.findFileInputNodeId().catch(() => 0);
-      if (nodeId && nodeId === previousNodeId) {
-        stableChecks += 1;
-        if (stableChecks >= 2) return nodeId;
-      } else {
-        previousNodeId = nodeId;
-        stableChecks = nodeId ? 1 : 0;
-      }
-      await delay(FILE_INPUT_SETTLE_DELAY_MILLISECONDS);
-    }
-    return stableChecks >= 2 ? previousNodeId : 0;
-  }
-
-  async waitForPackageAttachmentToAppear(filename, timeoutMilliseconds = PACKAGE_ATTACHMENT_APPEAR_TIMEOUT_MILLISECONDS) {
-    const startedAt = Date.now();
-    while (Date.now() - startedAt < timeoutMilliseconds) {
-      const status = await this.packageAttachmentStatus(filename, true);
-      if (status.attached) return true;
-      await delay(200);
-    }
-    return false;
-  }
-
   async uploadPackage(packagePath) {
     const filename = path.basename(packagePath);
     const existingAttachment = await this.packageAttachmentStatus(filename, true);
@@ -1645,7 +1616,7 @@ class ChatGPTView {
         debuggerApi.attach('1.3');
         attachedHere = true;
       }
-      let nodeId = await ChatGPTView.prototype.waitForFileInputNodeId.call(this, 1_500);
+      let nodeId = await this.findFileInputNodeId();
       if (!nodeId) {
         await this.view.webContents.executeJavaScript(`(() => {
           const candidates = [...document.querySelectorAll('button')];
@@ -1658,48 +1629,31 @@ class ChatGPTView {
           if (button) button.click();
           return Boolean(button);
         })()`, true);
-        nodeId = await ChatGPTView.prototype.waitForFileInputNodeId.call(this);
+        await delay(500);
+        nodeId = await this.findFileInputNodeId();
       }
       if (!nodeId) {
         throw new Error('Could not locate ChatGPT’s attachment input. Attach the package manually or reload and retry.');
       }
-      let lastError = null;
-      let attachmentRendered = false;
-      for (let attempt = 0; attempt < PACKAGE_ATTACHMENT_RETRY_COUNT; attempt += 1) {
-        try {
-          if (attempt > 0) {
-            nodeId = await ChatGPTView.prototype.waitForFileInputNodeId.call(this);
-            if (!nodeId) throw new Error('ChatGPT replaced its attachment input before the file could be selected.');
-          }
-          await debuggerApi.sendCommand('DOM.setFileInputFiles', {
-            files: [packagePath],
-            nodeId,
-          });
-          const eventDispatched = await this.view.webContents.executeJavaScript(
-            buildFileInputEventScript(filename),
-            true,
-          );
-          if (!eventDispatched) throw new Error('ChatGPT did not accept the selected task package.');
-          if (!await this.waitForPackageAttachmentToAppear(filename)) {
-            throw new Error('ChatGPT did not render the selected task package in the composer.');
-          }
-          attachmentRendered = true;
-          break;
-        } catch (error) {
-          lastError = error;
-          if (attempt + 1 < PACKAGE_ATTACHMENT_RETRY_COUNT) {
-            await delay(PACKAGE_ATTACHMENT_RETRY_DELAY_MILLISECONDS);
-          }
-        }
-      }
-      if (!attachmentRendered) {
-        throw new Error(`ChatGPT did not confirm the attachment ${filename}. ${lastError?.message || 'Nothing was submitted.'} Reload the embedded browser and try again.`);
-      }
-      await this.waitForPackageAttachment(filename);
-      return true;
+      await debuggerApi.sendCommand('DOM.setFileInputFiles', {
+        files: [packagePath],
+        nodeId,
+      });
+      const dispatchSelectedFileInput = this.dispatchSelectedFileInput
+        || ChatGPTView.prototype.dispatchSelectedFileInput;
+      const eventDispatched = await dispatchSelectedFileInput.call(this, filename);
+      if (!eventDispatched) throw new Error('ChatGPT did not accept the selected task package. Nothing was submitted.');
     } finally {
       if (attachedHere && debuggerApi.isAttached()) debuggerApi.detach();
     }
+    await this.waitForPackageAttachment(path.basename(packagePath));
+  }
+
+  async dispatchSelectedFileInput(filename) {
+    return this.view.webContents.executeJavaScript(
+      buildFileInputEventScript(filename),
+      true,
+    ).catch(() => false);
   }
 
   async uploadAttachments(attachments = []) {
@@ -1726,10 +1680,15 @@ class ChatGPTView {
   async waitForPackageAttachment(filename, timeoutMilliseconds = 60_000) {
     const startedAt = Date.now();
     let consecutiveReadyChecks = 0;
+    let lastRedispatchAt = startedAt;
     while (Date.now() - startedAt < timeoutMilliseconds) {
       const status = await this.packageAttachmentStatus(filename, true);
       consecutiveReadyChecks = status.attached && !status.busy ? consecutiveReadyChecks + 1 : 0;
       if (consecutiveReadyChecks >= 2) return true;
+      if (!status.attached && status.selectedByInput && Date.now() - lastRedispatchAt >= 1_000) {
+        lastRedispatchAt = Date.now();
+        await this.dispatchSelectedFileInput(filename);
+      }
       await delay(500);
     }
     throw new Error(`ChatGPT did not confirm the attachment ${filename}. Nothing was submitted; reload the embedded browser and try again.`);
