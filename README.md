@@ -53,9 +53,14 @@ Patchwork's dock opens on the right of the page and makes room for itself, so
 ChatGPT reflows instead of being covered. `Alt+P` toggles it, and the header's layout
 button switches to overlay if you prefer.
 
-Patchwork also replaces ChatGPT's model control in the composer with its own
-**Sol · Auto** picker offering GPT-5.6 Sol/Luna and Auto/Instant/Low/Medium/High/Extra
-High. That picker is part of the page, not the dock — it is there whether Patchwork is
+Nothing rendered into the page carries a product name or a logo. The panel is styled
+from ChatGPT's own design tokens — its greys, hairline borders, translucent hover fills,
+radii, and type scale — and follows whichever theme ChatGPT is currently showing, so it
+reads as one of the page's own surfaces rather than as something bolted on.
+
+Patchwork also replaces ChatGPT's model control in the composer with a **Sol · Auto**
+picker, drawn to match ChatGPT's own menus in both themes, offering GPT-5.6 Sol/Luna and
+Auto/Instant/Low/Medium/High/Extra High. That picker is part of the page, not the dock — it is there whether Patchwork is
 open or closed, works for ordinary chats, and whatever it shows when you press Send is
 what the request is sent with.
 
@@ -184,7 +189,9 @@ reuse the first tab's bridge without foregrounding the window.
 
 The dock renders inside a shadow root with a constructible stylesheet, so Patchwork's
 CSS and ChatGPT's CSS cannot collide and the dock keeps its styling regardless of the
-page's `style-src`. No external asset is ever loaded.
+page's `style-src`. ChatGPT's token *values* are copied into that stylesheet rather than
+referenced by name, because a renamed internal variable would silently resolve to
+nothing. No external asset is ever loaded.
 
 ## Development
 

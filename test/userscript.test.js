@@ -311,8 +311,8 @@ test('task labels and states match the states the agent can report', () => {
   assert.equal(taskLabel({ summaryOnly: true, repositories: [{ name: 'sunshine' }] }), 'Git Summary · sunshine');
 
   assert.equal(taskStateLabel({ state: 'submitted' }), 'Running');
-  assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'completed' }), 'ChatGPT finished');
-  assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'failed' }), 'ChatGPT stopped');
+  assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'completed' }), 'Response complete');
+  assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'failed' }), 'Generation stopped');
   assert.equal(taskStateLabel({ answerOnly: true, state: 'completed' }), 'Answered');
   assert.equal(taskStateLabel({ state: 'conflicted' }), 'Needs conflict resolution');
   assert.equal(taskStateLabel({ summaryOnly: true, state: 'ready' }), 'Summary ready');

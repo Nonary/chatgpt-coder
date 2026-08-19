@@ -7,10 +7,10 @@ async function readJson(response, what) {
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    throw new Error(`ChatGPT returned an unreadable ${what} response.`);
+    throw new Error(`The ${what} response was unreadable.`);
   }
   if (!response.ok) {
-    throw new Error(`ChatGPT rejected the ${what} request (${response.status}).`);
+    throw new Error(`The ${what} request was rejected (${response.status}).`);
   }
   return data;
 }
@@ -46,7 +46,7 @@ async function listProjects() {
 
 async function createProject(name) {
   const projectName = String(name || '').trim();
-  if (!projectName) throw new Error('Enter a name for the new ChatGPT project.');
+  if (!projectName) throw new Error('Enter a name for the new project.');
   const data = await readJson(await authorizedFetch('/backend-api/projects', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -64,7 +64,7 @@ async function createProject(name) {
     project = (await listProjects()).find((item) => item.name === projectName) || null;
   }
   if (!project || !CHATGPT_PROJECT_ID_PATTERN.test(project.id)) {
-    throw new Error('ChatGPT created the project, but Patchwork could not determine its identifier.');
+    throw new Error('The project was created, but its identifier could not be determined.');
   }
   const shortUrl = CHATGPT_PROJECT_ID_PATTERN.test(String(project.shortUrl || '')) ? project.shortUrl : null;
   return {
@@ -141,7 +141,7 @@ async function downloadFileText(fileId) {
     'file download',
   );
   const downloadUrl = data?.download_url || data?.url;
-  if (!downloadUrl) throw new Error('ChatGPT did not return a download URL for the result file.');
+  if (!downloadUrl) throw new Error('No download URL came back for the result file.');
   const response = await fetch(downloadUrl, { cache: 'no-store' });
   if (!response.ok) throw new Error(`The generated result file could not be downloaded (${response.status}).`);
   return response.text();

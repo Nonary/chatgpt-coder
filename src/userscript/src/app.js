@@ -31,7 +31,7 @@ class App {
       onNavigate: () => this.renderActiveView(),
       onPushIneffective: (result) => {
         this.store.addActivity(`The page did not reflow around the dock (content reaches ${result.worst}px of ${result.limit}px). Use the layout button for overlay.`);
-        this.toast('ChatGPT did not reflow around the dock. Try the layout button in the header.', true);
+        this.toast('The page did not reflow around the panel. Try the layout button in the header.', true);
       },
     });
     this.driver = new Driver({ api, report: (event) => this.handleEvent(event) });
@@ -341,7 +341,7 @@ class App {
         return app.run(async () => {
           let chatgptProject = null;
           if (composer.projectSelection === NEW_PROJECT_VALUE) {
-            if (!composer.newProjectName.trim()) throw new Error('Enter a name for the new ChatGPT project.');
+            if (!composer.newProjectName.trim()) throw new Error('Enter a name for the new project.');
             chatgptProject = await chatgpt.createProject(composer.newProjectName.trim());
             await app.refreshProjects();
             app.store.setComposer({ projectSelection: chatgptProject.id, newProjectName: '' }, 'silent');
@@ -388,7 +388,7 @@ class App {
           app.store.upsertTask(submitted);
           app.renderActiveView();
           return submitted;
-        }, { failure: 'ChatGPT submission failed.' });
+        }, { failure: 'The send failed.' });
       },
 
       async openConversation(taskId) {
@@ -432,7 +432,7 @@ class App {
         const confirmed = await app.shell.confirm({
           title: 'Delete task history?',
           message: task?.state === 'submitted'
-            ? 'This removes the saved task history. Patchwork stops tracking the running task, but it does not cancel ChatGPT.'
+            ? 'This removes the saved task history. The running task stops being tracked, but the chat keeps going.'
             : 'This removes the saved task history and task package. It does not change the coding tree.',
           confirmLabel: 'Delete task',
           danger: true,
@@ -490,7 +490,7 @@ class App {
       async rollbackTask(taskId) {
         const confirmed = await app.shell.confirm({
           title: 'Roll back applied changes?',
-          message: 'Patchwork reverts the commits or patches this task applied to its target.',
+          message: 'The commits or patches this task applied to its target are reverted.',
           confirmLabel: 'Roll back',
           danger: true,
         });
@@ -541,7 +541,7 @@ class App {
         if (!path) return;
         const confirmed = await app.shell.confirm({
           title: 'Remove from workspace?',
-          message: 'This only removes the repository from Patchwork. Nothing on disk changes.',
+          message: 'This only removes the repository from the workspace. Nothing on disk changes.',
           confirmLabel: 'Remove',
         });
         if (!confirmed) return;
@@ -634,7 +634,7 @@ class App {
         const tree = app.store.state.trees.find((item) => item.id === treeId);
         const confirmed = await app.shell.confirm({
           title: 'Discard coding tree?',
-          message: `Discard “${tree?.name || treeId}” and all commits that have not been merged? This removes the worktree and its Patchwork branch.`,
+          message: `Discard “${tree?.name || treeId}” and all commits that have not been merged? This removes the worktree and its coding branch.`,
           confirmLabel: 'Discard tree',
           danger: true,
         });

@@ -2,6 +2,7 @@ const {
   TASK_MODEL_PICKER_OPTIONS,
   TASK_REASONING_PICKER_OPTIONS,
 } = require('../../../shared/chatgpt');
+const { isDarkTheme, observeTheme } = require('../ui/theme');
 
 const PICKER_TAG = 'patchwork-model-selector';
 const MENU_TAG = 'patchwork-model-menu';
@@ -41,32 +42,67 @@ const MENU_ITEMS = [
   { choice: 'reasoning:extra-high', label: 'Extra High' },
 ];
 
-const PICKER_CSS = `
-:host{display:inline-flex;align-items:center;color:var(--text-primary,#f4f4f4);
-  font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-button{display:inline-flex;min-height:32px;align-items:center;gap:4px;padding:0 8px;border:0;
-  border-radius:8px;color:inherit;background:transparent;font:400 14px/20px inherit;
-  white-space:nowrap;cursor:pointer}
-button:hover,button[aria-expanded="true"]{background:var(--surface-hover,var(--main-surface-secondary,rgba(255,255,255,.08)))}
-.chevron{width:16px;height:16px;transition:transform .15s}
+// Both shadow roots carry the same tokens the dock uses, taken from ChatGPT's
+// own theme blocks, and switch on a data-theme attribute rather than reading the
+// page's variables - the picker has to look native in a composer whose internal
+// custom-property names are not ours to depend on.
+const THEME_TOKENS = `
+:host{--surface-elevated:#2f2f2f;--surface-hover:rgba(255,255,255,.08);
+  --surface-active:rgba(255,255,255,.12);--border:rgba(255,255,255,.1);
+  --text:#ececec;--text-secondary:rgba(255,255,255,.7);
+  --shadow:0 10px 34px rgba(0,0,0,.5)}
+:host([data-theme="light"]){--surface-elevated:#ffffff;--surface-hover:rgba(0,0,0,.05);
+  --surface-active:rgba(0,0,0,.08);--border:rgba(0,0,0,.1);
+  --text:#0d0d0d;--text-secondary:rgba(0,0,0,.6);
+  --shadow:0 10px 34px rgba(0,0,0,.12)}
+`;
+
+const FONT_STACK = '"OpenAI Sans","OpenAI Sans Variable Scripts",ui-sans-serif,'
+  + '-apple-system,system-ui,"Segoe UI",Helvetica,Arial,sans-serif';
+
+const PICKER_CSS = `${THEME_TOKENS}
+:host{display:inline-flex;align-items:center;color:var(--text);font-family:${FONT_STACK}}
+button{display:inline-flex;height:32px;align-items:center;gap:4px;padding:0 10px;border:0;
+  border-radius:999px;color:inherit;background:transparent;font:400 14px/20px inherit;
+  white-space:nowrap;cursor:pointer;transition:background-color .15s ease}
+button:hover{background:var(--surface-hover)}
+button[aria-expanded="true"]{background:var(--surface-active)}
+.chevron{width:16px;height:16px;transition:transform .15s ease}
 button[aria-expanded="true"] .chevron{transform:rotate(180deg)}
 `;
 
-const MENU_CSS = `
+const MENU_CSS = `${THEME_TOKENS}
 :host([hidden]){display:none!important}
-.menu{box-sizing:border-box;width:${MENU_WIDTH}px;padding:6px;border:1px solid rgba(255,255,255,.12);
-  border-radius:16px;background:#212121;box-shadow:0 14px 36px rgba(0,0,0,.4);font-size:14px;line-height:20px}
-.section{padding:7px 10px 5px;color:#aaa;font-size:12px;font-weight:600}
-.divider{height:1px;margin:5px 4px;background:rgba(255,255,255,.12)}
+.menu{box-sizing:border-box;width:${MENU_WIDTH}px;padding:6px;border:1px solid var(--border);
+  border-radius:16px;background:var(--surface-elevated);box-shadow:var(--shadow);
+  color:var(--text);font-family:${FONT_STACK};font-size:14px;line-height:20px}
+.section{padding:8px 10px 4px;color:var(--text-secondary);font-size:13px;font-weight:500}
+.divider{height:1px;margin:5px 4px;background:var(--border)}
 button{display:flex;box-sizing:border-box;width:100%;align-items:center;justify-content:space-between;
-  padding:9px 10px;border:0;border-radius:9px;color:#f4f4f4;background:transparent;font:inherit;
-  text-align:left;cursor:pointer}
-button:hover,button[aria-checked="true"]{background:#2f2f2f}
+  padding:9px 10px;border:0;border-radius:10px;color:inherit;background:transparent;font:inherit;
+  text-align:left;cursor:pointer;transition:background-color .15s ease}
+button:hover{background:var(--surface-hover)}
+button[aria-checked="true"]{background:var(--surface-active)}
 button[aria-checked="true"]::after{content:"\\2713";margin-left:16px;font-size:14px}
 `;
 
 let selection = { taskId: null, model: 'default', reasoningMode: 'default' };
 let session = null;
+const themedHosts = new Set();
+let stopThemeWatch = null;
+
+// One observer keeps every shadow host mounted into the composer on the same
+// theme as the conversation behind it. Hosts are tracked before they are mounted,
+// so the attribute is written straight away rather than waiting for a change, and
+// the set is emptied by uninstallDom() when those hosts are torn down.
+function trackTheme(host) {
+  themedHosts.add(host);
+  host.setAttribute('data-theme', isDarkTheme() ? 'dark' : 'light');
+  if (stopThemeWatch) return;
+  stopThemeWatch = observeTheme((dark) => {
+    for (const tracked of themedHosts) tracked.setAttribute('data-theme', dark ? 'dark' : 'light');
+  });
+}
 
 /* ------------------------------------------------------------------ pure logic */
 
@@ -177,10 +213,10 @@ function buildMenu(picker, renderPicker) {
   document.getElementById(MENU_ID)?.remove();
   const host = el(MENU_TAG, {
     id: MENU_ID,
-    style: 'position:fixed;z-index:2147483647;left:0;top:0;color:#f4f4f4;'
-      + 'font-family:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;',
+    style: 'position:fixed;z-index:2147483647;left:0;top:0;',
   });
   host.hidden = true;
+  trackTheme(host);
   const shadow = host.attachShadow({ mode: 'closed' });
   adopt(shadow, MENU_CSS);
 
@@ -275,6 +311,7 @@ function buildPicker() {
     'data-task-id': String(selection.taskId || ''),
     style: 'display:inline-flex;align-items:center;min-width:0;vertical-align:middle;',
   });
+  trackTheme(picker);
   const shadow = picker.attachShadow({ mode: 'closed' });
   adopt(shadow, PICKER_CSS);
 
@@ -283,7 +320,7 @@ function buildPicker() {
     type: 'button',
     'aria-haspopup': 'menu',
     'aria-expanded': 'false',
-    'aria-label': 'Patchwork model selector',
+    'aria-label': 'Model and thinking selector',
   }, [label, chevron()]);
   shadow.append(button);
 
@@ -444,6 +481,7 @@ function install({
 }
 
 function uninstallDom() {
+  themedHosts.clear();
   document.getElementById(MENU_ID)?.remove();
   document.getElementById(PICKER_ID)?.remove();
   document.getElementById(SLOT_ID)?.remove();
@@ -464,6 +502,8 @@ function uninstall() {
     document.removeEventListener('pointerdown', session.outsideHandler, true);
   }
   uninstallDom();
+  stopThemeWatch?.();
+  stopThemeWatch = null;
   session = null;
   return true;
 }
@@ -475,7 +515,7 @@ async function installWhenReady(options, attempts = 20, delayMilliseconds = 200)
     // eslint-disable-next-line no-await-in-loop
     await new Promise((resolve) => { setTimeout(resolve, delayMilliseconds); });
   }
-  throw new Error('Could not replace ChatGPT’s model selector with Patchwork’s selector.');
+  throw new Error('Could not replace the model selector.');
 }
 
 module.exports = {

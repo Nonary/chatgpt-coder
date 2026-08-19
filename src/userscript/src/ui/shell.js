@@ -2,6 +2,7 @@ const styles = require('./styles.css');
 const {
   clear, h, replace, svg,
 } = require('./dom');
+const { observeTheme } = require('./theme');
 
 const HOST_ID = 'patchwork-root';
 const WIDTH_KEY = 'patchwork.dock-width';
@@ -66,7 +67,7 @@ function writeStorage(key, value) {
   }
 }
 
-// Everything Patchwork renders lives in a shadow root, and its stylesheet is
+// Everything the panel renders lives in a shadow root, and its stylesheet is
 // adopted through CSSOM rather than a <style> tag so the page's style-src CSP
 // can never suppress it.
 class Shell {
@@ -91,13 +92,13 @@ class Shell {
 
     this.launcher = h(
       'button',
-      { class: 'launcher', title: 'Open Patchwork', onclick: () => this.open() },
-      svg(ICONS.tasks, { size: 15 }),
-      'Patchwork',
+      { class: 'launcher', title: 'Open workspace', onclick: () => this.open() },
+      svg(ICONS.layout, { size: 16 }),
+      'Workspace',
       this.launcherBadge = h('span', { class: 'badge', hidden: true }, '0'),
     );
 
-    this.grip = h('div', { class: 'grip', title: 'Resize Patchwork' });
+    this.grip = h('div', { class: 'grip', title: 'Resize the panel' });
     this.navBar = h('nav', { class: 'nav' });
     this.viewport = h('div', { class: 'viewport', style: { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column', position: 'relative' } });
 
@@ -105,24 +106,19 @@ class Shell {
     this.header = h(
       'header',
       { class: 'dock-header' },
-      h(
-        'div',
-        { class: 'brand' },
-        h('div', { class: 'brand-mark' }, 'P'),
-        h('div', { class: 'brand-text' }, h('strong', {}, 'Patchwork'), this.statusDot),
-      ),
+      h('div', { class: 'panel-title' }, h('strong', {}, 'Workspace'), this.statusDot),
       h('div', { class: 'spacer' }),
       this.layoutButton = h('button', {
         class: 'icon-button',
         title: 'Dock covers the page instead',
         onclick: () => this.toggleLayoutMode(),
-      }, svg(ICONS.layout, { size: 14 })),
+      }, svg(ICONS.layout, { size: 18 })),
       h('button', {
         class: 'icon-button', title: 'Toggle wide view', onclick: () => this.toggleExpanded(),
-      }, svg(ICONS.expand, { size: 14 })),
+      }, svg(ICONS.expand, { size: 18 })),
       h('button', {
-        class: 'icon-button', title: 'Hide Patchwork', onclick: () => this.close(),
-      }, svg(ICONS.close, { size: 14 })),
+        class: 'icon-button', title: 'Hide the workspace', onclick: () => this.close(),
+      }, svg(ICONS.close, { size: 18 })),
     );
 
     this.dock = h('aside', { class: 'dock', hidden: true }, this.grip, this.header, this.navBar, this.viewport);
@@ -199,14 +195,9 @@ class Shell {
   }
 
   syncTheme() {
-    const update = () => {
-      const dark = document.documentElement.classList.contains('dark')
-        || matchMedia('(prefers-color-scheme: dark)').matches;
+    this.stopThemeWatch = observeTheme((dark) => {
       this.host.classList.toggle('patchwork-light', !dark);
-    };
-    update();
-    new MutationObserver(update).observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
-    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', update);
+    });
   }
 
   applyWidth(width) {
@@ -267,7 +258,7 @@ class Shell {
       const button = h(
         'button',
         { dataset: { view: id }, onclick: () => this.show(id) },
-        icon ? svg(ICONS[icon] || icon, { size: 13 }) : null,
+        icon ? svg(ICONS[icon] || icon, { size: 16 }) : null,
         label,
         count,
       );
@@ -347,7 +338,7 @@ class Shell {
         h('div', { class: 'spacer', style: { flex: '1' } }),
         h('button', {
           class: 'icon-button', title: 'Close', onclick: () => handle.close(),
-        }, svg(ICONS.close, { size: 14 })),
+        }, svg(ICONS.close, { size: 18 })),
       ),
       h('div', { class: 'modal-body' }, body),
       footer ? h('div', { class: 'modal-footer' }, footer) : null,
@@ -382,6 +373,7 @@ class Shell {
   }
 
   destroy() {
+    this.stopThemeWatch?.();
     document.documentElement.classList.remove('patchwork-pushed');
     document.documentElement.style.removeProperty('--patchwork-dock-width');
     document.adoptedStyleSheets = document.adoptedStyleSheets.filter((sheet) => sheet !== this.pageSheet);

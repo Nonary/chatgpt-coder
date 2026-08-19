@@ -57,7 +57,7 @@ async function waitForComposer(timeoutMilliseconds = 15_000) {
 
 function setPrompt(prompt) {
   const composer = findComposer();
-  if (!composer) throw new Error('Could not find ChatGPT’s prompt composer. Reload the page and try again.');
+  if (!composer) throw new Error('Could not find the prompt composer. Reload the page and try again.');
   composer.focus();
   if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
     const prototype = composer instanceof HTMLTextAreaElement
@@ -104,7 +104,7 @@ async function requireFileInput() {
   if (input) return input;
   await openAttachmentMenu();
   input = findFileInput();
-  if (!input) throw new Error('Could not locate ChatGPT’s attachment input. Reload the page and try again.');
+  if (!input) throw new Error('Could not locate the attachment input. Reload the page and try again.');
   return input;
 }
 
@@ -210,7 +210,7 @@ async function waitForAttachment(filename, timeoutMilliseconds = 120_000) {
     }
     await delay(500);
   }
-  throw new Error(`ChatGPT did not confirm the attachment ${filename}. Nothing was submitted.`);
+  throw new Error(`The attachment ${filename} was never confirmed. Nothing was sent.`);
 }
 
 function sendButtonState(allowClick) {
@@ -252,8 +252,8 @@ async function clickSend({ isConversationOpen, timeoutMilliseconds = 90_000 } = 
     await delay(clicked ? 250 : 500);
   }
   throw new Error(clicked
-    ? 'ChatGPT did not start the conversation after Send. The composer may still be processing the attachment.'
-    : 'ChatGPT did not enable the Send button. The attachment may still be uploading.');
+    ? 'The conversation did not start after Send. The composer may still be processing the attachment.'
+    : 'The Send button never became enabled. The attachment may still be uploading.');
 }
 
 module.exports = {

@@ -20,7 +20,7 @@ function openConflictResolution({ shell, task, onSubmit }) {
     class: 'field-control',
     rows: 7,
     maxlength: 12_000,
-    placeholder: 'Add any context, constraints, or specific files you want ChatGPT to consider while resolving the conflict.',
+    placeholder: 'Add any context, constraints, or specific files to consider while resolving the conflict.',
   });
   const status = h('span', { class: 'field-help' }, '');
 
@@ -45,7 +45,7 @@ function openConflictResolution({ shell, task, onSubmit }) {
 
   const conflict = task.result?.conflicts?.[0];
   const handle = shell.modal({
-    title: 'Resolve this result with ChatGPT',
+    title: 'Resolve this result in a new chat',
     width: '620px',
     body: [
       h('div', { class: 'banner' }, task.error || 'The result could not be applied cleanly.'),
@@ -65,7 +65,7 @@ function openConflictResolution({ shell, task, onSubmit }) {
         h('label', { class: 'field', style: { flex: '1' } }, h('span', {}, 'Reasoning'), reasoningSelect),
       ),
       h('label', { class: 'field' }, h('span', {}, 'Additional instructions'), instructions),
-      h('p', { class: 'field-help' }, 'Patchwork sends the current dirty target, CONFLICTS.md, the original result patch, and the original attachments.'),
+      h('p', { class: 'field-help' }, 'The follow-up carries the current dirty target, CONFLICTS.md, the original result patch, and the original attachments.'),
     ],
     footer: [
       status,

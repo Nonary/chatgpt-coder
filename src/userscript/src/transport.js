@@ -59,8 +59,8 @@ function createGmTransport({ origin, token }) {
             text: options.responseType === 'arraybuffer' ? null : response.responseText,
             buffer: options.responseType === 'arraybuffer' ? response.response : null,
           }),
-          onerror: () => reject(new Error('The Patchwork agent is not reachable. Is `pnpm agent` running?')),
-          ontimeout: () => reject(new Error('The Patchwork agent did not respond in time.')),
+          onerror: () => reject(new Error('The local agent is not reachable. Is `pnpm agent` running?')),
+          ontimeout: () => reject(new Error('The local agent did not respond in time.')),
         });
       });
     },
@@ -138,9 +138,9 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
       'patchwork-bridge',
       'width=460,height=340',
     );
-    if (!popup) return Promise.reject(new Error('The browser blocked the Patchwork bridge window. Allow pop-ups for chatgpt.com.'));
+    if (!popup) return Promise.reject(new Error('The browser blocked the agent bridge window. Allow pop-ups for chatgpt.com.'));
     ready = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('The Patchwork bridge window did not respond.')), 15_000);
+      const timer = setTimeout(() => reject(new Error('The agent bridge window did not respond.')), 15_000);
       const onMessage = (event) => {
         if (event.data?.channel !== BRIDGE_CHANNEL || event.data.type !== 'ready') return;
         clearTimeout(timer);
@@ -198,7 +198,7 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
-          reject(new Error('The Patchwork bridge did not answer in time.'));
+          reject(new Error('The agent bridge did not answer in time.'));
         }, options.timeout || DEFAULT_TIMEOUT);
         const settle = (handler) => (value) => { clearTimeout(timer); handler(value); };
         pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
@@ -211,7 +211,7 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
 async function probe(transport) {
   const response = await transport.request({ path: '/health', timeout: 4_000 });
   const payload = JSON.parse(response.text || '{}');
-  if (!payload.ok) throw new Error('The Patchwork agent answered unexpectedly.');
+  if (!payload.ok) throw new Error('The local agent answered unexpectedly.');
   return payload;
 }
 

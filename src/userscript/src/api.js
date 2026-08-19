@@ -24,16 +24,16 @@ class Api {
   async call(method, path, body, options = {}) {
     const response = await this.transport.request({ method, path, body, ...options });
     if (options.responseType === 'arraybuffer') {
-      if (response.status >= 400) throw new AgentError('The Patchwork agent could not return that file.', response.status);
+      if (response.status >= 400) throw new AgentError('The local agent could not return that file.', response.status);
       return response.buffer;
     }
     let payload = {};
     try {
       payload = response.text ? JSON.parse(response.text) : {};
     } catch {
-      throw new AgentError('The Patchwork agent returned a malformed response.', response.status);
+      throw new AgentError('The local agent returned a malformed response.', response.status);
     }
-    if (response.status >= 400) throw new AgentError(payload.error || 'The Patchwork agent rejected that request.', response.status);
+    if (response.status >= 400) throw new AgentError(payload.error || 'The local agent rejected that request.', response.status);
     return payload;
   }
 

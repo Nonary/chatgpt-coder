@@ -25,7 +25,7 @@ function openSkillDrawer({
       || `${skill.name} ${skill.description} ${skill.provider} ${skill.location}`.toLowerCase().includes(term));
     if (matching.length === 0) {
       replace(list, h('div', { class: 'empty-state' }, skills.length === 0
-        ? 'No local skills were discovered. Patchwork looks for directories containing SKILL.md.'
+        ? 'No local skills were discovered. Any directory containing SKILL.md qualifies.'
         : 'No skills match that search.'));
       return;
     }
@@ -82,7 +82,7 @@ function openSkillDrawer({
     title: 'Choose skills',
     width: '620px',
     body: [
-      h('p', { class: 'field-help' }, 'Selected skill directories are copied into the task package under skills/. ChatGPT is told to use them only when relevant.'),
+      h('p', { class: 'field-help' }, 'Selected skill directories are copied into the task package under skills/, and are loaded only when relevant.'),
       h(
         'div',
         { class: 'row' },

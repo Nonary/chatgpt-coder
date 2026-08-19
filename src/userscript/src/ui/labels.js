@@ -1,5 +1,5 @@
 const MODEL_LABELS = {
-  default: 'ChatGPT default',
+  default: 'Default',
   sol: 'GPT-5.6 Sol',
   luna: 'GPT-5.6 Luna',
 };
@@ -26,14 +26,14 @@ const STATE_LABELS = {
 };
 
 const STATUS_TEXT = {
-  prepared: ['Package prepared', 'Submit this task to ChatGPT when you are ready.'],
-  submitted: ['Task is running', 'ChatGPT is still working. Patchwork is watching the conversation for the result file.'],
+  prepared: ['Package prepared', 'Send this task when you are ready.'],
+  submitted: ['Task is running', 'Still generating. The conversation is being watched for the result file.'],
   ready: ['Waiting to apply', 'The plain-text result is validated and waiting for you to apply it.'],
-  conflicted: ['Conflict needs resolution', 'Clean up the task target and retry the apply, or send a resolution task to ChatGPT to preserve both versions.'],
+  conflicted: ['Conflict needs resolution', 'Clean up the task target and retry the apply, or send a resolution task to preserve both versions.'],
   resolved: ['Conflict resolved', 'The original task conflict was resolved by a follow-up task.'],
   applied: ['Changes applied', 'The validated patch has been applied to the task target.'],
   'rolled-back': ['Changes reverted', 'The changes from this task were reverted.'],
-  failed: ['Task needs attention', 'Patchwork stopped before making unsafe or conflicting changes.'],
+  failed: ['Task needs attention', 'Stopped before making unsafe or conflicting changes.'],
 };
 
 function taskLabel(task) {
@@ -49,29 +49,29 @@ function taskStateLabel(task) {
   if (task.summaryOnly) {
     if (task.state === 'completed') return 'Summary applied';
     if (task.state === 'ready') return 'Summary ready';
-    if (task.state === 'submitted' && task.chatStatus === 'completed') return 'ChatGPT finished';
-    if (task.state === 'submitted' && task.chatStatus === 'failed') return 'ChatGPT stopped';
+    if (task.state === 'submitted' && task.chatStatus === 'completed') return 'Response complete';
+    if (task.state === 'submitted' && task.chatStatus === 'failed') return 'Generation stopped';
     if (task.state === 'submitted') return 'Generating summary';
     if (task.state === 'prepared') return 'Preparing summary';
   }
-  if (task.state === 'submitted' && task.chatStatus === 'completed') return 'ChatGPT finished';
-  if (task.state === 'submitted' && task.chatStatus === 'failed') return 'ChatGPT stopped';
+  if (task.state === 'submitted' && task.chatStatus === 'completed') return 'Response complete';
+  if (task.state === 'submitted' && task.chatStatus === 'failed') return 'Generation stopped';
   return STATE_LABELS[task.state] || task.state;
 }
 
 function taskStatusText(task) {
   if (task.answerOnly) {
     if (task.state === 'completed') {
-      return ['Answer complete', 'ChatGPT finished its detailed response in the conversation.'];
+      return ['Answer complete', 'The detailed response is finished in the conversation.'];
     }
     if (task.state === 'submitted' && task.chatStatus === 'failed') {
-      return ['ChatGPT stopped', 'ChatGPT reported a generation failure before completing the answer.'];
+      return ['Generation stopped', 'Generation failed before the answer was complete.'];
     }
     if (task.state === 'submitted') {
-      return ['Answer is running', 'ChatGPT is working on the response. No Patchwork result file is expected.'];
+      return ['Answer is running', 'The response is still generating. No result file is expected.'];
     }
     if (task.state === 'prepared') {
-      return ['Answer task prepared', 'Submit this read-only question to ChatGPT when you are ready.'];
+      return ['Answer task prepared', 'Send this read-only question when you are ready.'];
     }
   }
   if (task.summaryOnly) {
@@ -82,23 +82,23 @@ function taskStatusText(task) {
       return ['Git Summary ready', 'Review the message below, then use it in Source Control to complete this task.'];
     }
     if (task.state === 'submitted' && task.chatStatus === 'completed') {
-      return ['ChatGPT finished', 'ChatGPT finished generating the summary. Patchwork is downloading the result file.'];
+      return ['Response complete', 'The summary is finished. The result file is downloading.'];
     }
     if (task.state === 'submitted' && task.chatStatus === 'failed') {
-      return ['Git Summary stopped', 'ChatGPT reported a generation failure for this summary.'];
+      return ['Git Summary stopped', 'Generation failed for this summary.'];
     }
     if (task.state === 'submitted') {
-      return ['Generating Git Summary', 'Patchwork is monitoring the conversation and result file.'];
+      return ['Generating Git Summary', 'Monitoring the conversation and result file.'];
     }
     if (task.state === 'prepared') {
-      return ['Preparing Git Summary', 'Patchwork packaged the current working changes and is ready to send them.'];
+      return ['Preparing Git Summary', 'The current working changes are packaged and ready to send.'];
     }
   }
   if (task.state === 'submitted' && task.chatStatus === 'completed') {
-    return ['ChatGPT finished', 'ChatGPT finished generating this task. Patchwork is checking for the result file.'];
+    return ['Response complete', 'Generation is finished. Checking for the result file.'];
   }
   if (task.state === 'submitted' && task.chatStatus === 'failed') {
-    return ['ChatGPT stopped', 'ChatGPT reported a generation failure for this task.'];
+    return ['Generation stopped', 'Generation failed for this task.'];
   }
   return STATUS_TEXT[task.state] || STATUS_TEXT.prepared;
 }
@@ -122,7 +122,7 @@ function taskConfigurationLabel(task) {
 
 function treeStateLabel(tree) {
   if (!tree.available) return tree.error || 'Unavailable';
-  if (tree.mergeState === 'submitted') return 'Merging in ChatGPT';
+  if (tree.mergeState === 'submitted') return 'Merging in chat';
   if (tree.mergeState === 'failed') return 'Merge failed';
   if (!tree.clean) return 'Has uncommitted changes';
   return `${tree.commitCount || 0} commit${tree.commitCount === 1 ? '' : 's'}`;

@@ -25,15 +25,15 @@ async function readSession(force = false) {
     cache: 'no-store',
     headers: { Accept: 'application/json' },
   });
-  if (!response.ok) throw new Error('Sign in to ChatGPT before using Patchwork.');
+  if (!response.ok) throw new Error('Sign in before using the workspace.');
   let session;
   try {
     session = await response.json();
   } catch {
-    throw new Error('Sign in to ChatGPT before using Patchwork.');
+    throw new Error('Sign in before using the workspace.');
   }
   const accessToken = session?.accessToken || session?.access_token;
-  if (!accessToken) throw new Error('Sign in to ChatGPT before using Patchwork.');
+  if (!accessToken) throw new Error('Sign in before using the workspace.');
   cached = {
     accessToken,
     accountId: session?.account?.id || session?.accountId || null,

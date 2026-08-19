@@ -99,7 +99,7 @@ function installInterceptor() {
 
     if (isConversation && active.packageFilename
       && !conversationRequestIncludesAttachment(rewritten.text, active.packageFilename)) {
-      const message = `ChatGPT's outgoing request did not include the task ZIP attachment (${active.packageFilename}).`;
+      const message = `The outgoing request did not include the task ZIP attachment (${active.packageFilename}).`;
       active.settle({ ok: false, retrySubmission: true, error: message });
       throw new DOMException(message, 'AbortError');
     }
@@ -194,14 +194,14 @@ function beginEnforcement({ configuration, packageFilename = null }) {
     async wait(timeoutMilliseconds = 45_000) {
       const timeout = new Promise((resolve) => {
         const timer = setTimeout(
-          () => resolve({ ok: false, error: 'ChatGPT did not send a conversation request after Send.' }),
+          () => resolve({ ok: false, error: 'No conversation request was sent after Send.' }),
           timeoutMilliseconds,
         );
         resultPromise.then(() => clearTimeout(timer));
       });
       const result = await Promise.race([resultPromise, timeout]);
       if (!result.ok) {
-        const error = new Error(result.error || 'Could not verify ChatGPT’s outgoing model request.');
+        const error = new Error(result.error || 'Could not verify the outgoing model request.');
         error.retrySubmission = Boolean(result.retrySubmission);
         throw error;
       }

@@ -80,13 +80,13 @@ class Driver {
       type: 'automation-started',
       taskId: task.taskId,
       message: task.summaryOnly
-        ? 'Opening a ChatGPT chat for the Git Summary request…'
-        : 'Opening a ChatGPT chat for this task…',
+        ? 'Opening a chat for the Git Summary request…'
+        : 'Opening a chat for this task…',
     });
 
     if (attempt === 0) await navigate.openFreshChat(destination);
     if (!await composer.waitForComposer()) {
-      throw new Error('ChatGPT is not ready. Sign in and try again.');
+      throw new Error('Not signed in. Sign in and try again.');
     }
 
     // The composer's Patchwork picker is the live source of truth: whatever it
@@ -128,7 +128,7 @@ class Driver {
         await composer.waitForAttachment(attachment.name);
       }
 
-      this.report({ type: 'automation-progress', taskId: task.taskId, message: 'Sending the task to ChatGPT…' });
+      this.report({ type: 'automation-progress', taskId: task.taskId, message: 'Sending the task…' });
       await composer.clickSend({
         isConversationOpen: () => Boolean(conversationIdFromRouteUrl(location.href)),
       });
@@ -140,7 +140,7 @@ class Driver {
     this.report({
       type: 'task-request-verified',
       taskId: task.taskId,
-      message: `Verified ChatGPT request from ${verified.selectionSource === 'patchwork-selector' ? 'the composer picker' : 'the saved task'}: ${verified.model}${verified.thinkingEffort ? ` · ${verified.thinkingEffort}` : ''}.`,
+      message: `Verified request from ${verified.selectionSource === 'patchwork-selector' ? 'the composer picker' : 'the saved task'}: ${verified.model}${verified.thinkingEffort ? ` · ${verified.thinkingEffort}` : ''}.`,
     });
 
     // ChatGPT's own send request answers with an event stream that names the new
@@ -149,7 +149,7 @@ class Driver {
     const routeUrl = await navigate.waitForConversationUrl(streamedId ? 8_000 : 45_000);
     const conversationUrl = routeUrl || (streamedId ? `${CHATGPT_ORIGIN}/c/${streamedId}` : null);
     if (!conversationUrl) {
-      throw new Error('Patchwork could not confirm a ChatGPT conversation after Send.');
+      throw new Error('No conversation could be confirmed after Send.');
     }
     const { task: submitted } = await this.api.taskSubmitted(task.taskId, {
       conversationUrl,
@@ -168,7 +168,7 @@ class Driver {
     this.activeMerge = { treeId: request.treeId, resultFilename: request.resultFilename };
     await navigate.openFreshChat(request.chatgptProject);
     if (!await composer.waitForComposer()) {
-      throw new Error('ChatGPT is not ready. Sign in and try again.');
+      throw new Error('Not signed in. Sign in and try again.');
     }
     composer.setPrompt(request.prompt);
     await composer.clickSend({
@@ -267,9 +267,9 @@ class Driver {
   // Used by Retry apply: re-reads the saved conversation before reapplying.
   async refreshTaskResult(task) {
     const conversationId = this.conversationIdFor(task);
-    if (!conversationId) throw new Error('This task has no ChatGPT conversation to re-read.');
+    if (!conversationId) throw new Error('This task has no conversation to re-read.');
     const updated = await this.ingestTaskResult(task, conversationId);
-    if (!updated) throw new Error('That ChatGPT conversation does not contain a Patchwork result file yet.');
+    if (!updated) throw new Error('That conversation does not contain a result file yet.');
     return updated;
   }
 

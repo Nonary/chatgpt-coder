@@ -96,7 +96,7 @@ async function openFreshChat(project = null, pending = null) {
 
 async function openConversation(conversationUrl) {
   if (!isChatGPTConversationUrl(conversationUrl)) {
-    throw new Error('This task has an invalid saved ChatGPT conversation URL.');
+    throw new Error('This task has an invalid saved conversation URL.');
   }
   const targetId = conversationIdFromRouteUrl(conversationUrl);
   const openId = conversationIdFromRouteUrl(location.href);

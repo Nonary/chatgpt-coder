@@ -193,7 +193,7 @@ function renderComposer(ctx) {
       },
     },
     option('', 'New chat (no project)', composer.projectSelection === ''),
-    option(NEW_PROJECT_VALUE, 'Create a new ChatGPT project', composer.projectSelection === NEW_PROJECT_VALUE),
+    option(NEW_PROJECT_VALUE, 'Create a new project', composer.projectSelection === NEW_PROJECT_VALUE),
     ...state.projects.map((project) => option(project.id, project.name, composer.projectSelection === project.id)),
   );
 
@@ -201,7 +201,7 @@ function renderComposer(ctx) {
     type: 'text',
     class: 'field-control',
     maxlength: 100,
-    placeholder: 'For example: Patchwork tasks',
+    placeholder: 'For example: Coding tasks',
     value: composer.newProjectName,
     oninput: () => ctx.store.setComposer({ newProjectName: newProjectName.value }, 'silent'),
   });
@@ -209,7 +209,7 @@ function renderComposer(ctx) {
   const createButton = h('button', {
     class: 'primary wide',
     onclick: () => ctx.actions.createTask({ submit: true }),
-  }, 'Package and send to ChatGPT');
+  }, 'Package and send');
 
   return [
     h(
@@ -250,12 +250,12 @@ function renderComposer(ctx) {
         }, 'Manage'),
       ),
       selectedPrompts.length ? promptChips : null,
-      h('label', { class: 'field' }, h('span', {}, 'What should ChatGPT do?'), taskText),
+      h('label', { class: 'field' }, h('span', {}, 'Instructions'), taskText),
       h(
         'label',
         { class: 'row', style: { gap: '8px' } },
         answerOnlyCheckbox,
-        h('span', { class: 'field-help' }, 'Answer only — respond in the chat without generating a Patchwork result file or making changes'),
+        h('span', { class: 'field-help' }, 'Answer only — respond in the chat without generating a result file or making changes'),
       ),
       h(
         'div',
@@ -283,11 +283,11 @@ function renderComposer(ctx) {
     h(
       'div',
       { class: 'card' },
-      h('h3', {}, 'Where ChatGPT runs it'),
+      h('h3', {}, 'Destination'),
       h(
         'div',
         { class: 'row' },
-        h('label', { class: 'field', style: { flex: '1' } }, h('span', {}, 'ChatGPT destination'), projectSelect),
+        h('label', { class: 'field', style: { flex: '1' } }, h('span', {}, 'Where it runs'), projectSelect),
         h('button', {
           class: 'secondary',
           style: { alignSelf: 'flex-end' },

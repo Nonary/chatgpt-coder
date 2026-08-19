@@ -120,7 +120,7 @@ function renderResultCard(ctx, task) {
       ? h('button', { class: 'primary', onclick: () => ctx.actions.retryApply(task.taskId) }, 'Retry apply')
       : null,
     task.state === 'conflicted'
-      ? h('button', { class: 'secondary', onclick: () => ctx.actions.resolveConflict(task.taskId) }, 'Resolve with ChatGPT')
+      ? h('button', { class: 'secondary', onclick: () => ctx.actions.resolveConflict(task.taskId) }, 'Resolve in a new chat')
       : null,
     task.state === 'applied'
       ? h('button', { class: 'danger', onclick: () => ctx.actions.rollbackTask(task.taskId) }, 'Roll back')
@@ -131,7 +131,7 @@ function renderResultCard(ctx, task) {
     'div',
     { class: 'card' },
     h('h3', {}, 'Result'),
-    h('p', { class: 'muted', style: { margin: '0' } }, task.result.summary || 'ChatGPT returned a validated result.'),
+    h('p', { class: 'muted', style: { margin: '0' } }, task.result.summary || 'The returned result passed validation.'),
     patches,
     actions,
   );
@@ -150,7 +150,7 @@ function renderTaskDetail(ctx, task) {
     'div',
     { class: 'row wrap' },
     !task.summaryOnly && ['prepared', 'failed'].includes(task.state)
-      ? h('button', { class: 'primary', onclick: () => ctx.actions.submitTask(task.taskId) }, 'Send to ChatGPT')
+      ? h('button', { class: 'primary', onclick: () => ctx.actions.submitTask(task.taskId) }, 'Send')
       : null,
     task.conversationUrl
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.openConversation(task.taskId) }, 'Open conversation')

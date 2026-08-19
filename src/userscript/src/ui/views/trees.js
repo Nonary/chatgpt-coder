@@ -23,7 +23,7 @@ function renderTrees(ctx) {
       h('button', {
         class: 'icon-button',
         style: { alignSelf: 'flex-end' },
-        title: 'Refresh ChatGPT projects',
+        title: 'Refresh projects',
         onclick: () => ctx.actions.refreshProjects(true),
       }, '↻'),
     ),
@@ -69,7 +69,7 @@ function renderTrees(ctx) {
           onclick: () => ctx.actions.revealTree(tree.id),
         }, 'Reveal'),
         tree.mergeState === 'failed'
-          ? h('button', { class: 'primary', onclick: () => ctx.actions.resolveTreeMerge(tree.id) }, 'Resolve with ChatGPT')
+          ? h('button', { class: 'primary', onclick: () => ctx.actions.resolveTreeMerge(tree.id) }, 'Resolve in a new chat')
           : h('button', {
             class: 'primary',
             disabled: !tree.available || !tree.clean || (tree.commitCount || 0) === 0 || tree.mergeState === 'submitted',
