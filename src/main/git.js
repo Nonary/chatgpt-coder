@@ -128,9 +128,10 @@ async function inspectRepositoryGraph(selectedPaths) {
       try {
         const resolvedChildPath = await fs.realpath(childPath);
         child = await inspectRepository(childPath);
-        if (child.path !== resolvedChildPath) throw new Error('Submodule checkout is not initialized.');
+        if (child.path !== resolvedChildPath) continue;
       } catch {
-        throw new Error(`Initialize submodule ${definition.path} in ${repository.name} before using it with Patchwork.`);
+        // Match the bundle exporter: uninitialized or missing submodules are skipped.
+        continue;
       }
       await visit(child.path, {
         parentPath: repository.path,

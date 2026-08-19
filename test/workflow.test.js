@@ -99,6 +99,34 @@ async function ingestDownloadedText(results, tasks, task, text) {
   return results.ingestTextFile(task.taskId, downloadedPath);
 }
 
+test('task packaging skips uninitialized submodules instead of blocking submission', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-uninitialized-submodule-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const childPath = await createNamedRepository(root, 'child-repository', 'child.txt', 'child\n');
+  const parentPath = await createNamedRepository(root, 'parent-repository', 'parent.txt', 'parent\n');
+  await runGit(parentPath, [
+    '-c', 'protocol.file.allow=always', 'submodule', 'add', childPath, 'modules/child',
+  ]);
+  await runGit(parentPath, ['commit', '-am', 'Add child submodule']);
+  await runGit(parentPath, ['submodule', 'deinit', '-f', '--', 'modules/child']);
+
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([parentPath]))[0];
+  assert.equal(repository.path, await fs.realpath(parentPath));
+
+  const task = await tasks.createTask({
+    taskText: 'Update the parent repository.',
+    repositories: [repository],
+  });
+
+  assert.equal(task.repositories.length, 1);
+  assert.equal(task.repositories[0].path, await fs.realpath(parentPath));
+  const manifest = JSON.parse((new AdmZip(task.packagePath)).getEntry('manifest.json').getData().toString('utf8'));
+  assert.equal(manifest.repositories.length, 1);
+  assert.equal(manifest.repositories[0].path, await fs.realpath(parentPath));
+});
+
 test('Git Summary prompts use the saved prompt when present and the built-in prompt otherwise', () => {
   assert.equal(resolveGitSummaryPrompt('  Review these changes.  '), 'Review these changes.');
   assert.equal(resolveGitSummaryPrompt('\r\n'), DEFAULT_GIT_SUMMARY_PROMPT);
