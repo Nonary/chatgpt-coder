@@ -1,0 +1,503 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { test } = require('node:test');
+
+const gitConfigPath = path.join(os.tmpdir(), 'patchwork-agent-test-gitconfig');
+require('node:fs').writeFileSync(gitConfigPath, '[core]\n\tautocrlf = false\n\teol = lf\n');
+process.env.GIT_CONFIG_GLOBAL = gitConfigPath;
+process.env.GIT_CONFIG_SYSTEM = gitConfigPath;
+
+const { isAllowedOrigin, loadConfig } = require('../src/agent/config');
+const { EventLog } = require('../src/agent/events');
+const { FsService } = require('../src/agent/services/fs-service');
+const { PromptService, appendPromptInstructions, normalizePrompt } = require('../src/agent/services/prompt-service');
+const { Router } = require('../src/agent/router');
+const { runGit } = require('../src/agent/services/git');
+const { startServer } = require('../src/agent/server');
+const { installPage, bookmarkletSource, bridgePage } = require('../src/agent/install');
+
+async function createRepository(root, name = 'sample-repository') {
+  const repositoryPath = path.join(root, name);
+  await fs.mkdir(repositoryPath, { recursive: true });
+  await runGit(repositoryPath, ['init', '-b', 'main']);
+  await runGit(repositoryPath, ['config', 'user.email', 'patchwork@example.invalid']);
+  await runGit(repositoryPath, ['config', 'user.name', 'Patchwork Test']);
+  await runGit(repositoryPath, ['config', 'core.autocrlf', 'false']);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'hello\n');
+  await runGit(repositoryPath, ['add', 'hello.txt']);
+  await runGit(repositoryPath, ['commit', '-m', 'Initial commit']);
+  return repositoryPath;
+}
+
+async function startAgent(context) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-'));
+  const config = await loadConfig({ dataRoot: root, port: 0 });
+  const started = await startServer(config);
+  const { port } = started.server.address();
+  context.after(async () => {
+    await new Promise((resolve) => started.server.close(resolve));
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  const call = async (method, route, body, headers = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...headers,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = { raw: text };
+    }
+    return { status: response.status, payload, response };
+  };
+
+  return {
+    root, config, port, call, context: started.context,
+  };
+}
+
+test('the agent refuses every workspace route without its token and allows only ChatGPT origins', async (context) => {
+  const agent = await startAgent(context);
+
+  const unauthenticated = await fetch(`http://127.0.0.1:${agent.port}/v1/tasks`);
+  assert.equal(unauthenticated.status, 401);
+  assert.match((await unauthenticated.json()).error, /token is missing or incorrect/);
+
+  const wrongToken = await agent.call('GET', '/v1/tasks', undefined, { Authorization: 'Bearer not-the-token' });
+  assert.equal(wrongToken.status, 401);
+
+  const health = await fetch(`http://127.0.0.1:${agent.port}/health`);
+  assert.equal(health.status, 200, 'health is public so the page can probe transports cheaply');
+  assert.equal((await health.json()).ok, true);
+
+  assert.equal(isAllowedOrigin('https://chatgpt.com'), true);
+  assert.equal(isAllowedOrigin('https://chat.openai.com'), true);
+  assert.equal(isAllowedOrigin('http://127.0.0.1:8787'), true);
+  assert.equal(isAllowedOrigin('https://evil.example'), false);
+  assert.equal(isAllowedOrigin('null'), false);
+  assert.equal(isAllowedOrigin(undefined), false);
+});
+
+test('preflight answers the Private Network Access and embedder policy checks chatgpt.com needs', async (context) => {
+  const agent = await startAgent(context);
+  const response = await fetch(`http://127.0.0.1:${agent.port}/v1/tasks`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://chatgpt.com',
+      'Access-Control-Request-Method': 'GET',
+      'Access-Control-Request-Private-Network': 'true',
+    },
+  });
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get('access-control-allow-origin'), 'https://chatgpt.com');
+  assert.equal(response.headers.get('access-control-allow-private-network'), 'true');
+  assert.equal(response.headers.get('cross-origin-resource-policy'), 'cross-origin');
+  assert.match(response.headers.get('access-control-allow-headers'), /Authorization/);
+
+  const foreign = await fetch(`http://127.0.0.1:${agent.port}/health`, { headers: { Origin: 'https://evil.example' } });
+  assert.equal(foreign.headers.get('access-control-allow-origin'), null, 'unknown origins get no CORS grant');
+});
+
+test('unknown routes and wrong methods are reported distinctly', async (context) => {
+  const agent = await startAgent(context);
+  const missing = await agent.call('GET', '/v1/nope');
+  assert.equal(missing.status, 404);
+  const wrongMethod = await agent.call('POST', '/v1/trees');
+  assert.equal(wrongMethod.status, 405);
+  assert.match(wrongMethod.payload.error, /not allowed/);
+});
+
+test('a task travels create, download, submit, result, and apply entirely over HTTP', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-repo-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const added = await agent.call('POST', '/v1/workspace/repositories', { paths: [repositoryPath] });
+  assert.equal(added.status, 200);
+  assert.equal(added.payload.repositories.length, 1);
+
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Add a goodbye file.',
+    repositories: [{ path: repositoryPath }],
+    model: 'sol',
+    reasoningMode: 'high',
+  });
+  assert.equal(created.status, 200);
+  const task = created.payload.task;
+  assert.equal(task.state, 'prepared');
+  assert.equal(task.model, 'sol');
+  assert.equal(task.reasoningMode, 'high');
+  assert.equal(task.resultFilename, `chatgpt-ide-result-${task.taskId}.txt`);
+
+  const zip = await fetch(`http://127.0.0.1:${agent.port}/v1/tasks/${task.taskId}/package`, {
+    headers: { Authorization: `Bearer ${agent.config.token}` },
+  });
+  assert.equal(zip.status, 200);
+  assert.equal(zip.headers.get('content-type'), 'application/zip');
+  const bytes = Buffer.from(await zip.arrayBuffer());
+  assert.ok(bytes.length > 0);
+  assert.equal(bytes.subarray(0, 2).toString('utf8'), 'PK', 'the page receives a real ZIP to attach');
+
+  const conversationUrl = 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  const submitted = await agent.call('POST', `/v1/tasks/${task.taskId}/submitted`, {
+    conversationUrl,
+    conversationId: '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+    conversationTitle: 'Add a goodbye file',
+  });
+  assert.equal(submitted.payload.task.state, 'submitted');
+  assert.equal(submitted.payload.task.chatStatus, 'streaming');
+
+  const rejected = await agent.call('POST', `/v1/tasks/${task.taskId}/submitted`, { conversationUrl: 'https://chatgpt.com/' });
+  assert.equal(rejected.status, 400, 'a task is never marked submitted without a real conversation');
+
+  const status = await agent.call('POST', `/v1/tasks/${task.taskId}/chat-status`, { status: 'COMPLETED' });
+  assert.equal(status.payload.task.chatStatus, 'completed');
+  assert.ok(status.payload.task.chatFinishedAt, 'the elapsed timer stops when ChatGPT finishes');
+
+  const patch = [
+    'diff --git a/goodbye.txt b/goodbye.txt',
+    'new file mode 100644',
+    'index 0000000..dd7e1c6',
+    '--- /dev/null',
+    '+++ b/goodbye.txt',
+    '@@ -0,0 +1 @@',
+    '+goodbye',
+    '',
+  ].join('\n');
+  const envelope = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Added goodbye.txt.',
+    commitMessage: 'feat(sample): add a goodbye file',
+    repositories: [{
+      id: task.repositories[0].id,
+      baseCommit: task.repositories[0].baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patch).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+
+  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(applied.status, 200);
+  assert.equal(applied.payload.task.state, 'applied', 'auto-apply runs as soon as the envelope validates');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'goodbye.txt'), 'utf8'), 'goodbye\n');
+
+  const rolledBack = await agent.call('POST', `/v1/tasks/${task.taskId}/rollback`);
+  assert.equal(rolledBack.payload.task.state, 'rolled-back');
+
+  const listed = await agent.call('GET', '/v1/tasks');
+  assert.equal(listed.payload.tasks.length, 1);
+  const deleted = await agent.call('DELETE', `/v1/tasks/${task.taskId}`);
+  assert.equal(deleted.payload.deleted, true);
+  assert.equal((await agent.call('GET', '/v1/tasks')).payload.tasks.length, 0);
+});
+
+test('a result envelope for a different task is refused before anything is applied', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-mismatch-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const { payload } = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Do something.',
+    repositories: [{ path: repositoryPath }],
+  });
+  const task = payload.task;
+  const envelope = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: '00000000-0000-4000-8000-000000000000',
+    status: 'completed',
+    summary: 'Wrong task.',
+    repositories: [],
+  })}\nPATCHWORK_RESULT_END`;
+
+  const rejected = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(rejected.status, 400);
+  assert.match(rejected.payload.error, /different Patchwork task/);
+  assert.equal((await agent.call('GET', `/v1/tasks/${task.taskId}`)).payload.task.state, 'failed');
+});
+
+test('uploaded attachments are staged on disk and reach the task package', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-upload-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const upload = await fetch(`http://127.0.0.1:${agent.port}/v1/uploads?name=${encodeURIComponent('notes: draft.txt')}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${agent.config.token}`, 'Content-Type': 'application/octet-stream' },
+    body: 'requirement one\n',
+  });
+  assert.equal(upload.status, 200);
+  const staged = await upload.json();
+  assert.equal(staged.name, 'notes_ draft.txt', 'unsafe filename characters are replaced');
+  assert.equal(await fs.readFile(staged.path, 'utf8'), 'requirement one\n');
+
+  const { payload } = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Use the attached notes.',
+    repositories: [{ path: repositoryPath }],
+    attachments: [{ path: staged.path }],
+  });
+  assert.equal(payload.task.attachments.length, 1);
+  assert.equal(payload.task.attachments[0].name, staged.name);
+
+  const download = await fetch(
+    `http://127.0.0.1:${agent.port}/v1/tasks/${payload.task.taskId}/attachments/${encodeURIComponent(staged.name)}`,
+    { headers: { Authorization: `Bearer ${agent.config.token}` } },
+  );
+  assert.equal(await download.text(), 'requirement one\n', 'the page can re-upload attachments to ChatGPT');
+});
+
+test('saved prompts live in the agent and are appended to the task text', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-prompts-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const saved = await agent.call('POST', '/v1/prompts', {
+    name: 'Accessibility review',
+    description: 'Keyboard and labels',
+    content: 'Check keyboard navigation and accessible names.',
+  });
+  assert.equal(saved.status, 200);
+  const promptId = saved.payload.prompt.id;
+
+  const duplicate = await agent.call('POST', '/v1/prompts', { name: 'accessibility review', content: 'Other text.' });
+  assert.equal(duplicate.status, 400);
+  assert.match(duplicate.payload.error, /already exists/);
+
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Improve the settings dialog.',
+    repositories: [{ path: repositoryPath }],
+    promptIds: [promptId],
+  });
+  assert.match(created.payload.task.taskText, /Improve the settings dialog\./);
+  assert.match(created.payload.task.taskText, /Additional instructions from the prompt library/);
+  assert.match(created.payload.task.taskText, /### Accessibility review/);
+
+  const removed = await agent.call('DELETE', `/v1/prompts/${promptId}`);
+  assert.deepEqual(removed.payload.prompts, []);
+});
+
+test('the Git summary route packages a read-only task using the saved Git Summary prompt', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-summary-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'hello again\n');
+
+  const empty = await agent.call('POST', '/v1/git-summary', { path: repositoryPath });
+  assert.equal(empty.status, 200);
+  assert.equal(empty.payload.task.summaryOnly, true);
+  assert.equal(empty.payload.task.model, 'luna');
+  assert.equal(empty.payload.task.reasoningMode, 'medium');
+  assert.equal(empty.payload.task.repositories[0].readOnly, true);
+  assert.equal(empty.payload.usedCustomPrompt, false);
+  assert.match(empty.payload.task.taskText, /Review all \*\*uncommitted Git changes\*\*/);
+
+  await agent.call('POST', '/v1/prompts', { name: 'Git Summary', content: 'Summarize the diff my way.' });
+  const custom = await agent.call('POST', '/v1/git-summary', { path: repositoryPath });
+  assert.equal(custom.payload.usedCustomPrompt, true);
+  assert.equal(custom.payload.task.taskText, 'Summarize the diff my way.');
+});
+
+test('the event log is replayed from a sequence so a page reload misses nothing', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-events-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  await agent.call('POST', '/v1/tasks', { taskText: 'One.', repositories: [{ path: repositoryPath }] });
+  const first = await agent.call('GET', '/v1/events?since=0&wait=false');
+  assert.ok(first.payload.events.length >= 1);
+  assert.equal(first.payload.events[0].type, 'task-prepared');
+  assert.equal(first.payload.events[0].seq, 1);
+
+  await agent.call('POST', '/v1/tasks', { taskText: 'Two.', repositories: [{ path: repositoryPath }] });
+  const second = await agent.call('GET', `/v1/events?since=${first.payload.seq}&wait=false`);
+  assert.ok(second.payload.events.every((event) => event.seq > first.payload.seq));
+  assert.equal((await agent.call('GET', '/v1/events?since=999&wait=false')).payload.events.length, 0);
+});
+
+test('event long-polling resolves as soon as an event arrives and otherwise times out empty', async () => {
+  const events = new EventLog();
+  const waiting = events.wait(0, 5_000);
+  events.emit({ type: 'task-prepared' });
+  const delivered = await waiting;
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].type, 'task-prepared');
+  assert.ok(delivered[0].at, 'events carry a timestamp for the activity feed');
+  assert.deepEqual(await events.wait(events.sequence, 20), []);
+  assert.deepEqual(events.since(0).map((event) => event.seq), [1]);
+});
+
+test('the filesystem service browses directories and finds repositories for the in-page picker', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-fs-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  await createRepository(path.join(root, 'projects'), 'alpha');
+  await fs.mkdir(path.join(root, 'projects', 'plain'), { recursive: true });
+  await fs.mkdir(path.join(root, 'projects', 'node_modules'), { recursive: true });
+
+  const service = new FsService();
+  const listing = await service.browse(path.join(root, 'projects'));
+  const names = listing.directories.map((entry) => entry.name).sort();
+  assert.deepEqual(names, ['alpha', 'node_modules', 'plain']);
+  assert.equal(listing.directories.find((entry) => entry.name === 'alpha').repository, true);
+  assert.equal(listing.directories.find((entry) => entry.name === 'plain').repository, false);
+  assert.ok(listing.parent, 'the picker can walk back up');
+  assert.ok(listing.roots.length > 0, 'the picker offers drive or filesystem roots');
+
+  const discovered = await service.discoverRepositories(root);
+  assert.deepEqual(discovered.map((entry) => entry.name), ['alpha']);
+  await assert.rejects(() => service.browse(path.join(root, 'missing')));
+});
+
+test('prompt records are normalized and clamped before they are stored', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-prompt-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  assert.equal(normalizePrompt({ name: '  ', content: 'x' }), null);
+  assert.equal(normalizePrompt({ name: 'x', content: '  ' }), null);
+  const normalized = normalizePrompt({ name: 'A'.repeat(80), content: 'body\r\nmore\r\n' });
+  assert.equal(normalized.name.length, 60);
+  assert.equal(normalized.content, 'body\nmore');
+  assert.match(normalized.id, /^prompt-/);
+
+  const service = new PromptService(root);
+  assert.deepEqual(await service.list(), []);
+  const saved = await service.save({ name: 'Git Summary', content: 'Summarize.' });
+  assert.equal(await service.gitSummaryPrompt(), 'Summarize.');
+  const updated = await service.save({ id: saved.id, name: 'Git Summary', content: 'Summarize better.' });
+  assert.equal(updated.id, saved.id);
+  assert.equal((await service.list()).length, 1);
+  assert.equal(await service.gitSummaryPrompt(), 'Summarize better.');
+  await assert.rejects(() => service.remove('missing'), /no longer exists/);
+
+  assert.equal(appendPromptInstructions('Task.', []), 'Task.');
+  assert.match(
+    appendPromptInstructions('Task.', [{ name: 'Review', content: 'Look closely.' }]),
+    /Task\.\n\nAdditional instructions from the prompt library:\n\n### Review\nLook closely\./,
+  );
+});
+
+test('the router matches parameters and distinguishes an unknown path from a wrong method', () => {
+  const router = new Router();
+  router.get('/v1/tasks/:taskId/package', () => null);
+  router.post('/v1/tasks/:taskId/result', () => null);
+
+  const match = router.resolve('GET', '/v1/tasks/abc%2F123/package');
+  assert.deepEqual(match.params, { taskId: 'abc/123' });
+  assert.equal(router.resolve('DELETE', '/v1/tasks/abc/package').methodNotAllowed, true);
+  assert.equal(router.resolve('GET', '/v1/tasks/abc'), null);
+  assert.equal(router.resolve('GET', '/v1/tasks/abc/package/extra'), null);
+});
+
+test('install assets carry the token and describe both injection routes', async (context) => {
+  const agent = await startAgent(context);
+
+  const install = await fetch(`http://127.0.0.1:${agent.port}/install`);
+  assert.equal(install.status, 200);
+  assert.match(install.headers.get('content-type'), /text\/html/);
+  const page = await install.text();
+  assert.match(page, /patchwork\.user\.js/);
+  assert.match(page, /Tampermonkey/);
+  assert.match(page, /bookmarklet/i);
+
+  const bookmarklet = await fetch(`http://127.0.0.1:${agent.port}/bookmarklet.js`);
+  assert.match(bookmarklet.headers.get('content-type'), /javascript/);
+  const source = await bookmarklet.text();
+  assert.ok(source.includes(agent.config.token), 'the bookmarklet carries the agent token');
+  assert.match(source, /window\.open\(/);
+  assert.match(source, /createObjectURL/);
+  assert.doesNotMatch(source, /\beval\b/);
+
+  const bridge = await fetch(`http://127.0.0.1:${agent.port}/bridge`);
+  const bridgeHtml = await bridge.text();
+  assert.match(bridgeHtml, /addEventListener\('message'/);
+  assert.match(bridgeHtml, /https:\/\/chatgpt\.com/);
+
+  assert.match(installPage(agent.config), /Patchwork v3/);
+  assert.match(bridgePage(agent.config), /patchwork-bridge/);
+  assert.ok(bookmarkletSource(agent.config).includes('__patchworkBootstrap'));
+});
+
+test('the served userscript has its placeholders replaced and no CORS grant', async (context) => {
+  const agent = await startAgent(context);
+  const response = await fetch(`http://127.0.0.1:${agent.port}/patchwork.user.js`, {
+    headers: { Origin: 'https://evil.example' },
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get('content-type'), /javascript/);
+  assert.equal(
+    response.headers.get('access-control-allow-origin'),
+    null,
+    'no other origin may read the token baked into the script',
+  );
+  const source = await response.text();
+  assert.doesNotMatch(source, /__PATCHWORK_TOKEN__/);
+  assert.doesNotMatch(source, /__PATCHWORK_ORIGIN__/);
+  assert.ok(source.includes(agent.config.token));
+  assert.ok(source.includes(`http://127.0.0.1:${agent.config.port}`));
+});
+
+test('a submitted task without a confirmed conversation is recovered on agent start', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-recover-'));
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-recover-repo-'));
+  context.after(() => Promise.all([
+    fs.rm(root, { recursive: true, force: true }),
+    fs.rm(workspace, { recursive: true, force: true }),
+  ]));
+  const repositoryPath = await createRepository(workspace);
+
+  const config = await loadConfig({ dataRoot: root, port: 0 });
+  const first = await startServer(config);
+  const created = await first.context.taskService.createTask({
+    taskText: 'Recover me.',
+    repositories: [{ path: repositoryPath }],
+  });
+  await first.context.taskService.updateTask(created.taskId, {
+    state: 'submitted',
+    submittedAt: new Date().toISOString(),
+    conversationUrl: null,
+    chatStatus: 'streaming',
+  });
+  await new Promise((resolve) => first.server.close(resolve));
+
+  const second = await startServer(await loadConfig({ dataRoot: root, port: 0 }));
+  context.after(() => new Promise((resolve) => second.server.close(resolve)));
+  const recovered = await second.context.taskService.getTask(created.taskId);
+  assert.equal(recovered.state, 'prepared');
+  assert.equal(recovered.submittedAt, null);
+  assert.equal(recovered.chatStatus, null);
+});
+
+test('the install page embeds the bootstrap instead of loading it from the agent', async (context) => {
+  const agent = await startAgent(context);
+  const page = await (await fetch(`http://127.0.0.1:${agent.port}/install`)).text();
+  const href = /<a class="button bookmarklet" href="javascript:([^"]+)"/.exec(page);
+  assert.ok(href, 'the install page offers a bookmarklet');
+  const source = decodeURIComponent(href[1]);
+
+  // chatgpt.com's script-src-elem has no loopback entry, so a bookmarklet that
+  // injected <script src="http://127.0.0.1:…"> would be refused outright.
+  assert.doesNotMatch(source, /<script/i);
+  assert.doesNotMatch(source, /\.src = ['"]?\s*origin/);
+  assert.doesNotMatch(source, /\beval\b/);
+  assert.match(source, /window\.open\(/);
+  assert.match(source, /createObjectURL\(new Blob\(/);
+  assert.ok(source.includes(agent.config.token));
+});

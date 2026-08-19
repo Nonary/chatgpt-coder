@@ -568,6 +568,7 @@ class TaskService {
       repositories: publicRepositories,
       includesIacRepositories: iacPackage.includesIacRepositories,
       iacSettingsPath: iacPackage.includesIacRepositories ? iacPackage.settingsPath : null,
+      iac_settings_path: iacPackage.includesIacRepositories ? iacPackage.settingsPath : null,
       includes_iac_repos: iacPackage.includesIacRepositories,
       iac_repos: iacPackage.repositories,
       attachments: packageAttachments,

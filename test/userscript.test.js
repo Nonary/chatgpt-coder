@@ -1,0 +1,496 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { test } = require('node:test');
+
+const {
+  chatGPTProjectUrl,
+  conversationIdFromRouteUrl,
+  conversationRequestIncludesAttachment,
+  isChatGPTConversationUrl,
+  mergeTreeId,
+  normalizeConversationStreamStatus,
+  normalizeConversationTitle,
+  resultTaskId,
+  rewriteConversationRequestBody,
+  taskRequestConfiguration,
+} = require('../src/shared/chatgpt');
+const { element, installDocument, text } = require('./helpers/dom-stub');
+
+test('result and merge filenames identify their task even with duplicate suffixes', () => {
+  const taskId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId}.txt`), taskId);
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId} (1).txt`), taskId);
+  assert.equal(resultTaskId(`/downloads/chatgpt-ide-result-${taskId}.txt`), taskId);
+  assert.equal(resultTaskId('chatgpt-ide-result.txt'), null);
+  assert.equal(resultTaskId(`chatgpt-ide-result-${taskId}.zip`), null);
+  assert.equal(mergeTreeId(`chatgpt-ide-merge-result-${taskId} (2).txt`), taskId);
+  assert.equal(mergeTreeId(`chatgpt-ide-result-${taskId}.txt`), null);
+});
+
+test('only real ChatGPT conversation routes are accepted as submission proof', () => {
+  assert.equal(isChatGPTConversationUrl('https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22'), true);
+  assert.equal(isChatGPTConversationUrl('https://chatgpt.com/g/g-p-abc/c/3f2b7f68'), true);
+  assert.equal(isChatGPTConversationUrl('https://chatgpt.com/'), false);
+  assert.equal(isChatGPTConversationUrl('https://example.com/c/1234'), false);
+  assert.equal(isChatGPTConversationUrl('http://chatgpt.com/c/1234'), false);
+
+  assert.equal(
+    conversationIdFromRouteUrl('https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22'),
+    '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+  );
+  assert.equal(
+    conversationIdFromRouteUrl('https://chatgpt.com/g/g-p-abc/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22'),
+    '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+  );
+  assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/not-a-uuid'), null);
+});
+
+test('project URLs reject identifiers that do not belong to the project', () => {
+  assert.equal(chatGPTProjectUrl('g-p-abc123'), 'https://chatgpt.com/g/g-p-abc123/project');
+  assert.equal(chatGPTProjectUrl('g-p-abc123', 'g-p-abc123-tasks'), 'https://chatgpt.com/g/g-p-abc123-tasks/project');
+  assert.throws(() => chatGPTProjectUrl('not-a-project'), /invalid project identifier/);
+  assert.throws(() => chatGPTProjectUrl('g-p-abc123', 'g-p-other'), /invalid project URL/);
+});
+
+test('stream status and conversation titles normalize the way the task timer expects', () => {
+  assert.equal(normalizeConversationStreamStatus('IS_STREAMING'), 'streaming');
+  assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
+  assert.equal(normalizeConversationStreamStatus('COMPLETED'), 'completed');
+  assert.equal(normalizeConversationStreamStatus(''), 'unknown');
+  assert.equal(normalizeConversationTitle('  Fix   the parser  '), 'Fix the parser');
+  assert.equal(normalizeConversationTitle('ChatGPT'), '');
+  assert.equal(normalizeConversationTitle('New chat'), '');
+});
+
+test('task request configuration maps models and reasoning to ChatGPT slugs', () => {
+  assert.deepEqual(taskRequestConfiguration('sol', 'high'), {
+    model: 'sol', reasoningMode: 'high', modelSlug: 'gpt-5-6-thinking', thinkingEffort: 'extended',
+  });
+  assert.deepEqual(taskRequestConfiguration('sol', 'instant'), {
+    model: 'sol', reasoningMode: 'instant', modelSlug: 'gpt-5-6-instant', thinkingEffort: null,
+  });
+  assert.deepEqual(taskRequestConfiguration('luna', 'medium'), {
+    model: 'luna', reasoningMode: 'medium', modelSlug: 'gpt-5-6-t-mini', thinkingEffort: 'standard',
+  });
+  assert.equal(taskRequestConfiguration('default', 'default').modelSlug, 'gpt-5-6');
+  assert.throws(() => taskRequestConfiguration('gemini', 'high'), /Unsupported ChatGPT model/);
+  assert.throws(() => taskRequestConfiguration('sol', 'ludicrous'), /Unsupported ChatGPT reasoning mode/);
+});
+
+test('the fetch interceptor rewrites the outgoing conversation body in place', () => {
+  const configuration = taskRequestConfiguration('luna', 'low');
+  const rewritten = rewriteConversationRequestBody(
+    JSON.stringify({ model: 'gpt-4o', thinking_effort: 'standard', messages: [] }),
+    configuration,
+  );
+  const payload = JSON.parse(rewritten.text);
+  assert.equal(payload.model, 'gpt-5-6-t-mini');
+  assert.equal(payload.thinking_effort, 'min');
+  assert.deepEqual(payload.messages, []);
+  assert.equal(rewritten.model, 'gpt-5-6-t-mini');
+  assert.equal(rewritten.thinkingEffort, 'min');
+
+  const instant = rewriteConversationRequestBody(
+    JSON.stringify({ model: 'gpt-4o', thinking_effort: 'max' }),
+    taskRequestConfiguration('sol', 'instant'),
+  );
+  assert.equal(JSON.parse(instant.text).thinking_effort, undefined);
+  assert.throws(() => rewriteConversationRequestBody('[]', configuration), /invalid conversation request/);
+});
+
+test('attachment verification accepts ChatGPT file assets as well as the original filename', () => {
+  const filename = 'chatgpt-ide-task-3f2b7f68.zip';
+  assert.equal(conversationRequestIncludesAttachment(
+    JSON.stringify({ messages: [{ content: { parts: [`Uploaded ${filename}`] } }] }),
+    filename,
+  ), true);
+  assert.equal(conversationRequestIncludesAttachment(
+    JSON.stringify({ messages: [{ content: { parts: [{ asset_pointer: 'file-service://file-abc' }] } }] }),
+    filename,
+  ), true);
+  assert.equal(conversationRequestIncludesAttachment(
+    JSON.stringify({ messages: [{ attachments: [{ id: 'file-abc' }] }] }),
+    filename,
+  ), true);
+  assert.equal(conversationRequestIncludesAttachment(
+    JSON.stringify({ messages: [{ content: { parts: ['Just some text'] } }] }),
+    filename,
+  ), false);
+  assert.equal(conversationRequestIncludesAttachment('not json', filename), false);
+});
+
+test('generated result files are found in the conversation record, newest first', () => {
+  const { findGeneratedFile } = require('../src/userscript/src/chatgpt/api');
+  const record = {
+    mapping: {
+      a: {
+        message: {
+          id: 'a',
+          create_time: 10,
+          author: { role: 'assistant' },
+          metadata: { attachments: [{ id: 'file-old', name: 'chatgpt-ide-result-1.txt' }] },
+        },
+      },
+      b: {
+        message: {
+          id: 'b',
+          create_time: 20,
+          author: { role: 'assistant' },
+          content: { parts: [{ asset_pointer: 'file-service://file-new', metadata: { name: 'chatgpt-ide-result-1.txt' } }] },
+        },
+      },
+      c: {
+        message: {
+          id: 'c',
+          create_time: 30,
+          author: { role: 'user' },
+          metadata: { attachments: [{ id: 'file-user', name: 'chatgpt-ide-result-1.txt' }] },
+        },
+      },
+    },
+  };
+  const found = findGeneratedFile(record, (file) => file.name === 'chatgpt-ide-result-1.txt');
+  assert.equal(found.id, 'file-new', 'the newest assistant attachment wins and user uploads are ignored');
+  assert.equal(findGeneratedFile(record, () => false), null);
+});
+
+test('request-limit notices are dismissed but ordinary ChatGPT dialogs are not', () => {
+  const notices = require('../src/userscript/src/chatgpt/notices');
+  assert.equal(notices.isDismissibleLimitNotice('You have reached your daily message limit'), true);
+  assert.equal(notices.isDismissibleLimitNotice('Too many requests'), true);
+  assert.equal(notices.isDismissibleLimitNotice('Thinking…'), false);
+  assert.equal(notices.isDismissibleLimitNotice('Share this chat'), false);
+
+  const gotIt = text('button', 'Got it');
+  const dialog = element('div', { role: 'alertdialog' }, [text('p', 'You have reached your daily message limit'), gotIt]);
+  const unrelated = element('div', { role: 'alertdialog' }, [text('p', 'Thinking about your request'), text('button', 'Stop')]);
+  const restore = installDocument(element('body', {}, [unrelated, dialog]));
+  try {
+    const result = notices.dismissBlockingLimitNotice();
+    assert.equal(result.dismissed, true);
+    assert.equal(result.action, 'Got it');
+    assert.equal(gotIt.clicks, 1);
+    assert.equal(unrelated.querySelector('button').clicks, 0);
+  } finally {
+    restore();
+  }
+});
+
+test('attachment confirmation waits for the upload chip and reports busy processing', () => {
+  const composer = require('../src/userscript/src/chatgpt/composer');
+  const filename = 'chatgpt-ide-task-3f2b7f68.zip';
+
+  const input = element('input', { type: 'file' });
+  input.files = [{ name: filename }];
+  const selectedOnly = element('body', {}, [input]);
+  let restore = installDocument(selectedOnly);
+  try {
+    const status = composer.attachmentStatus(filename);
+    assert.equal(status.attached, false, 'a selected input alone is not a confirmed attachment');
+    assert.equal(status.selectedByInput, true);
+    assert.equal(status.busy, true);
+  } finally {
+    restore();
+  }
+
+  const busyChip = element('div', { 'data-testid': 'file-attachment' }, [
+    text('span', filename),
+    element('div', { role: 'progressbar' }),
+  ]);
+  restore = installDocument(element('body', {}, [busyChip]));
+  try {
+    assert.deepEqual(
+      (({ attached, busy }) => ({ attached, busy }))(composer.attachmentStatus(filename)),
+      { attached: true, busy: true },
+    );
+  } finally {
+    restore();
+  }
+
+  const readyChip = element('div', { 'data-testid': 'file-attachment' }, [text('span', filename)]);
+  restore = installDocument(element('body', {}, [readyChip]));
+  try {
+    assert.deepEqual(
+      (({ attached, busy }) => ({ attached, busy }))(composer.attachmentStatus(filename)),
+      { attached: true, busy: false },
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('the Send control is found by test id and never clicked while generation runs', () => {
+  const composer = require('../src/userscript/src/chatgpt/composer');
+
+  const sendButton = element('button', { 'data-testid': 'send-button' });
+  let restore = installDocument(element('body', {}, [sendButton]));
+  try {
+    const state = composer.sendButtonState(true);
+    assert.deepEqual(state, {
+      found: true, enabled: true, submitted: false, clicked: true,
+    });
+    assert.equal(sendButton.clicks, 1);
+    composer.sendButtonState(false);
+    assert.equal(sendButton.clicks, 1, 'allowClick=false inspects without clicking');
+  } finally {
+    restore();
+  }
+
+  const stopButton = element('button', { 'data-testid': 'stop-button' });
+  restore = installDocument(element('body', {}, [stopButton, element('button', { 'data-testid': 'send-button' })]));
+  try {
+    const state = composer.sendButtonState(true);
+    assert.equal(state.submitted, true);
+    assert.equal(state.clicked, false);
+    assert.equal(stopButton.clicks, 0);
+  } finally {
+    restore();
+  }
+
+  const shadowHost = element('div', {});
+  const shadow = shadowHost.attachShadow();
+  const shadowSend = element('button', { 'data-testid': 'send-button' });
+  shadow.append(shadowSend);
+  restore = installDocument(element('body', {}, [shadowHost]));
+  try {
+    assert.equal(composer.sendButtonState(true).clicked, true, 'the composer walks shadow roots');
+    assert.equal(shadowSend.clicks, 1);
+  } finally {
+    restore();
+  }
+});
+
+test('the agent client builds authenticated request paths for every workspace call', async () => {
+  const { Api } = require('../src/userscript/src/api');
+  const calls = [];
+  const api = new Api({
+    kind: 'test',
+    request(options) {
+      calls.push(options);
+      return Promise.resolve({ status: 200, text: '{"ok":true}', buffer: null });
+    },
+  });
+
+  await api.gitDiff('C:/repo', 'src/app.js', true);
+  assert.equal(calls.at(-1).path, '/v1/workspace/diff?path=C%3A%2Frepo&file=src%2Fapp.js&staged=true');
+
+  await api.skills(['C:/one', 'C:/two']);
+  assert.equal(calls.at(-1).path, '/v1/skills?repositories=C%3A%2Fone%0AC%3A%2Ftwo');
+
+  await api.taskResult('task-1', 'PATCHWORK_RESULT_V1');
+  assert.equal(calls.at(-1).method, 'POST');
+  assert.equal(calls.at(-1).path, '/v1/tasks/task-1/result');
+  assert.deepEqual(calls.at(-1).body, { text: 'PATCHWORK_RESULT_V1' });
+
+  await api.uploadAttachment('notes v2.txt', new ArrayBuffer(4));
+  assert.equal(calls.at(-1).path, '/v1/uploads?name=notes+v2.txt');
+
+  await api.events(12);
+  assert.equal(calls.at(-1).path, '/v1/events?since=12');
+});
+
+test('agent errors surface their message instead of a generic failure', async () => {
+  const { AgentError, Api } = require('../src/userscript/src/api');
+  const api = new Api({
+    request: () => Promise.resolve({ status: 400, text: '{"error":"Add at least one Git repository."}' }),
+  });
+  await assert.rejects(() => api.tasks(), (error) => {
+    assert.ok(error instanceof AgentError);
+    assert.equal(error.message, 'Add at least one Git repository.');
+    assert.equal(error.status, 400);
+    return true;
+  });
+});
+
+test('task labels and states match the states the agent can report', () => {
+  const { taskLabel, taskStateLabel, taskStatusText } = require('../src/userscript/src/ui/labels');
+  assert.equal(taskLabel({ taskText: 'Fix the parser\nmore detail' }), 'Fix the parser');
+  assert.equal(taskLabel({ conversationTitle: 'Parser work', taskText: 'Fix' }), 'Parser work');
+  assert.equal(taskLabel({ summaryOnly: true, repositories: [{ name: 'sunshine' }] }), 'Git Summary · sunshine');
+
+  assert.equal(taskStateLabel({ state: 'submitted' }), 'Running');
+  assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'completed' }), 'ChatGPT finished');
+  assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'failed' }), 'ChatGPT stopped');
+  assert.equal(taskStateLabel({ state: 'conflicted' }), 'Needs conflict resolution');
+  assert.equal(taskStateLabel({ summaryOnly: true, state: 'ready' }), 'Summary ready');
+
+  assert.equal(taskStatusText({ state: 'conflicted' })[0], 'Conflict needs resolution');
+  assert.equal(taskStatusText({ summaryOnly: true, state: 'completed' })[0], 'Git Summary applied');
+});
+
+test('the userscript bundles every module it requires and keeps its install placeholders', () => {
+  const build = require('../src/userscript/build');
+  const bundle = build.bundle();
+  assert.match(bundle, /^\/\/ ==UserScript==/);
+  assert.match(bundle, /@match\s+https:\/\/chatgpt\.com\/\*/);
+  assert.match(bundle, /@grant\s+GM_xmlhttpRequest/);
+  assert.match(bundle, /@connect\s+127\.0\.0\.1/);
+  assert.ok(bundle.includes('__PATCHWORK_TOKEN__'), 'the agent injects the token at download time');
+  assert.ok(bundle.includes('__PATCHWORK_ORIGIN__'), 'the agent injects its own origin at download time');
+
+  const modules = build.collect(build.ENTRY);
+  const ids = [...modules.keys()];
+  assert.ok(ids.includes('src/shared/chatgpt.js'), 'the shared ChatGPT helpers are shared, not duplicated');
+  assert.ok(ids.includes('src/userscript/src/ui/styles.css'), 'the stylesheet is inlined as a module');
+  for (const [id, source] of modules) {
+    assert.doesNotMatch(source, /\brequire\((['"])[^'"]+\1\)/, `${id} still has an unresolved require`);
+  }
+  assert.doesNotMatch(bundle, /require\(['"]node:/, 'no Node built-in leaks into the page bundle');
+});
+
+test('the built userscript on disk is current', () => {
+  const build = require('../src/userscript/build');
+  if (!fs.existsSync(build.OUTPUT)) return;
+  const digest = (value) => require('node:crypto').createHash('sha256').update(value).digest('hex').slice(0, 16);
+  // Compared by digest so a stale bundle reports one line instead of 160 KB.
+  assert.equal(
+    digest(fs.readFileSync(build.OUTPUT, 'utf8')),
+    digest(build.bundle()),
+    'run `pnpm build:userscript` after changing userscript sources',
+  );
+});
+
+test('the architecture note documents the transports the userscript actually implements', () => {
+  const doc = fs.readFileSync(path.join(__dirname, '..', 'docs', 'ARCHITECTURE-V3.md'), 'utf8');
+  const transport = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'transport.js'),
+    'utf8',
+  );
+  for (const name of ['GM_xmlhttpRequest', 'Access-Control-Allow-Private-Network', 'postMessage']) {
+    assert.ok(doc.includes(name), `the architecture note should explain ${name}`);
+  }
+  assert.match(transport, /createGmTransport/);
+  assert.match(transport, /createFetchTransport/);
+  assert.match(transport, /createBridgeTransport/);
+});
+
+test('the send request stream yields the conversation id without waiting for the route', async () => {
+  const { CONVERSATION_ID_PATTERN, readConversationId } = require('../src/userscript/src/chatgpt/intercept');
+  // Shaped after the real event stream: delta_encoding, then resume_conversation_token.
+  const chunks = [
+    'event: delta_encoding\ndata: "v1"\n\n',
+    'data: {"type":"resume_conversation_token","kind":"topic","token":"eyJhbGciOi",'
+      + '"conversation_id":"6a8614e8-6f4c-83ea-ac44-57685def48df"}\n\n',
+    'event: delta\ndata: {"p":"","o":"add"}\n\n',
+  ];
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+      controller.close();
+    },
+  });
+  const response = new Response(stream, { status: 200 });
+  assert.equal(await readConversationId(response), '6a8614e8-6f4c-83ea-ac44-57685def48df');
+  assert.equal(response.bodyUsed, false, 'the page keeps its own readable copy of the stream');
+  assert.equal(await new Response('nothing here').text(), 'nothing here');
+  assert.equal(CONVERSATION_ID_PATTERN.exec('"conversation_id":"not-a-uuid"'), null);
+});
+
+test('the transcript fallback finds the generated file id without triggering a download', () => {
+  const scan = require('../src/userscript/src/chatgpt/result-scan');
+  const name = 'chatgpt-ide-result-3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22.txt';
+
+  const link = element('a', { href: '/backend-api/files/file-AbCd1234EfGh/download' });
+  const card = element('div', { 'data-testid': 'file-attachment' }, [text('span', name), link]);
+  let restore = installDocument(element('body', {}, [card]));
+  try {
+    const found = scan.findResultFileInDom(name);
+    assert.deepEqual(found, { id: 'file-AbCd1234EfGh', name, source: 'dom' });
+    assert.equal(link.clicks, 0, 'a browser download would land on disk, not in the page');
+    assert.equal(scan.findResultFileInDom('chatgpt-ide-result-other.txt'), null);
+    assert.equal(scan.isGenerating(), false);
+  } finally {
+    restore();
+  }
+
+  const stop = element('button', { 'data-testid': 'stop-button' });
+  restore = installDocument(element('body', {}, [stop]));
+  try {
+    assert.equal(scan.isGenerating(), true, 'a running generation is never scanned for a result');
+  } finally {
+    restore();
+  }
+});
+
+test('the bookmarklet uses only injection routes chatgpt.com actually permits', () => {
+  const { bookmarkletSource, bridgePage } = require('../src/agent/install');
+  const source = bookmarkletSource({ port: 8787, token: 'test-token' });
+
+  assert.match(source, /window\.open\(/, 'popups are not governed by connect-src');
+  assert.match(source, /createObjectURL\(new Blob\(/, 'script-src-elem allows blob:');
+  assert.doesNotMatch(source, /\beval\b/, "chatgpt.com's script-src has no 'unsafe-eval'");
+  assert.doesNotMatch(source, /element\.src = origin/, 'script-src-elem has no loopback entry');
+  assert.doesNotMatch(source, /\bimport\(/, 'dynamic import is governed by script-src too');
+  assert.match(source, /transport: 'bridge'/, 'the app reuses the bridge the bookmarklet opened');
+  assert.ok(source.includes('test-token'));
+
+  assert.match(bridgePage({ port: 8787, token: 'test-token' }), /boot-source/);
+});
+
+test('a bootstrapped bridge is used directly instead of probing blocked transports', async () => {
+  const { createTransport } = require('../src/userscript/src/transport');
+  const previous = { window: global.window, document: global.document };
+  const posted = [];
+  global.window = {
+    open: () => ({ closed: false, postMessage: (message) => posted.push(message) }),
+    addEventListener: () => {},
+  };
+  global.document = { addEventListener: () => {}, removeEventListener: () => {} };
+  try {
+    const result = await createTransport({
+      origin: 'http://127.0.0.1:8787',
+      token: 'test-token',
+      prefer: 'bridge',
+    });
+    assert.equal(result.transport.kind, 'bridge');
+    assert.deepEqual(result.failures, [], 'no blocked fetch is attempted first');
+  } finally {
+    global.window = previous.window;
+    global.document = previous.document;
+  }
+});
+
+test('project listing matches the sidebar shape a real session returns', async () => {
+  const { installDocument: install } = require('./helpers/dom-stub');
+  const previous = { fetch: global.fetch, location: global.location, localStorage: global.localStorage };
+  const restore = install(element('body', {}));
+  global.location = { origin: 'https://chatgpt.com' };
+  global.localStorage = { getItem: () => null };
+  global.document.cookie = '';
+  const pages = [{
+    items: [
+      { gizmo: { gizmo: { id: 'g-p-6a81d72f0e9c81918ec8a18a72244337', short_url: 'g-p-6a81d72f0e9c81918ec8a18a72244337-coding', display: { name: 'Coding' } } } },
+      { gizmo: { gizmo: { id: 'g-p-0000', display: { name: 'Zebra' } } } },
+      { gizmo: { gizmo: { id: 'not-a-project', display: { name: 'Ignored' } } } },
+    ],
+    cursor: null,
+  }];
+  global.fetch = async (url) => {
+    if (String(url).includes('/api/auth/session')) {
+      return new Response(JSON.stringify({ accessToken: 'token', account: { id: 'acct' } }), { status: 200 });
+    }
+    return new Response(JSON.stringify(pages.shift() || { items: [], cursor: null }), { status: 200 });
+  };
+  try {
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/session')];
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/api')];
+    const { listProjects } = require('../src/userscript/src/chatgpt/api');
+    const projects = await listProjects();
+    assert.deepEqual(projects, [
+      { id: 'g-p-6a81d72f0e9c81918ec8a18a72244337', shortUrl: 'g-p-6a81d72f0e9c81918ec8a18a72244337-coding', name: 'Coding' },
+      { id: 'g-p-0000', shortUrl: null, name: 'Zebra' },
+    ], 'sorted by name, non-project gizmos dropped');
+    assert.equal(
+      chatGPTProjectUrl(projects[0].id, projects[0].shortUrl),
+      'https://chatgpt.com/g/g-p-6a81d72f0e9c81918ec8a18a72244337-coding/project',
+    );
+  } finally {
+    restore();
+    global.fetch = previous.fetch;
+    global.location = previous.location;
+    global.localStorage = previous.localStorage;
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/session')];
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/api')];
+  }
+});

@@ -1,42 +1,26 @@
 {
-  "name": "chatgpt-coding-ide",
-  "version": "0.7.4",
-  "description": "A local-first Electron IDE companion for exchanging Git patches with ChatGPT.",
+  "name": "patchwork-chatgpt",
+  "version": "3.0.0",
+  "description": "A userscript that turns chatgpt.com into a coding workspace, backed by a local Git agent.",
   "packageManager": "pnpm@11.19.0",
-  "main": "src/main/app.js",
+  "main": "src/agent/cli.js",
   "type": "commonjs",
   "scripts": {
-    "start": "electron .",
+    "agent": "node src/agent/cli.js",
+    "build:userscript": "node src/userscript/build.js",
+    "build": "node src/userscript/build.js",
+    "start": "node src/userscript/build.js && node src/agent/cli.js",
     "test": "node --test",
-    "check": "node scripts/check.js",
-    "dist": "electron-builder --dir"
+    "check": "node scripts/check.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16"
   },
-  "devDependencies": {
-    "electron": "^37.2.6",
-    "electron-builder": "^26.0.12"
-  },
+  "devDependencies": {},
   "engines": {
     "node": ">=22"
   },
-  "build": {
-    "appId": "dev.patchwork.chatgpt-coding",
-    "productName": "ChatGPT - Coder",
-    "files": [
-      "src/**/*",
-      "package.json",
-      "settings.example.json"
-    ],
-    "mac": {
-      "category": "public.app-category.developer-tools"
-    },
-    "linux": {
-      "category": "Development"
-    },
-    "win": {
-      "target": "nsis"
-    }
+  "bin": {
+    "patchwork-agent": "src/agent/cli.js"
   }
 }

@@ -1,123 +1,184 @@
-# ChatGPT - Coder
+# Patchwork for ChatGPT (v3)
 
-Patchwork is a local-first Electron companion for completing coding tasks through the normal ChatGPT website. It packages Git repositories as full-history Git bundles inside a ZIP task package, embeds a persistent ChatGPT browser session directly inside the IDE, automates task submission through the visible page, downloads ChatGPT's marked text result, validates every patch against its task base, and applies the changes locally.
+Patchwork turns **chatgpt.com itself** into a coding workspace. A userscript injects
+the entire Patchwork interface into the real ChatGPT page, and a small local HTTP
+service — the *agent* — does only what a browser cannot: Git, the filesystem, and
+packaging.
 
-Patchwork does not use the OpenAI developer API, inspect live ChatGPT network traffic, or read browser authentication cookies. Project discovery and creation use ChatGPT's same-origin web endpoints from inside the visible authenticated page. The ChatGPT page remains visible and the user signs in normally. Task submission automation is limited to the visible page, Chromium's file-input and download controls, and same-origin project requests issued from that authenticated page. Outbound tasks are ZIP files containing Git bundles and instructions. Tasks can target current repository working changes directly or use a coding tree. Results return as downloadable UTF-8 text files; binary-safe Git patches are base64-encoded inside that text.
+There is no Electron app, no embedded browser, and no second window. You work in
+your own ChatGPT session, signed in normally, in the browser you already use.
 
-## Source control
-
-Repositories added to Patchwork are kept in a local workspace and are available from **Source control** in the sidebar. The source-control workspace provides:
-
-- staged, unstaged, and untracked file groups;
-- textual previews for tracked changes and safe content previews for untracked files;
-- stage/unstage actions for individual files or all changes;
-- AI-generated Conventional Commit messages from all uncommitted changes;
-- commit creation using the repository's configured Git identity; and
-- recent commit history with commit IDs and authors.
-
-Select **AI summary** to package the repository's staged, unstaged, and untracked changes through the same Git-bundle ZIP workflow used for coding tasks. Patchwork uses the saved prompt named **Git Summary** when one exists in the local Prompt library. Otherwise it uses the built-in Git Changes Review + Conventional Commit prompt. The generated message is placed into the commit editor without changing or staging files.
-
-Patchwork deliberately does not expose discard, hard reset, or forced checkout actions in this initial Git workflow. Those operations can erase local work and require a separate, explicit confirmation design.
-
-## Coding trees
-
-Coding trees are optional task targets. A tree runs in a real Git worktree on its own `patchwork/…` branch. The original checkout must have a commit, be on a branch, and be clean before a tree is created. The **Coding trees** workspace lets you:
-
-- create a named tree from a repository;
-- discover existing linked worktrees directly from repositories in the workspace;
-- attach follow-up tasks to an existing tree while opening a fresh ChatGPT chat each time;
-- inspect the tree in Source Control, reveal its directory, and see its task and commit counts;
-- discard a tree through an explicit confirmation; or
-- choose the ChatGPT project used by **Merge tree**, with the selected destination retained as the tree's default; then ask ChatGPT to summarize all tree commits and produce an improved Conventional Commit message.
-
-Coding-tree task results are never applied to the original checkout. After validation, Patchwork applies the patch to the selected tree, stages it, and commits it using the Conventional Commit message included in ChatGPT's plain-text result. Tasks that target current working changes apply directly to the selected repository without creating a new commit. A tree merge is first tested and committed in a temporary integration worktree. The original branch is fast-forwarded only if it stayed clean and unchanged; Patchwork then removes the task worktree and its branch.
-
-## Task history
-
-Patchwork keeps task records in its local data directory after a task finishes and after its coding tree is merged. **Task history** in the sidebar shows the complete saved history with search and status filters, including task descriptions, result summaries, commit messages, and the coding-tree or repository context. The sidebar's **Recent tasks** list stays intentionally short and links to the full history when older tasks exist.
-
-## Task skills
-
-The task composer keeps skills out of the main form. **Choose skills** opens a compact drawer that scans common local skill folders used by Claude Code, Codex, GitHub Copilot, and the provider-agnostic Agent Skills layout. A skill is offered when its directory contains `SKILL.md`, with project and personal skills shown separately. Selected skill directories are copied into the task package under `skills/` and described in `manifest.json`, so the uploaded task stays self-contained.
-
-The generated task instructions tell ChatGPT that skills may be present and to read or invoke a selected skill only when it is relevant to the task. Unrelated skills remain available in the package but should not be loaded just because they were selected.
-
-## Infrastructure context (IaC)
-
-Tasks can optionally include infrastructure-as-code repositories as read-only context, similar to the IaC support in the companion bundle tool. This is useful for Terraform, Pulumi, Kubernetes, Helm, GitOps, deployment configuration, and other platform repositories that explain how the application is operated.
-
-IaC repositories are opt-in. Copy `settings.example.json` to `settings.json` in the Patchwork checkout and list repository locations under `iac_urls`:
-
-```json
-{
-  "iac_urls": [
-    "~/sources/platform-infra",
-    "https://github.com/your-org/terraform-prod.git",
-    "git@github.com:your-org/kubernetes-config.git"
-  ]
-}
+```
+  chatgpt.com (your browser)                  patchwork-agent (Node, 127.0.0.1)
+  ├─ ChatGPT's own React app                  ├─ Git bundles and ZIP packaging
+  └─ Patchwork userscript          ⇄          ├─ patch validation and apply
+     ├─ dock UI (shadow DOM)                  ├─ coding trees and squash merges
+     ├─ ChatGPT driver (backend-api)          └─ skills, IaC, prompt library
+     └─ agent client
 ```
 
-`iac_urls` accepts local paths, `file://` URLs, HTTPS Git URLs, and SSH-style Git URLs. Relative local paths resolve from `settings.json`, and environment variables plus `~` are expanded. Remote repositories are cloned to a temporary directory while the task ZIP is prepared, then included under `iac/` as Git bundles.
+Patchwork does not use the OpenAI developer API and does not read your cookies. It
+runs inside the authenticated page and uses the same same-origin endpoints
+ChatGPT's own client uses. Outbound tasks are ZIP files containing Git bundles.
+Results come back as a downloadable UTF-8 text file; binary-safe Git patches are
+base64-encoded inside it.
 
-Enable **Infrastructure context** in the task composer when the configured IaC repositories should be included. The generated `manifest.json` records them in `iac_repos` and marks the included repositories as read-only. They are provided for context only and are never part of result patches or Patchwork's apply target.
+## Install
 
-For packaged installs where the bundled application directory does not contain `settings.json`, set `PATCHWORK_IAC_SETTINGS` to an explicit settings file path.
-
-## Prompt library
-
-The task composer includes a local **Prompt library** dropdown directly below model selection. Saved prompts have a name, short description, and reusable instruction text. Multiple prompts can be selected for a task, removed from the selection as chips, and managed from the prompt library drawer. The instruction text is appended to the task only when selected, and the saved library stays local to the Patchwork installation. A saved prompt named **Git Summary** is also used by Source control's AI summary action.
-
-## Current workflow
-
-1. Patchwork opens directly to the embedded ChatGPT session. Sign in there before creating a task; the persistent session is reused afterward.
-2. Choose **New task**, then use the current working changes from one or more Git repositories, create a coding tree from one clean, committed Git repository, or attach the task to an existing tree. The task target, model, reasoning mode, and ChatGPT project selection stay sticky between task selections and are restored after application restarts.
-3. Describe the software task, optionally select saved prompt instructions, local reference files, skills, or configured IaC context, and choose where ChatGPT should launch it. A task can use a normal new chat, an existing ChatGPT project, or a newly created project. Patchwork copies attachments into the task record and embeds them in the task package under `attachments/`.
-4. Patchwork creates a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, selected skill directories under `skills/`, user-provided files under `attachments/`, one Git bundle for each selected repository or coding tree under `repositories/`, and any opted-in IaC bundles under `iac/`. Already-compressed bundles are stored directly in the ZIP; they are not redundantly compressed a second time.
-5. Patchwork opens the selected ChatGPT destination in the same embedded browser, injects the instructions, attaches the ZIP package plus any user-selected reference files, waits for the attachments to finish processing, and clicks ChatGPT's Send button.
-6. ChatGPT follows the embedded protocol and attaches `chatgpt-ide-result-<task-id>.txt`, containing a marked `PATCHWORK_RESULT_V1` JSON envelope with base64-encoded `git diff --binary` patches. The envelope is not printed in the chat.
-7. Patchwork's application-level monitor activates that exact download, reads the text file locally, verifies the task ID, repository set, base commits, size limits, and base64 integrity, then applies the patch to the task target. Coding-tree tasks also verify the Conventional Commit message and commit the patch. If the target's `HEAD` advanced, Patchwork first tries a clean contextual apply and then Git's three-way merge.
-8. When **Merge tree** is chosen, Patchwork opens another fresh ChatGPT chat with the tree's commit history and diff summary. It reads the returned merge envelope, creates one squash commit on the original branch through a temporary integration worktree, and removes the coding tree.
-
-If Git reports conflicts, Patchwork leaves the conflict markers and unmerged files in the target, reports the affected files, and offers **Retry apply**. It also offers **Resolve with ChatGPT** when the task has a writable target, which opens a new ChatGPT task containing the current dirty target, `CONFLICTS.md`, the original result patch, and the original task attachments.
-
-If page automation is temporarily unavailable because ChatGPT's markup changed, the embedded browser remains fully usable. **Copy prompt**, **Show package**, and **Import result** remain available.
-
-## Development
-
-Requirements:
-
-- Node.js 22 or newer
-- pnpm or npm
-- Git available on `PATH`
-
-Install and run:
+Requirements: Node.js 22+, pnpm or npm, and Git on `PATH`.
 
 ```sh
 pnpm install
-pnpm start
+pnpm start          # builds the userscript and starts the agent
 ```
 
-Verify the project:
+Then open <http://127.0.0.1:8787/install> and pick one:
 
-```sh
-pnpm check
-pnpm test
-pnpm dist
-```
+- **Userscript (recommended).** Install [Tampermonkey](https://www.tampermonkey.net/)
+  or Violentmonkey, click *Install patchwork.user.js*, and reload chatgpt.com. Your
+  agent token is baked into the script, so nothing has to be typed.
+- **Bookmarklet (fallback).** For browsers without a userscript manager. Drag it to
+  the bookmarks bar and click it while on chatgpt.com. It opens a small bridge
+  window — keep that window open, because chatgpt.com's Content-Security-Policy
+  forbids the page itself from reaching `127.0.0.1`, and the bridge is what carries
+  every request. Allow pop-ups for chatgpt.com or it cannot start.
+
+`pnpm agent` starts the agent on its own; `pnpm build:userscript` rebuilds only the
+bundle. Keep the agent running while you use Patchwork — every Git and filesystem
+operation goes through it.
+
+Patchwork's dock opens on the right of the page. `Alt+P` toggles it.
+
+## Workflow
+
+1. Open **Tasks** in the dock. Choose where the work lands: the current working
+   changes of one or more repositories, a new coding tree, or an existing tree.
+   The task target, model, reasoning mode, and ChatGPT project selection stay
+   sticky between tasks.
+2. Describe the task. Optionally add saved prompts, local skills, reference file
+   attachments, or configured IaC context, and choose whether ChatGPT runs it in a
+   plain new chat, an existing project, or a project Patchwork creates.
+3. The agent builds a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, one
+   Git bundle per repository under `repositories/`, plus any `skills/`,
+   `attachments/`, `iac/`, and `conflicts/` content. Already-compressed bundles are
+   stored, not compressed again.
+4. The userscript opens the chosen ChatGPT destination, fills the composer, attaches
+   the ZIP as a real `File`, waits for the upload to finish, and clicks Send. A
+   `fetch` wrapper rewrites the outgoing request so the exact model and reasoning
+   effort you picked are used, and aborts the send if the ZIP is not actually
+   attached.
+5. ChatGPT follows the embedded protocol and attaches
+   `chatgpt-ide-result-<task-id>.txt` containing a marked `PATCHWORK_RESULT_V1`
+   envelope. The envelope is never printed in the chat.
+6. Patchwork reads that file out of the conversation record, downloads it, and hands
+   it to the agent, which verifies the task ID, repository set, base commits, size
+   limits, and base64 integrity before touching anything on disk. It then applies the
+   patch to the task target — committing it for coding-tree tasks — falling back from
+   a clean contextual apply to Git's three-way merge if `HEAD` advanced.
+7. **Merge tree** opens a fresh chat with the tree's commit history and diff summary,
+   reads the returned merge envelope, creates one squash commit on the original
+   branch through a temporary integration worktree, and removes the tree.
+
+If Git reports conflicts, Patchwork leaves the markers in place, reports the affected
+files, and offers **Retry apply**. **Resolve with ChatGPT** opens a follow-up task
+containing the dirty target, `CONFLICTS.md`, the original result patch, and the
+original attachments.
+
+## What lives where
+
+- **Source control** — staged/unstaged/untracked groups, split diffs, stage and
+  unstage, commit with the repository's Git identity, recent history, and **AI
+  summary**, which packages the working changes as a read-only task and returns a
+  Conventional Commit message. It uses your saved prompt named **Git Summary** when
+  one exists, otherwise the built-in prompt.
+- **Coding trees** — real Git worktrees on `patchwork/…` branches. Create, discover
+  existing linked worktrees, attach follow-up tasks, inspect in Source control,
+  reveal on disk, discard, or merge. Coding-tree results are never applied to the
+  original checkout.
+- **History** — every saved task with search and status filters.
+- **Prompt library** — reusable named instructions, stored by the agent rather than in
+  browser storage, appended to a task only when selected.
+- **Skills** — a drawer that scans the local skill folders used by Claude Code, Codex,
+  GitHub Copilot, and the provider-agnostic Agent Skills layout. Any directory with a
+  `SKILL.md` qualifies. Selected directories are copied into the package under
+  `skills/`, and ChatGPT is told to load them only when relevant.
+- **Infrastructure context (IaC)** — opt-in read-only Terraform/Pulumi/Kubernetes/
+  GitOps repositories, included as bundles under `iac/` and never accepted as a
+  result patch target. Configure them in `settings.json` (see
+  `settings.example.json`) in the agent's data directory, or point
+  `PATCHWORK_IAC_SETTINGS` at a file:
+
+  ```json
+  { "iac_urls": ["~/sources/platform-infra", "https://github.com/your-org/terraform-prod.git"] }
+  ```
+
+  Local paths, `file://` URLs, HTTPS Git URLs, and SSH-style Git URLs all work.
+
+Instead of a native file dialog — which a web page cannot open — repositories are
+chosen through an in-page directory browser backed by the agent, including a "scan
+for repositories" sweep. Attachments use an ordinary file input, and their bytes are
+staged by the agent before packaging.
+
+## Configuration
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `--port`, `PATCHWORK_PORT` | `8787` | Agent HTTP port |
+| `--home`, `PATCHWORK_HOME` | `~/.patchwork` | Token, task storage, workspace, prompts |
+| `--iac-settings`, `PATCHWORK_IAC_SETTINGS` | `<home>/settings.json` | IaC repository list |
+
+The agent generates a token on first run and only accepts requests carrying it, from
+an allowlisted origin. The token is embedded in the userscript it serves.
 
 ## Safety boundaries
 
-- Coding trees can only be created from clean repositories with an existing `HEAD`, which keeps concurrent workstreams anchored to an unambiguous commit. Current-working-change tasks can package dirty repositories without creating a tree.
-- Each follow-up task is pinned to the coding tree's current `HEAD`.
-- Each result must name the original task and exact base commit.
-- Plain-text envelopes have strict markers, schemas, size limits, repository IDs, and base64-integrity checks. Legacy ZIP paths are treated as untrusted input and are never extracted wholesale.
-- All patches are checked before the first repository is modified.
-- IaC bundles are read-only context and are never accepted as result patch targets.
-- A multi-repository failure triggers a best-effort reversal of patches already applied.
-- Applied task changes are committed only on Patchwork worktree branches. Patchwork never pushes or rewrites published history.
-- Squash merging runs in a temporary worktree first and updates the original branch only by fast-forwarding the verified integration commit.
+- Coding trees can only be created from clean repositories with an existing `HEAD`.
+  Current-working-change tasks can package dirty repositories without a tree.
+- Each follow-up task is pinned to its coding tree's current `HEAD`, and each result
+  must name the original task and exact base commit.
+- Plain-text envelopes have strict markers, schemas, size limits, repository IDs, and
+  base64 integrity checks. Legacy ZIP result paths are never extracted wholesale.
+- Every patch is checked before the first repository is modified, and a
+  multi-repository failure triggers a best-effort reversal of what was already applied.
+- IaC bundles are read-only context and are never a patch target.
+- Applied changes are committed only on Patchwork worktree branches. Patchwork never
+  pushes or rewrites published history.
+- Squash merging runs in a temporary worktree first and updates the original branch
+  only by fast-forwarding the verified integration commit.
+- Discard, hard reset, and forced checkout are deliberately absent from the Git UI.
 
-## Browser automation boundary
+## Browser boundary
 
-The automation adapter intentionally targets a small set of semantic browser controls: the prompt composer, attachment input, Send button, generated-file links, and blocking limit notices. Result monitoring runs in Patchwork rather than in a page timer and survives ChatGPT's in-page navigation. The same background monitor dismisses ChatGPT's known conversation-history request-limit dialog through its semantic test ID and “Got it” action, with a narrow text-and-role fallback for other limit dialogs. It never closes unrelated prompts. Patchwork activates only the text result whose filename contains the exact task ID. Project listing and creation use the same authenticated web endpoints as ChatGPT's project UI; task submission and result handling continue through the visible browser surface. Clicking a task reopens its saved ChatGPT conversation, and submitted tasks show live elapsed time in the sidebar. Because page markup can change, selector failures stop safely and leave the embedded page available for manual interaction.
+The userscript talks to ChatGPT through a deliberately small surface: the composer,
+the attachment input, the Send control, `/backend-api` project, conversation,
+stream-status and file endpoints, and ChatGPT's known request-limit dialog, which it
+dismisses by test ID with a narrow text-and-role fallback. It never closes unrelated
+prompts. Because page markup can change, selector failures stop safely and leave
+ChatGPT fully usable.
+
+Message sending stays on the real Send control on purpose. ChatGPT's own send request
+carries a sentinel chat-requirements token, a proof-of-work token, a Turnstile token,
+and a conduit token; reproducing that handshake would be brittle and would make the
+session look synthetic. The `fetch` wrapper still gives exact control over the request
+body, and reads the new conversation id out of the reply stream.
+
+Reaching the agent is constrained by chatgpt.com's policy, not by preference: its
+`connect-src` has no loopback entry, so the page cannot call `127.0.0.1` directly.
+With a userscript manager, `GM_xmlhttpRequest` sidesteps that entirely. Without one,
+the bookmarklet uses the one route the policy leaves open — a popup bridge plus a
+`blob:` script element. `docs/ARCHITECTURE-V3.md` shows the exact directives.
+
+The dock renders inside a shadow root with a constructible stylesheet, so Patchwork's
+CSS and ChatGPT's CSS cannot collide and the dock keeps its styling regardless of the
+page's `style-src`. No external asset is ever loaded.
+
+## Development
+
+```sh
+pnpm check    # syntax check every JavaScript file
+pnpm test     # service, agent HTTP, and userscript suites
+pnpm build    # rebuild src/userscript/dist/patchwork.user.js
+```
+
+`docs/ARCHITECTURE-V3.md` explains the design, the three browser→agent transports,
+and how each piece of v2's Electron automation was replaced by an in-page equivalent.
