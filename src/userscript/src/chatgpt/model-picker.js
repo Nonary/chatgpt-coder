@@ -224,7 +224,11 @@ function buildMenu(picker, renderPicker) {
     const bounds = picker.getBoundingClientRect();
     const below = bounds.bottom + 6;
     const above = bounds.top - MENU_HEIGHT - 6;
-    host.style.left = `${Math.max(8, Math.min(bounds.left, window.innerWidth - MENU_WIDTH - 8))}px`;
+    const dockWidth = Number.parseInt(
+      getComputedStyle(document.documentElement).getPropertyValue('--patchwork-dock-width'), 10,
+    ) || 0;
+    const rightEdge = window.innerWidth - dockWidth - MENU_WIDTH - 8;
+    host.style.left = `${Math.max(8, Math.min(bounds.left, rightEdge))}px`;
     host.style.top = `${below + MENU_HEIGHT <= window.innerHeight - 8 ? below : Math.max(8, above)}px`;
     renderMenu();
     host.hidden = false;
@@ -237,19 +241,12 @@ function buildMenu(picker, renderPicker) {
   return { host, options, renderMenu };
 }
 
-function rememberBounds(nativePicker) {
-  const bounds = nativePicker?.getBoundingClientRect();
-  if (bounds && bounds.width > 0 && bounds.height > 0) {
-    session.bounds = { left: bounds.left, top: bounds.top, height: bounds.height };
-  }
-  return session.bounds;
-}
-
-function positionPicker(picker, nativePicker = null) {
-  const saved = rememberBounds(nativePicker);
-  picker.style.left = `${Math.max(8, saved?.left ?? 48)}px`;
-  picker.style.top = `${Math.max(4, saved?.top ?? 8)}px`;
-  if (saved?.height > 0) picker.style.minHeight = `${saved.height}px`;
+// The picker is mounted inside the slot that replaced ChatGPT's own control, so
+// it inherits the composer's position and moves with it. Nothing is positioned
+// against the viewport, which is what previously left it stranded over the dock.
+function mountPicker(picker, slot) {
+  if (!slot || picker.parentElement === slot) return;
+  slot.append(picker);
 }
 
 // The native control is replaced by a same-sized invisible slot so the composer's
@@ -260,18 +257,16 @@ function resizeLayoutSlot(picker) {
   const bounds = picker.getBoundingClientRect();
   const width = Math.ceil(Math.max(Number(slot.dataset.nativeWidth || 0), bounds.width));
   const height = Math.ceil(Math.max(Number(slot.dataset.nativeHeight || 0), bounds.height));
-  slot.style.cssText = `display:inline-block;flex:0 0 ${width}px;width:${width}px;`
-    + `min-width:${width}px;height:${height}px;visibility:hidden;pointer-events:none;vertical-align:middle;`;
+  slot.style.cssText = 'display:inline-flex;align-items:center;vertical-align:middle;'
+    + `min-width:${Math.min(width, 220)}px;min-height:${height}px;`;
 }
 
-function buildPicker(nativePicker = null) {
+function buildPicker() {
   const picker = el(PICKER_TAG, {
     id: PICKER_ID,
     'data-task-id': String(selection.taskId || ''),
-    style: 'display:inline-flex;position:fixed;z-index:2147483646;align-items:center;'
-      + 'min-width:0;vertical-align:middle;',
+    style: 'display:inline-flex;align-items:center;min-width:0;vertical-align:middle;',
   });
-  positionPicker(picker, nativePicker);
   const shadow = picker.attachShadow({ mode: 'closed' });
   adopt(shadow, PICKER_CSS);
 
@@ -320,28 +315,19 @@ function findNativePickers() {
 }
 
 function replaceNativePickers() {
-  let picker = document.getElementById(PICKER_ID);
   const nativePickers = findNativePickers();
   const visible = nativePickers.find((candidate) => {
     const bounds = candidate.getBoundingClientRect();
     return bounds.width > 0 && bounds.height > 0;
   }) || null;
 
-  if (!picker) {
-    picker = buildPicker(visible);
-    document.body.append(picker);
-    persistSelection();
-  } else if (visible) {
-    positionPicker(picker, visible);
-  }
-
+  let slot = document.getElementById(SLOT_ID);
   for (const nativePicker of nativePickers) {
     if (!nativePicker.isConnected) continue;
     if (nativePicker !== visible) {
       nativePicker.remove();
       continue;
     }
-    let slot = document.getElementById(SLOT_ID);
     if (slot && slot.parentElement !== nativePicker.parentElement) {
       slot.remove();
       slot = null;
@@ -355,8 +341,24 @@ function replaceNativePickers() {
     }
     slot.dataset.nativeWidth = String(nativeBounds.width);
     slot.dataset.nativeHeight = String(nativeBounds.height);
-    resizeLayoutSlot(picker);
   }
+
+  // Without an anchor in the composer there is nowhere legitimate to put the
+  // picker. v2 floated it at a fixed viewport offset in that case, which is how
+  // it ended up stranded on top of the dock; now it simply is not installed and
+  // ChatGPT keeps its own behaviour.
+  if (!slot?.isConnected) {
+    document.getElementById(PICKER_ID)?.remove();
+    return null;
+  }
+
+  let picker = document.getElementById(PICKER_ID);
+  if (!picker) {
+    picker = buildPicker();
+    persistSelection();
+  }
+  mountPicker(picker, slot);
+  resizeLayoutSlot(picker);
   return picker;
 }
 
@@ -381,7 +383,7 @@ function install({
   }
   const previous = session;
   uninstallDom();
-  session = { bounds: previous?.bounds || null, onChange: onChange || previous?.onChange || null };
+  session = { onChange: onChange || previous?.onChange || null };
   previous?.observer?.disconnect();
   clearInterval(previous?.guard);
   if (previous?.outsideHandler) {

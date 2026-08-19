@@ -16,6 +16,7 @@ const { renderHistory } = require('./ui/views/history');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
 const { taskLabel } = require('./ui/labels');
+const { reportLayout } = require('./ui/layout-report');
 const { taskRequestConfiguration } = require('../../shared/chatgpt');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
@@ -730,6 +731,9 @@ class App {
 
     this.installComposerPicker();
     this.renderActiveView();
+    // Report the real layout once it has settled, so the agent log shows what
+    // the page actually did rather than what Patchwork assumed.
+    setTimeout(() => reportLayout(this.api, this.shell), 2500);
     this.driver.start();
     this.pollEvents().catch(() => {});
 

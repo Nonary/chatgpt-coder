@@ -17,6 +17,16 @@ function registerSystem(router, context) {
     reasoningModes: TASK_REASONING_PICKER_OPTIONS,
   }));
 
+  // A place for the page to post what it actually measured, so layout and
+  // selector problems are diagnosed from real numbers instead of guessed at.
+  router.post('/v1/diagnostics', async ({ body }) => {
+    context.lastDiagnostics = { ...body, at: new Date().toISOString() };
+    process.stdout.write(`[diagnostics] ${JSON.stringify(context.lastDiagnostics)}\n`);
+    return { received: true };
+  });
+
+  router.get('/v1/diagnostics', async () => ({ diagnostics: context.lastDiagnostics || null }));
+
   router.get('/v1/events', async ({ url }) => {
     const since = Number.parseInt(url.searchParams.get('since') || '0', 10) || 0;
     const wait = url.searchParams.get('wait') !== 'false';

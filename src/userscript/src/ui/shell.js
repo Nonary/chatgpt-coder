@@ -132,8 +132,8 @@ class Shell {
     this.root.append(this.launcher, this.dock, this.toast, this.modalHost);
     document.documentElement.append(this.host);
 
-    this.layoutMode = readStorage(LAYOUT_KEY, 'push') === 'overlay' ? 'overlay' : 'push';
     this.installPageLayout();
+    this.setLayoutMode(readStorage(LAYOUT_KEY, 'push'));
     this.applyWidth(Number.parseInt(readStorage(WIDTH_KEY, '460'), 10) || 460);
     this.installResize();
     this.syncTheme();
@@ -184,10 +184,14 @@ class Shell {
     this.layoutMode = mode === 'overlay' ? 'overlay' : 'push';
     writeStorage(LAYOUT_KEY, this.layoutMode);
     this.applyPageLayout();
-    this.layoutButton?.setAttribute(
-      'title',
-      this.layoutMode === 'push' ? 'Dock covers the page instead' : 'Dock makes room on the page',
-    );
+    if (this.layoutButton) {
+      const pushing = this.layoutMode === 'push';
+      this.layoutButton.setAttribute(
+        'title',
+        pushing ? 'Making room on the page — click to overlay instead' : 'Overlaying the page — click to make room',
+      );
+      this.layoutButton.classList.toggle('active', pushing);
+    }
   }
 
   toggleLayoutMode() {

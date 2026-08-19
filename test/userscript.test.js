@@ -626,3 +626,20 @@ test('the picker governs ordinary sends, not only Patchwork task sends', async (
     delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
   }
 });
+
+test('the picker mounts inside the composer rather than floating over the page', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'chatgpt', 'model-picker.js'),
+    'utf8',
+  );
+  // A viewport-positioned picker cannot follow the composer, which is how it
+  // ended up sitting on top of the dock.
+  assert.doesNotMatch(source, /position:fixed[^`]*id: PICKER_ID/);
+  assert.match(source, /function mountPicker/);
+  assert.match(source, /slot\.append\(picker\)/);
+  assert.doesNotMatch(source, /positionPicker/, 'no snapshotted viewport coordinates remain');
+  assert.doesNotMatch(source, /visibility:hidden/, 'the slot now shows the picker instead of hiding');
+  // With no anchor in the composer the picker is not installed at all.
+  assert.match(source, /if \(!slot\?\.isConnected\)/);
+  assert.match(source, /--patchwork-dock-width/, 'the menu is kept clear of the dock');
+});
