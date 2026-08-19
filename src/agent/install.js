@@ -42,6 +42,86 @@ function bookmarkletSource(config) {
   const origin = ${JSON.stringify(origin)};
   const token = ${JSON.stringify(token)};
   if (window.__patchworkBooted) { window.__patchworkPanel?.toggle?.(); return; }
+
+  const inject = (source) => {
+    const element = document.createElement('script');
+    element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    element.addEventListener('load', () => URL.revokeObjectURL(element.src));
+    element.addEventListener('error', () => {
+      alert('chatgpt.com blocked the Patchwork script (script-src). Install the userscript with Tampermonkey instead: ' + origin + '/install');
+    });
+    document.documentElement.append(element);
+  };
+
+  // Named windows are scoped to a browsing-context group, so a second ChatGPT
+  // tab cannot reliably find the first tab's popup. Discover the owning tab over
+  // ChatGPT's same-origin BroadcastChannel before calling window.open().
+  let tabChannel = null;
+  try { tabChannel = new BroadcastChannel('patchwork-tab-bridge'); } catch {}
+
+  const findOwner = (wait = 350) => new Promise((resolve) => {
+    if (!tabChannel) { resolve(null); return; }
+    const discoveryId = crypto.randomUUID();
+    const timer = setTimeout(() => {
+      tabChannel.removeEventListener('message', onMessage);
+      resolve(null);
+    }, wait);
+    const onMessage = (event) => {
+      const message = event.data;
+      if (message?.type !== 'owner' || message.discoveryId !== discoveryId || message.token !== token) return;
+      clearTimeout(timer);
+      tabChannel.removeEventListener('message', onMessage);
+      resolve(message);
+    };
+    tabChannel.addEventListener('message', onMessage);
+    tabChannel.postMessage({ type: 'discover', discoveryId, token });
+  });
+
+  const useOwner = (owner) => {
+    const relayRequest = (request) => new Promise((resolve, reject) => {
+      const requestId = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        tabChannel.removeEventListener('message', onMessage);
+        reject(new Error('The ChatGPT tab that owns the Patchwork bridge did not answer.'));
+      }, request.timeout || 45000);
+      const onMessage = (event) => {
+        const message = event.data;
+        if (message?.type !== 'response' || message.requestId !== requestId || message.token !== token) return;
+        clearTimeout(timer);
+        tabChannel.removeEventListener('message', onMessage);
+        if (message.error) reject(new Error(message.error));
+        else resolve(message.response);
+      };
+      tabChannel.addEventListener('message', onMessage);
+      tabChannel.postMessage({
+        type: 'request', requestId, ownerId: owner.ownerId, token, request,
+      });
+    });
+    window.__patchworkBootstrap = { origin, token, transport: 'tab-relay', relayRequest };
+    inject(owner.source);
+  };
+
+  let existingOwner = await findOwner();
+  if (existingOwner) { useOwner(existingOwner); return; }
+
+  // Close the small race where two tabs launch the bookmarklet together. Web
+  // Locks elects one popup owner; the loser waits for that owner to announce
+  // itself and then uses the relay path above.
+  let releaseOwnerLock = null;
+  if (navigator.locks?.request) {
+    let reportLock;
+    const lockReady = new Promise((resolve) => { reportLock = resolve; });
+    navigator.locks.request('patchwork-popup-owner', { ifAvailable: true }, async (lock) => {
+      reportLock(Boolean(lock));
+      if (lock) await new Promise((resolve) => { releaseOwnerLock = resolve; });
+    }).catch(() => reportLock(false));
+    const ownsLock = await lockReady;
+    if (!ownsLock) {
+      existingOwner = await findOwner(1200);
+      if (existingOwner) { useOwner(existingOwner); return; }
+    }
+  }
+
   const bridgeUrl = origin + '/bridge?token=' + encodeURIComponent(token) + '&boot=1';
   const bridgeWindow = window.open(bridgeUrl, 'patchwork-bridge', 'width=460,height=340');
   if (!bridgeWindow) {
@@ -64,14 +144,44 @@ function bookmarkletSource(config) {
       };
       window.addEventListener('message', onMessage);
     });
-    const element = document.createElement('script');
-    element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-    element.addEventListener('load', () => URL.revokeObjectURL(element.src));
-    element.addEventListener('error', () => {
-      alert('chatgpt.com blocked the Patchwork script (script-src). Install the userscript with Tampermonkey instead: ' + origin + '/install');
-    });
-    document.documentElement.append(element);
+    inject(source);
+
+    if (tabChannel) {
+      const ownerId = crypto.randomUUID();
+      tabChannel.addEventListener('message', async (event) => {
+        const message = event.data;
+        if (!message || message.token !== token) return;
+        if (message.type === 'discover') {
+          tabChannel.postMessage({
+            type: 'owner', discoveryId: message.discoveryId, ownerId, token, source,
+          });
+          return;
+        }
+        if (message.type !== 'request' || message.ownerId !== ownerId) return;
+        try {
+          // Discovery can race the owner's bundle boot. Wait until its real
+          // bridge transport is available before relaying the first request.
+          for (let attempt = 0; attempt < 300 && !window.__patchworkPanel?.app?.transport; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+          const transport = window.__patchworkPanel?.app?.transport;
+          if (!transport) throw new Error('The Patchwork bridge owner did not finish starting.');
+          const response = await transport.request(message.request);
+          tabChannel.postMessage({ type: 'response', requestId: message.requestId, token, response });
+        } catch (error) {
+          tabChannel.postMessage({
+            type: 'response', requestId: message.requestId, token,
+            error: String(error && error.message || error),
+          });
+        }
+      });
+      window.addEventListener('pagehide', () => {
+        tabChannel.close();
+        releaseOwnerLock?.();
+      });
+    }
   } catch (error) {
+    releaseOwnerLock?.();
     bridgeWindow.close();
     alert('Patchwork could not start.\\n\\n' + error.message + '\\n\\nThe supported install is the userscript: ' + origin + '/install');
   }
@@ -127,7 +237,7 @@ function installPage(config) {
   <h2>Fallback · bookmarklet</h2>
   <p>No userscript manager? Drag this to your bookmarks bar and click it while on chatgpt.com.</p>
   <a class="button bookmarklet" href="${bookmarklet}">Patchwork</a>
-  <small>Opens a small bridge window and keeps it open: chatgpt.com's Content-Security-Policy forbids the page from reaching 127.0.0.1 directly, so that window carries every request. Allow pop-ups for chatgpt.com. The userscript path is the supported one.</small>
+  <small>The first ChatGPT tab opens one bridge window and keeps it open. Later tabs reuse it without opening or focusing another window. Allow pop-ups for chatgpt.com so the first bridge can start. The userscript path is the supported one.</small>
 </section>
 
 <section>

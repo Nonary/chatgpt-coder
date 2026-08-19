@@ -38,10 +38,12 @@ Then open <http://127.0.0.1:8787/install> and pick one:
   or Violentmonkey, click *Install patchwork.user.js*, and reload chatgpt.com. Your
   agent token is baked into the script, so nothing has to be typed.
 - **Bookmarklet (fallback).** For browsers without a userscript manager. Drag it to
-  the bookmarks bar and click it while on chatgpt.com. It opens a small bridge
-  window — keep that window open, because chatgpt.com's Content-Security-Policy
-  forbids the page itself from reaching `127.0.0.1`, and the bridge is what carries
-  every request. Allow pop-ups for chatgpt.com or it cannot start.
+  the bookmarks bar and click it while on chatgpt.com. The first ChatGPT tab opens
+  one small bridge window — keep that window open, because chatgpt.com's
+  Content-Security-Policy forbids the page itself from reaching `127.0.0.1`.
+  Launching the bookmarklet in another ChatGPT tab discovers that owner first and
+  relays through its existing bridge without opening or focusing another window.
+  Allow pop-ups for chatgpt.com so the first bridge can start.
 
 `pnpm agent` starts the agent on its own; `pnpm build:userscript` rebuilds only the
 bundle. Keep the agent running while you use Patchwork — every Git and filesystem
@@ -174,7 +176,9 @@ Reaching the agent is constrained by chatgpt.com's policy, not by preference: it
 `connect-src` has no loopback entry, so the page cannot call `127.0.0.1` directly.
 With a userscript manager, `GM_xmlhttpRequest` sidesteps that entirely. Without one,
 the bookmarklet uses the one route the policy leaves open — a popup bridge plus a
-`blob:` script element. `docs/ARCHITECTURE-V3.md` shows the exact directives.
+`blob:` script element. ChatGPT tabs coordinate before opening it, so later tabs
+reuse the first tab's bridge without foregrounding the window.
+`docs/ARCHITECTURE-V3.md` shows the exact directives.
 
 The dock renders inside a shadow root with a constructible stylesheet, so Patchwork's
 CSS and ChatGPT's CSS cannot collide and the dock keeps its styling regardless of the

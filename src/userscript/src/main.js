@@ -14,10 +14,11 @@ function resolveSettings(settings) {
     ...settings,
     origin,
     token,
-    // Set by the bookmarklet, which had to open a bridge window to get this
-    // bundle into the page in the first place.
-    prefer: bootstrap.transport === 'bridge' ? 'bridge' : null,
+    // Set by the bookmarklet. The first tab owns the bridge window; later tabs
+    // receive this bundle and their agent transport through that owner.
+    prefer: ['bridge', 'tab-relay'].includes(bootstrap.transport) ? bootstrap.transport : null,
     bridgeWindow: bootstrap.bridgeWindow || null,
+    relayRequest: bootstrap.relayRequest || null,
   };
 }
 

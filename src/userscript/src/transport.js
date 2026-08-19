@@ -97,6 +97,13 @@ function createFetchTransport({ origin, token }) {
   };
 }
 
+function createTabRelayTransport(request) {
+  return {
+    kind: 'tab-relay',
+    request,
+  };
+}
+
 function createBridgeTransport({ origin, token, bridgeWindow = null }) {
   let popup = bridgeWindow && !bridgeWindow.closed ? bridgeWindow : null;
   let ready = popup ? Promise.resolve(true) : null;
@@ -196,9 +203,15 @@ function watchPolicyViolations(origin) {
 }
 
 async function createTransport({
-  origin, token, prefer = null, bridgeWindow = null,
+  origin, token, prefer = null, bridgeWindow = null, relayRequest = null,
 }) {
   const bridge = () => createBridgeTransport({ origin, token, bridgeWindow });
+  // A later bookmarklet tab reuses the popup owned by the first tab. The
+  // bookmarklet supplies a BroadcastChannel-backed request function, so this
+  // transport must never call window.open() itself.
+  if (prefer === 'tab-relay' && typeof relayRequest === 'function') {
+    return { transport: createTabRelayTransport(relayRequest), health: null, failures: [] };
+  }
   // The bookmarklet already opened a bridge to deliver this bundle, so there is
   // nothing to discover.
   if (prefer === 'bridge') return { transport: bridge(), health: null, failures: [] };
@@ -233,6 +246,7 @@ module.exports = {
   createBridgeTransport,
   createFetchTransport,
   createGmTransport,
+  createTabRelayTransport,
   createTransport,
   probe,
 };

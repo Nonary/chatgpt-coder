@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
+const vm = require('node:vm');
 
 const {
   chatGPTProjectUrl,
@@ -426,6 +427,130 @@ test('the bookmarklet uses only injection routes chatgpt.com actually permits', 
   assert.ok(source.includes('test-token'));
 
   assert.match(bridgePage({ port: 8787, token: 'test-token' }), /boot-source/);
+});
+
+test('bookmarklets in later ChatGPT tabs reuse the existing popup without opening or focusing it', async () => {
+  const { bookmarkletSource } = require('../src/agent/install');
+  const source = bookmarkletSource({ port: 8787, token: 'test-token' });
+  const channels = new Map();
+  let popupOpens = 0;
+
+  class FakeBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.listeners = new Set();
+      if (!channels.has(name)) channels.set(name, new Set());
+      channels.get(name).add(this);
+    }
+
+    addEventListener(type, listener) {
+      if (type === 'message') this.listeners.add(listener);
+    }
+
+    removeEventListener(type, listener) {
+      if (type === 'message') this.listeners.delete(listener);
+    }
+
+    postMessage(data) {
+      for (const peer of channels.get(this.name) || []) {
+        if (peer === this) continue;
+        queueMicrotask(() => {
+          for (const listener of peer.listeners) listener({ data });
+        });
+      }
+    }
+
+    close() {
+      channels.get(this.name)?.delete(this);
+    }
+  }
+
+  function fakeTab() {
+    const windowListeners = new Map();
+    const appended = [];
+    const alerts = [];
+    const tabWindow = {
+      addEventListener(type, listener) {
+        if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+        windowListeners.get(type).add(listener);
+      },
+      removeEventListener(type, listener) {
+        windowListeners.get(type)?.delete(listener);
+      },
+      open() {
+        popupOpens += 1;
+        const popup = { closed: false, close() { this.closed = true; }, postMessage() {} };
+        queueMicrotask(() => {
+          for (const listener of windowListeners.get('message') || []) {
+            listener({
+              source: tabWindow.__patchworkBootstrap?.bridgeWindow || popup,
+              data: { channel: 'patchwork-bridge', type: 'boot-source', source: 'void 0;' },
+            });
+          }
+        });
+        return popup;
+      },
+    };
+    const document = {
+      createElement: () => ({ addEventListener() {}, src: '' }),
+      documentElement: { append: (element) => appended.push(element) },
+    };
+    const context = vm.createContext({
+      window: tabWindow,
+      document,
+      navigator: {},
+      BroadcastChannel: FakeBroadcastChannel,
+      Blob,
+      URL: { createObjectURL: () => 'blob:patchwork', revokeObjectURL() {} },
+      crypto: require('node:crypto'),
+      alert: (message) => alerts.push(message),
+      setTimeout,
+      clearTimeout,
+      queueMicrotask,
+    });
+    return { context, window: tabWindow, appended, alerts };
+  }
+
+  async function runBookmarklet(tab, label) {
+    let timer;
+    try {
+      return await Promise.race([
+        vm.runInContext(source, tab.context),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} bookmarklet timed out`)), 2_000);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const owner = fakeTab();
+  await runBookmarklet(owner, 'owner');
+  const follower = fakeTab();
+  await runBookmarklet(follower, 'follower');
+
+  assert.equal(popupOpens, 1, 'the follower discovers the owner before it calls window.open');
+  assert.equal(owner.window.__patchworkBootstrap.transport, 'bridge');
+  assert.equal(follower.window.__patchworkBootstrap.transport, 'tab-relay');
+  assert.equal(owner.appended.length, 1);
+  assert.equal(follower.appended.length, 1);
+  assert.deepEqual([...owner.alerts, ...follower.alerts], []);
+});
+
+test('the tab-relay transport never probes or opens a bridge window', async () => {
+  const { createTransport } = require('../src/userscript/src/transport');
+  const relayRequest = async (request) => ({ status: 200, text: request.path });
+  const result = await createTransport({
+    origin: 'http://127.0.0.1:8787',
+    token: 'test-token',
+    prefer: 'tab-relay',
+    relayRequest,
+  });
+
+  assert.equal(result.transport.kind, 'tab-relay');
+  assert.deepEqual(await result.transport.request({ path: '/health' }), { status: 200, text: '/health' });
+  assert.deepEqual(result.failures, []);
 });
 
 test('a bootstrapped bridge is used directly instead of probing blocked transports', async () => {

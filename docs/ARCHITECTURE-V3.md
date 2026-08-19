@@ -124,11 +124,16 @@ Three transports, probed in order at boot:
    failure message is accurate.
 3. **Popup bridge.** `window.open('http://127.0.0.1:<port>/bridge')`. The bridge page
    performs requests same-origin with the agent and relays results through
-   `postMessage`, including `ArrayBuffer` transfers.
+   `postMessage`, including `ArrayBuffer` transfers. Before opening a window, a
+   bookmarklet asks the other same-origin ChatGPT tabs for an existing bridge owner
+   over `BroadcastChannel`. Later tabs receive the bundle and proxy their requests
+   through that owner, so they neither call `window.open()` nor focus its popup.
+   Web Locks closes the simultaneous-launch race by electing one initial owner.
 
-Bookmarklet install, for users without a userscript manager, follows the only path
-the CSP leaves open: open the bridge popup → receive the bundle over `postMessage` →
-inject it as a `blob:` script → use the already-open bridge as the transport.
+The first bookmarklet install, for users without a userscript manager, follows the
+only path the CSP leaves open: open the bridge popup → receive the bundle over
+`postMessage` → inject it as a `blob:` script → use the already-open bridge as the
+transport. Later tabs receive that same bundle and transport through the owner tab.
 
 ### 4. Auth
 
