@@ -67,7 +67,9 @@ what the request is sent with.
    sticky between tasks.
 2. Describe the task. Optionally add saved prompts, local skills, reference file
    attachments, or configured IaC context, and choose whether ChatGPT runs it in a
-   plain new chat, an existing project, or a project Patchwork creates.
+   plain new chat, an existing project, or a project Patchwork creates. Enable
+   **Answer only** for questions and analysis: ChatGPT responds in the conversation
+   without modifying the bundled repositories or generating a Patchwork result file.
 3. The agent builds a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, one
    Git bundle per repository under `repositories/`, plus any `skills/`,
    `attachments/`, `iac/`, and `conflicts/` content. Already-compressed bundles are
@@ -77,9 +79,9 @@ what the request is sent with.
    `fetch` wrapper rewrites the outgoing request so the exact model and reasoning
    effort you picked are used, and aborts the send if the ZIP is not actually
    attached.
-5. ChatGPT follows the embedded protocol and attaches
-   `chatgpt-ide-result-<task-id>.txt` containing a marked `PATCHWORK_RESULT_V1`
-   envelope. The envelope is never printed in the chat.
+5. For a normal implementation task, ChatGPT follows the embedded protocol and
+   attaches `chatgpt-ide-result-<task-id>.txt` containing a marked
+   `PATCHWORK_RESULT_V1` envelope. The envelope is never printed in the chat.
 6. Patchwork reads that file out of the conversation record, downloads it, and hands
    it to the agent, which verifies the task ID, repository set, base commits, size
    limits, and base64 integrity before touching anything on disk. It then applies the

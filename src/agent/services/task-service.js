@@ -68,6 +68,7 @@ function normalizeReasoningMode(value) {
 function buildAgentInstructions(taskId, skills = [], options = {}) {
   const resultFilename = `chatgpt-ide-result-${taskId}.txt`;
   const summaryOnly = Boolean(options.summaryOnly);
+  const answerOnly = Boolean(options.answerOnly);
   const includeIac = Boolean(options.includeIac);
   const skillInstructions = skills.length
     ? `## Optional task skills
@@ -80,6 +81,30 @@ This task includes ${skills.length} selected local skill${skills.length === 1 ? 
 Task packages may include selected local skills under the \`skills/\` directory. When skills are present, use or invoke them only when they are clearly relevant to the task. Do not load unrelated skills just because they are available, and do not edit bundled skill files.
 
 `;
+  if (answerOnly) {
+    return `# Patchwork answer-only task protocol
+
+You are answering a question supplied by the user through Patchwork IDE. The uploaded ZIP is a self-contained context package containing Git bundles. This is a read-only task: inspect the supplied context, but do not modify repository files, create commits, or generate a Patchwork result file.
+
+## Inspect the supplied context
+
+1. Extract the uploaded ZIP into a writable directory.
+2. Read \`AGENTS.md\`, \`manifest.json\`, and \`TASK.md\` completely. If \`manifest.json.attachments\` is non-empty, also read each listed file under \`attachments/\`. If \`manifest.json.skills\` is non-empty, the selected skills are bundled under \`skills/\`; use them only when relevant.
+3. For each entry in \`manifest.json.repositories\`, clone its \`bundleFile\` from the extracted \`repositories\` directory into \`workspace/<id>\`, check out \`baseCommit\`, and verify that \`git rev-parse HEAD\` exactly equals that commit.
+4. Inspect relevant source, history, and captured working changes. When \`workingChanges\` is true, read \`workingStatus\` and inspect \`git diff --binary <sourceHead> <baseCommit> -- .\` when \`sourceHead\` is present.${includeIac ? `
+5. Treat every bundled entry in \`manifest.json.iac_repos\` as read-only infrastructure context. Clone it from \`iac/<...>\`, check out its supplied \`baseCommit\`, and inspect it only when relevant.` : ''}
+
+${skillInstructions}## Sandbox constraints
+
+Do not install or update dependencies, access package registries, or run builds, tests, linters, type checks, development servers, code generators, or packaging commands. You may search and inspect files and use read-only Git commands.
+
+## Answer the task
+
+Answer the question or request in \`TASK.md\` directly in the chat. Give a detailed, evidence-based explanation and connect conclusions to the relevant source, history, or supplied context. Clearly distinguish confirmed behavior from inference and call out important uncertainty.
+
+Do not edit files, create commits, generate patches, create \`chatgpt-ide-result-${taskId}.txt\`, or emit a \`PATCHWORK_RESULT_V1\` envelope. Your normal chat response is the complete result of this task.
+`;
+  }
   return `# Patchwork task protocol
 
 You are working on a task supplied by the user through Patchwork IDE.
@@ -162,16 +187,20 @@ ${summaryOnly ? 'For this read-only Git summary task, set `commitMessage` to the
 
 function buildHandoffPrompt(taskId, taskText, attachments = [], skills = [], options = {}) {
   const summaryOnly = Boolean(options.summaryOnly);
+  const answerOnly = Boolean(options.answerOnly);
   const includeIac = Boolean(options.includeIac);
   const attachmentNote = attachments.length
-    ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed before making changes.`
+    ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed ${answerOnly ? 'when answering' : 'before making changes'}.`
     : '';
   const skillNote = skills.length
     ? `\n\nThe task ZIP also includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under \`skills/\`. Use or invoke a selected skill only when it is relevant to the task, and do not load unrelated skills.`
     : '\n\nThe task ZIP may include selected local skills under \`skills/\`. Use or invoke them only when they are relevant to the task.';
   const iacNote = includeIac
-    ? '\n\nThe task package may also contain read-only infrastructure-as-code Git bundles under `iac/`. Use those repositories for deployment and platform context, but do not edit them or include them in result patches.'
+    ? `\n\nThe task package may also contain read-only infrastructure-as-code Git bundles under \`iac/\`. Use those repositories for deployment and platform context, but do not edit them${answerOnly ? '.' : ' or include them in result patches.'}`
     : '';
+  if (answerOnly) {
+    return `I attached a Patchwork IDE ZIP task package containing read-only Git context. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, inspect the bundled context, and answer the request in detail directly in the chat. Do not modify files, create commits, generate patches, or create a Patchwork result file.${attachmentNote}${skillNote}${iacNote}\n\nQuestion or request:\n${taskText}`;
+  }
   if (summaryOnly) {
     return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the generated Conventional Commit message in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nGit Summary instructions:\n${taskText}`;
   }
@@ -414,6 +443,7 @@ class TaskService {
     const model = normalizeTaskModel(input.model);
     const reasoningMode = normalizeReasoningMode(input.reasoningMode);
     const summaryOnly = Boolean(input.summaryOnly);
+    const answerOnly = Boolean(input.answerOnly);
 
     const repositories = await this.inspectRepositories(input.repositories.map((item) => item.path));
     const skillRepositoryPaths = Array.isArray(input.skillRepositoryPaths) && input.skillRepositoryPaths.length
@@ -489,7 +519,7 @@ class TaskService {
     const publicRepositories = [];
     const taskRepositories = [];
     for (const repository of repositories) {
-      const readOnly = summaryOnly || Boolean(requestedRepositories.get(repository.path)?.readOnly);
+      const readOnly = summaryOnly || answerOnly || Boolean(requestedRepositories.get(repository.path)?.readOnly);
       const bundleFile = `repositories/${repository.id}.bundle`;
       const bundlePath = path.join(taskDir, bundleFile);
       let taskRepository;
@@ -573,10 +603,12 @@ class TaskService {
       iac_repos: iacPackage.repositories,
       attachments: packageAttachments,
       skills: packageSkills,
+      answerOnly,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
     const agentInstructions = buildAgentInstructions(taskId, packageSkills, {
       summaryOnly,
+      answerOnly,
       includeIac: Boolean(input.includeIac),
     });
 
@@ -613,8 +645,9 @@ class TaskService {
       includeIac: Boolean(input.includeIac),
       autoApply: input.autoApply !== false,
       summaryOnly,
+      answerOnly,
       transport: 'zip-git-bundle',
-      resultTransport: 'downloaded-text-file',
+      resultTransport: answerOnly ? null : 'downloaded-text-file',
       treeId: input.tree?.id || null,
       treeName: input.tree?.name || null,
       mergeResolution: Boolean(input.mergeResolution),
@@ -624,7 +657,7 @@ class TaskService {
       chatStatus: null,
       chatStatusRaw: null,
       chatFinishedAt: null,
-      resultFilename: `chatgpt-ide-result-${taskId}.txt`,
+      resultFilename: answerOnly ? null : `chatgpt-ide-result-${taskId}.txt`,
       sourceRepositoryPath: input.tree?.repositoryPath
         || (taskRepositories.length === 1 ? taskRepositories[0].path : null),
       chatgptProject: input.chatgptProject?.id ? {
@@ -636,6 +669,7 @@ class TaskService {
       attachments,
       handoffPrompt: buildHandoffPrompt(taskId, taskText, attachments, packageSkills, {
         summaryOnly,
+        answerOnly,
         includeIac: Boolean(input.includeIac),
       }),
       repositories: taskRepositories,

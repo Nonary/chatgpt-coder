@@ -313,11 +313,14 @@ test('task labels and states match the states the agent can report', () => {
   assert.equal(taskStateLabel({ state: 'submitted' }), 'Running');
   assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'completed' }), 'ChatGPT finished');
   assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'failed' }), 'ChatGPT stopped');
+  assert.equal(taskStateLabel({ answerOnly: true, state: 'completed' }), 'Answered');
   assert.equal(taskStateLabel({ state: 'conflicted' }), 'Needs conflict resolution');
   assert.equal(taskStateLabel({ summaryOnly: true, state: 'ready' }), 'Summary ready');
 
   assert.equal(taskStatusText({ state: 'conflicted' })[0], 'Conflict needs resolution');
   assert.equal(taskStatusText({ summaryOnly: true, state: 'completed' })[0], 'Git Summary applied');
+  assert.equal(taskStatusText({ answerOnly: true, state: 'submitted' })[0], 'Answer is running');
+  assert.equal(taskStatusText({ answerOnly: true, state: 'completed' })[0], 'Answer complete');
 });
 
 test('the userscript bundles every module it requires and keeps its install placeholders', () => {

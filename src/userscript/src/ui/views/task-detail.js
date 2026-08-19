@@ -10,6 +10,7 @@ const NEW_TREE_VALUE = '__new__';
 function canChangeTaskTarget(task) {
   return Boolean(task)
     && !task.summaryOnly
+    && !task.answerOnly
     && ['prepared', 'submitted', 'ready', 'failed', 'conflicted'].includes(task.state)
     && (task.repositories || []).filter((repository) => !repository.readOnly).length === 1;
 }
@@ -158,7 +159,7 @@ function renderTaskDetail(ctx, task) {
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.copyPrompt(task.taskId) }, 'Copy prompt')
       : null,
     h('button', { class: 'secondary', onclick: () => ctx.actions.revealPackage(task.taskId) }, 'Show package'),
-    !task.summaryOnly
+    !task.summaryOnly && !task.answerOnly
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.importResult(task.taskId) }, 'Import result')
       : null,
     h('button', { class: 'danger', onclick: () => ctx.actions.deleteTask(task.taskId) }, 'Delete task'),

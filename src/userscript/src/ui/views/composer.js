@@ -146,6 +146,15 @@ function renderComposer(ctx) {
     },
   });
 
+  const answerOnlyCheckbox = h('input', {
+    type: 'checkbox',
+    checked: composer.answerOnly,
+    onchange: () => {
+      ctx.store.setComposer({ answerOnly: answerOnlyCheckbox.checked }, 'silent');
+      ctx.persist('task-answer-only', String(answerOnlyCheckbox.checked));
+    },
+  });
+
   const attachmentInput = h('input', {
     type: 'file',
     multiple: true,
@@ -242,6 +251,12 @@ function renderComposer(ctx) {
       ),
       selectedPrompts.length ? promptChips : null,
       h('label', { class: 'field' }, h('span', {}, 'What should ChatGPT do?'), taskText),
+      h(
+        'label',
+        { class: 'row', style: { gap: '8px' } },
+        answerOnlyCheckbox,
+        h('span', { class: 'field-help' }, 'Answer only — respond in the chat without generating a Patchwork result file or making changes'),
+      ),
       h(
         'div',
         { class: 'row' },

@@ -168,6 +168,36 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
 });
 
+test('answer-only tasks package repositories as read-only context without a result-file protocol', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-answer-only-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+
+  const task = await tasks.createTask({
+    taskText: 'Explain why this parser uses two passes.',
+    repositories: [{ path: repositoryPath }],
+    answerOnly: true,
+  });
+
+  assert.equal(task.answerOnly, true);
+  assert.equal(task.repositories[0].readOnly, true);
+  assert.equal(task.resultFilename, null);
+  assert.equal(task.resultTransport, null);
+  assert.match(task.handoffPrompt, /answer the request in detail directly in the chat/i);
+  assert.doesNotMatch(task.handoffPrompt, /required downloadable text file/i);
+
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  const agentInstructions = archive.getEntry('AGENTS.md').getData().toString('utf8');
+  assert.equal(manifest.answerOnly, true);
+  assert.equal(manifest.repositories[0].readOnly, true);
+  assert.match(agentInstructions, /normal chat response is the complete result/i);
+  assert.match(agentInstructions, /do not edit files/i);
+  assert.doesNotMatch(agentInstructions, /Produce the plain-text result/);
+});
+
 test('tasks can package multiple repositories into one ZIP', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-task-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

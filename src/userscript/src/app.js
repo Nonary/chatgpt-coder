@@ -360,6 +360,7 @@ class App {
             model: composer.model,
             reasoningMode: composer.reasoningMode,
             includeIac: composer.includeIac,
+            answerOnly: composer.answerOnly,
             chatgptProject,
           };
           if (composer.treeSelection === NEW_TREE_VALUE) {

@@ -227,6 +227,10 @@ class Driver {
         await this.api.taskChatStatus(task.taskId, { status: status.status, conversationId }).catch(() => {});
       }
       const finished = normalized !== 'streaming';
+      if (task.answerOnly) {
+        if (finished) this.activeTaskId = null;
+        return;
+      }
       const sweepDue = Date.now() - this.lastConversationSweepAt >= CONVERSATION_SWEEP_MILLISECONDS;
       if (!finished && !sweepDue) return;
     }

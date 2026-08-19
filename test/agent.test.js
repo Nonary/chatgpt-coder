@@ -205,6 +205,38 @@ test('a task travels create, download, submit, result, and apply entirely over H
   assert.equal((await agent.call('GET', '/v1/tasks')).payload.tasks.length, 0);
 });
 
+test('answer-only tasks complete with the ChatGPT response and reject result uploads', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-answer-only-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Explain how hello.txt is used.',
+    repositories: [{ path: repositoryPath }],
+    answerOnly: true,
+  });
+  assert.equal(created.status, 200);
+  const task = created.payload.task;
+  assert.equal(task.answerOnly, true);
+  assert.equal(task.resultFilename, null);
+
+  const conversationUrl = 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  await agent.call('POST', `/v1/tasks/${task.taskId}/submitted`, { conversationUrl });
+  const completed = await agent.call('POST', `/v1/tasks/${task.taskId}/chat-status`, {
+    status: 'COMPLETED',
+  });
+  assert.equal(completed.payload.task.state, 'completed');
+  assert.equal(completed.payload.task.chatStatus, 'completed');
+  assert.ok(completed.payload.task.chatFinishedAt);
+
+  const result = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, {
+    text: 'PATCHWORK_RESULT_V1',
+  });
+  assert.equal(result.status, 400);
+  assert.match(result.payload.error, /answer-only tasks do not accept/i);
+});
+
 test('a result envelope for a different task is refused before anything is applied', async (context) => {
   const agent = await startAgent(context);
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-mismatch-'));

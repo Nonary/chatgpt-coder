@@ -171,10 +171,16 @@ function register(router, context) {
     const chatStatus = normalizeConversationStreamStatus(body.status);
     if (task.chatStatus === chatStatus && task.chatStatusRaw === body.status) return { task };
     const saved = await taskService.updateTask(task.taskId, {
+      state: task.answerOnly
+        ? (chatStatus === 'completed' ? 'completed' : chatStatus === 'failed' ? 'failed' : task.state)
+        : task.state,
       conversationId: body.conversationId || task.conversationId || null,
       chatStatus,
       chatStatusRaw: body.status || null,
       chatFinishedAt: chatStatus === 'streaming' ? null : task.chatFinishedAt || new Date().toISOString(),
+      error: task.answerOnly && chatStatus === 'failed'
+        ? 'ChatGPT stopped before completing the answer.'
+        : task.error || null,
     });
     emit({
       type: 'task-chat-status',
@@ -196,6 +202,8 @@ function register(router, context) {
   // The page downloads the result text from ChatGPT and hands it to the agent for
   // envelope validation and, when auto-apply is on, application.
   router.post('/v1/tasks/:taskId/result', async ({ params, body, rawBody }) => {
+    const current = await taskService.getTask(params.taskId);
+    if (current.answerOnly) throw new Error('Answer-only tasks do not accept Patchwork result files.');
     const text = typeof body?.text === 'string' ? body.text : rawBody?.toString('utf8');
     if (!text) throw new Error('The result upload contained no text.');
     if (Buffer.byteLength(text, 'utf8') > MAX_RESULT_TEXT_BYTES) {

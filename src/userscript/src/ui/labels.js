@@ -45,6 +45,7 @@ function taskLabel(task) {
 }
 
 function taskStateLabel(task) {
+  if (task.answerOnly && task.state === 'completed') return 'Answered';
   if (task.summaryOnly) {
     if (task.state === 'completed') return 'Summary applied';
     if (task.state === 'ready') return 'Summary ready';
@@ -59,6 +60,20 @@ function taskStateLabel(task) {
 }
 
 function taskStatusText(task) {
+  if (task.answerOnly) {
+    if (task.state === 'completed') {
+      return ['Answer complete', 'ChatGPT finished its detailed response in the conversation.'];
+    }
+    if (task.state === 'submitted' && task.chatStatus === 'failed') {
+      return ['ChatGPT stopped', 'ChatGPT reported a generation failure before completing the answer.'];
+    }
+    if (task.state === 'submitted') {
+      return ['Answer is running', 'ChatGPT is working on the response. No Patchwork result file is expected.'];
+    }
+    if (task.state === 'prepared') {
+      return ['Answer task prepared', 'Submit this read-only question to ChatGPT when you are ready.'];
+    }
+  }
   if (task.summaryOnly) {
     if (task.state === 'completed') {
       return ['Git Summary applied', 'The generated Conventional Commit message was moved to the Source Control commit editor.'];
@@ -101,7 +116,8 @@ function taskConfigurationLabel(task) {
   const iac = iacCount ? ` · ${iacCount} IaC` : '';
   const model = MODEL_LABELS[task.model || 'default'] || task.model;
   const reasoning = REASONING_LABELS[task.reasoningMode || 'default'] || task.reasoningMode;
-  return `${model} · ${reasoning}${skills}${iac}`;
+  const mode = task.answerOnly ? ' · answer only' : '';
+  return `${model} · ${reasoning}${mode}${skills}${iac}`;
 }
 
 function treeStateLabel(tree) {
