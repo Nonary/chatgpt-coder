@@ -579,6 +579,33 @@ test('a bootstrapped bridge is used directly instead of probing blocked transpor
   }
 });
 
+test('the popup bridge returns asynchronous replies over a transferred message port', async () => {
+  const { createBridgeTransport } = require('../src/userscript/src/transport');
+  const previousWindow = global.window;
+  const popup = {
+    closed: false,
+    postMessage(message, origin, transfer) {
+      assert.equal(origin, 'http://127.0.0.1:8787');
+      assert.equal(message.request.path, '/health');
+      assert.equal(transfer.length, 1);
+      transfer[0].postMessage({ status: 200, text: '{"ok":true}' });
+    },
+  };
+  global.window = {
+    addEventListener: () => {},
+  };
+  try {
+    const transport = createBridgeTransport({
+      origin: 'http://127.0.0.1:8787', token: 'test-token', bridgeWindow: popup,
+    });
+    assert.deepEqual(await transport.request({ path: '/health', timeout: 1_000 }), {
+      status: 200, text: '{"ok":true}', buffer: null,
+    });
+  } finally {
+    global.window = previousWindow;
+  }
+});
+
 test('project listing matches the sidebar shape a real session returns', async () => {
   const { installDocument: install } = require('./helpers/dom-stub');
   const previous = { fetch: global.fetch, location: global.location, localStorage: global.localStorage };
@@ -770,4 +797,6 @@ test('the picker mounts inside the composer rather than floating over the page',
   // With no anchor in the composer the picker is not installed at all.
   assert.match(source, /if \(!slot\?\.isConnected\)/);
   assert.match(source, /--patchwork-dock-width/, 'the menu is kept clear of the dock');
+  assert.match(source, /if \(!externalMutation\) return/, 'the observer ignores Patchwork-owned mutations');
+  assert.doesNotMatch(source, /slot\.style\.cssText\s*=/, 'slot resizing does not blindly retrigger style observation');
 });

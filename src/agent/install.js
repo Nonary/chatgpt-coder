@@ -323,11 +323,12 @@ function bridgePage(config) {
     if (!ALLOWED.has(event.origin)) return;
     const message = event.data;
     if (!message || message.channel !== 'patchwork-bridge' || message.type !== 'request') return;
-    const reply = (payload, transfer = []) => event.source.postMessage(
-      { channel: 'patchwork-bridge', type: 'response', id: message.id, ...payload },
-      event.origin,
-      transfer,
-    );
+    const replyPort = event.ports?.[0] || null;
+    const reply = (payload, transfer = []) => {
+      const response = { channel: 'patchwork-bridge', type: 'response', id: message.id, ...payload };
+      if (replyPort) replyPort.postMessage(response, transfer);
+      else event.source?.postMessage(response, event.origin, transfer);
+    };
     try {
       const result = await perform(message.request);
       reply(result, result.buffer ? [result.buffer] : []);

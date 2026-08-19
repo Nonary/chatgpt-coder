@@ -552,4 +552,6 @@ test('only one bridge window survives, and an orphaned one closes itself', async
   assert.match(transport, /addEventListener\('pagehide'/);
   assert.match(transport, /popup\.close\(\)/);
   assert.match(transport, /'patchwork-bridge',/, 'the window is named so it is reused, not duplicated');
+  assert.match(transport, /new MessageChannel\(\)/, 'requests transfer a durable response port');
+  assert.match(page, /event\.ports\?\.\[0\]/, 'the bridge replies through the transferred port');
 });

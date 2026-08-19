@@ -257,8 +257,16 @@ function resizeLayoutSlot(picker) {
   const bounds = picker.getBoundingClientRect();
   const width = Math.ceil(Math.max(Number(slot.dataset.nativeWidth || 0), bounds.width));
   const height = Math.ceil(Math.max(Number(slot.dataset.nativeHeight || 0), bounds.height));
-  slot.style.cssText = 'display:inline-flex;align-items:center;vertical-align:middle;'
-    + `min-width:${Math.min(width, 220)}px;min-height:${height}px;`;
+  const values = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    verticalAlign: 'middle',
+    minWidth: `${Math.min(width, 220)}px`,
+    minHeight: `${height}px`,
+  };
+  for (const [property, value] of Object.entries(values)) {
+    if (slot.style[property] !== value) slot.style[property] = value;
+  }
 }
 
 function buildPicker() {
@@ -394,7 +402,12 @@ function install({
   const picker = replaceNativePickers();
 
   let pending = false;
-  const observer = new MutationObserver(() => {
+  const observer = new MutationObserver((records) => {
+    const externalMutation = records.some((record) => {
+      const target = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
+      return !target?.closest?.(`${PICKER_TAG}, ${MENU_TAG}, ${SLOT_TAG}, #${SUPPRESSION_ID}`);
+    });
+    if (!externalMutation) return;
     if (pending) return;
     pending = true;
     queueMicrotask(() => {

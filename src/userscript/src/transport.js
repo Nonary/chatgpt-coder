@@ -168,6 +168,33 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
         body: typeof body === 'string' ? body : null,
         responseType: options.responseType || 'text',
       };
+
+      // Keep the response path independent of MessageEvent.source. Chromium can
+      // deliver a cross-origin popup request while leaving the source WindowProxy
+      // unusable by the time the bridge's asynchronous fetch completes. A port
+      // transferred with the request remains a direct, durable reply channel.
+      if (typeof MessageChannel === 'function') {
+        return new Promise((resolve, reject) => {
+          const channel = new MessageChannel();
+          const timer = setTimeout(() => {
+            channel.port1.close();
+            reject(new Error('The Patchwork bridge did not answer in time.'));
+          }, options.timeout || DEFAULT_TIMEOUT);
+          channel.port1.onmessage = (event) => {
+            clearTimeout(timer);
+            channel.port1.close();
+            const message = event.data || {};
+            if (message.error) reject(new Error(message.error));
+            else resolve({ status: message.status, text: message.text ?? null, buffer: message.buffer ?? null });
+          };
+          popup.postMessage(
+            { channel: BRIDGE_CHANNEL, type: 'request', id, request },
+            origin,
+            [channel.port2],
+          );
+        });
+      }
+
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
