@@ -8,17 +8,32 @@ const WIDTH_KEY = 'patchwork.dock-width';
 const OPEN_KEY = 'patchwork.dock-open';
 const LAYOUT_KEY = 'patchwork.dock-layout';
 
-// Reserving room on <html> makes ChatGPT reflow into the remaining width instead
-// of being covered by the dock. Applied through CSSOM so the page's style-src
-// policy has no say, and reversible the moment the dock closes.
+// Reserving room for the dock is not as simple as a margin on <html>: ChatGPT's
+// shell is positioned against the viewport, so it ignores one entirely. Narrowing
+// <body> AND giving it a transform is what works - a transformed element becomes
+// the containing block for its position:fixed descendants, so ChatGPT's header,
+// composer, and modals resolve against the narrowed body instead of the viewport.
+//
+// The dock itself is appended to <html>, outside <body>, so the transform never
+// applies to it. Applied through CSSOM so the page's style-src policy has no say,
+// and fully reversed the moment the dock closes.
 const PAGE_LAYOUT_CSS = `
 html.patchwork-pushed {
-  margin-right: var(--patchwork-dock-width, 0px) !important;
-  width: auto !important;
-  max-width: none !important;
   overflow-x: hidden !important;
 }
-html.patchwork-pushed body {
+html.patchwork-pushed > body {
+  width: calc(100% - var(--patchwork-dock-width, 0px)) !important;
+  max-width: calc(100% - var(--patchwork-dock-width, 0px)) !important;
+  min-width: 0 !important;
+  margin-right: 0 !important;
+  overflow-x: hidden !important;
+  transform: translateZ(0) !important;
+  transform-origin: top left !important;
+}
+/* Viewport units are measured against the window, not the narrowed body. */
+html.patchwork-pushed > body .w-screen,
+html.patchwork-pushed > body [style*="100vw"] {
+  width: 100% !important;
   max-width: 100% !important;
 }
 `;
@@ -55,8 +70,10 @@ function writeStorage(key, value) {
 // adopted through CSSOM rather than a <style> tag so the page's style-src CSP
 // can never suppress it.
 class Shell {
-  constructor({ onNavigate } = {}) {
+  constructor({ onNavigate, onPushIneffective } = {}) {
     this.onNavigate = onNavigate || (() => {});
+    this.onPushIneffective = onPushIneffective || null;
+    this.pushWarned = false;
     this.views = new Map();
     this.navButtons = new Map();
     this.activeView = null;
@@ -132,11 +149,35 @@ class Shell {
   applyPageLayout() {
     const root = document.documentElement;
     const pushed = this.layoutMode === 'push' && !this.dock.hidden;
-    root.style.setProperty(
-      '--patchwork-dock-width',
-      pushed ? `${Math.round(this.dock.getBoundingClientRect().width)}px` : '0px',
-    );
+    const width = pushed ? Math.round(this.dock.getBoundingClientRect().width) : 0;
+    root.style.setProperty('--patchwork-dock-width', `${width}px`);
     root.classList.toggle('patchwork-pushed', pushed);
+    if (pushed) requestAnimationFrame(() => this.reportPushEffect(width));
+  }
+
+  // Whether the page actually moved is a fact about ChatGPT's layout, not
+  // something to assume: measure it and say so rather than leaving the dock
+  // sitting on top of the conversation with no explanation.
+  measurePush(width) {
+    const limit = window.innerWidth - width;
+    const probes = ['main', 'form', '[data-testid="composer-root"]', '#thread', 'body > div']
+      .map((selector) => document.querySelector(selector))
+      .filter(Boolean);
+    const worst = probes.reduce((right, node) => Math.max(right, node.getBoundingClientRect().right), 0);
+    return { effective: probes.length === 0 || worst <= limit + 8, worst: Math.round(worst), limit: Math.round(limit) };
+  }
+
+  reportPushEffect(width) {
+    const result = this.measurePush(width);
+    if (result.effective) {
+      this.pushWarned = false;
+      return result;
+    }
+    if (!this.pushWarned) {
+      this.pushWarned = true;
+      this.onPushIneffective?.(result);
+    }
+    return result;
   }
 
   setLayoutMode(mode) {

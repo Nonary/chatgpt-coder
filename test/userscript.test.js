@@ -580,3 +580,49 @@ test('the request enforcer reads the picker at send time, not at task creation',
     delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
   }
 });
+
+test('the picker governs ordinary sends, not only Patchwork task sends', async () => {
+  delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  const intercept = require('../src/userscript/src/chatgpt/intercept');
+  const { taskRequestConfiguration } = require('../src/shared/chatgpt');
+
+  const previous = { window: global.window, location: global.location };
+  global.location = { origin: 'https://chatgpt.com' };
+  let sent = null;
+  global.window = {
+    fetch: async (url, init) => {
+      sent = { url: String(url), body: init?.body ?? null };
+      return new Response('data: {}', { status: 200 });
+    },
+  };
+  try {
+    // No task is in flight; only the composer picker is set.
+    let pickerInstalled = true;
+    intercept.setAmbientConfiguration(() => (pickerInstalled
+      ? { ...taskRequestConfiguration('luna', 'high'), source: 'patchwork-selector' }
+      : null));
+
+    await window.fetch('https://chatgpt.com/backend-api/f/conversation', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-5-6', messages: [] }),
+    });
+    const rewritten = JSON.parse(sent.body);
+    assert.equal(rewritten.model, 'gpt-5-6-t-mini', 'an ordinary chat is sent as Luna');
+    assert.equal(rewritten.thinking_effort, 'extended');
+
+    // With no picker installed Patchwork must not touch ChatGPT's own request.
+    pickerInstalled = false;
+    const original = JSON.stringify({ model: 'gpt-5-6', messages: [] });
+    await window.fetch('https://chatgpt.com/backend-api/f/conversation', { method: 'POST', body: original });
+    assert.equal(sent.body, original, 'declining the resolver leaves the request untouched');
+
+    // Unrelated endpoints are never rewritten.
+    await window.fetch('https://chatgpt.com/backend-api/conversations', { method: 'POST', body: '{"a":1}' });
+    assert.equal(sent.body, '{"a":1}');
+  } finally {
+    intercept.setAmbientConfiguration(null);
+    global.window = previous.window;
+    global.location = previous.location;
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  }
+});

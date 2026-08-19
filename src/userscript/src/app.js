@@ -1,4 +1,5 @@
 const chatgpt = require('./chatgpt/api');
+const intercept = require('./chatgpt/intercept');
 const modelPicker = require('./chatgpt/model-picker');
 const navigate = require('./chatgpt/navigate');
 const { Driver } = require('./driver');
@@ -15,6 +16,7 @@ const { renderHistory } = require('./ui/views/history');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
 const { taskLabel } = require('./ui/labels');
+const { taskRequestConfiguration } = require('../../shared/chatgpt');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
 
@@ -24,7 +26,13 @@ class App {
     this.transport = transport;
     this.version = version;
     this.store = new Store();
-    this.shell = new Shell({ onNavigate: () => this.renderActiveView() });
+    this.shell = new Shell({
+      onNavigate: () => this.renderActiveView(),
+      onPushIneffective: (result) => {
+        this.store.addActivity(`The page did not reflow around the dock (content reaches ${result.worst}px of ${result.limit}px). Use the layout button for overlay.`);
+        this.toast('ChatGPT did not reflow around the dock. Try the layout button in the header.', true);
+      },
+    });
     this.driver = new Driver({ api, report: (event) => this.handleEvent(event) });
     this.diff = null;
     this.eventSequence = 0;
@@ -675,6 +683,17 @@ class App {
         this.renderActiveView();
       },
     });
+    // Ordinary chats are sent with whatever the picker shows too, not only the
+    // chats Patchwork drives; without this the picker would be decorative.
+    intercept.setAmbientConfiguration(() => {
+      if (!modelPicker.isInstalled()) return null;
+      const selected = modelPicker.currentSelection();
+      return {
+        ...taskRequestConfiguration(selected.model, selected.reasoningMode),
+        source: 'patchwork-selector',
+      };
+    });
+
     // Keep ChatGPT's composer in step when the choice is made in the dock instead.
     this.store.subscribe((state, reason) => {
       if (reason === 'composer' || reason === 'silent') {

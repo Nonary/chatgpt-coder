@@ -8,7 +8,24 @@ const PREPARE_PATH = '/backend-api/f/conversation/prepare';
 
 let installed = false;
 let enforcement = null;
+let ambient = null;
 let nativeFetch = null;
+
+// Patchwork replaces ChatGPT's model control, so it owes every send the model that
+// control shows - not just the sends it makes itself. The ambient resolver applies
+// the composer picker to ordinary chats; a task submission layers its own
+// enforcement (which also verifies the attachment) on top.
+function setAmbientConfiguration(resolver) {
+  ambient = typeof resolver === 'function' ? resolver : null;
+  if (ambient) installInterceptor();
+  return ambient;
+}
+
+function activeEnforcement() {
+  if (enforcement) return enforcement;
+  if (!ambient) return null;
+  return { resolveConfiguration: ambient, packageFilename: null, settle: () => {} };
+}
 
 function requestUrl(input) {
   if (typeof input === 'string') return input;
@@ -52,7 +69,8 @@ function installInterceptor() {
     const path = pathOf(input);
     const isConversation = path === CONVERSATION_PATH;
     const isPrepare = path === PREPARE_PATH;
-    if (!enforcement || methodOf(input, init) !== 'POST' || (!isConversation && !isPrepare)) {
+    const active = activeEnforcement();
+    if (!active || methodOf(input, init) !== 'POST' || (!isConversation && !isPrepare)) {
       return nativeFetch(input, init);
     }
 
@@ -69,17 +87,20 @@ function installInterceptor() {
     let configuration;
     let rewritten;
     try {
-      configuration = enforcement.resolveConfiguration();
+      configuration = active.resolveConfiguration();
+      // A resolver may decline - the picker is not installed, for instance - and
+      // then ChatGPT's own request is left exactly as it was.
+      if (!configuration) return nativeFetch(input, init);
       rewritten = rewriteConversationRequestBody(text, configuration);
     } catch (error) {
-      if (isConversation) enforcement.settle({ ok: false, error: error.message });
+      if (isConversation) active.settle({ ok: false, error: error.message });
       return nativeFetch(input, init);
     }
 
-    if (isConversation && enforcement.packageFilename
-      && !conversationRequestIncludesAttachment(rewritten.text, enforcement.packageFilename)) {
-      const message = `ChatGPT's outgoing request did not include the task ZIP attachment (${enforcement.packageFilename}).`;
-      enforcement.settle({ ok: false, retrySubmission: true, error: message });
+    if (isConversation && active.packageFilename
+      && !conversationRequestIncludesAttachment(rewritten.text, active.packageFilename)) {
+      const message = `ChatGPT's outgoing request did not include the task ZIP attachment (${active.packageFilename}).`;
+      active.settle({ ok: false, retrySubmission: true, error: message });
       throw new DOMException(message, 'AbortError');
     }
 
@@ -102,7 +123,7 @@ function installInterceptor() {
     };
     const response = await nativeFetch(requestUrl(input), nextInit);
     if (isConversation) {
-      enforcement.settle({
+      active.settle({
         ok: true,
         model: rewritten.model,
         thinkingEffort: rewritten.thinkingEffort,
@@ -197,5 +218,10 @@ function isInstalled() {
 }
 
 module.exports = {
-  CONVERSATION_ID_PATTERN, beginEnforcement, installInterceptor, isInstalled, readConversationId,
+  CONVERSATION_ID_PATTERN,
+  beginEnforcement,
+  installInterceptor,
+  isInstalled,
+  readConversationId,
+  setAmbientConfiguration,
 };
