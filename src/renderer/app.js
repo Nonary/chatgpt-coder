@@ -21,6 +21,7 @@ const state = {
   editingPromptId: null,
   chatgptProjects: [],
   projectSelection: undefined,
+  gitSummaryModel: 'luna',
   conflictResolutionTaskId: null,
   gitSummaryBusy: false,
   diffTabContextKey: null,
@@ -31,6 +32,7 @@ const TASK_REASONING_STORAGE_KEY = 'patchwork.task-reasoning';
 const TASK_TREE_STORAGE_KEY = 'patchwork.task-tree';
 const TASK_REPOSITORIES_STORAGE_KEY = 'patchwork.task-repositories';
 const TASK_PROJECT_STORAGE_KEY = 'patchwork.task-project';
+const GIT_SUMMARY_MODEL_STORAGE_KEY = 'patchwork.git-summary-model';
 const PROMPT_LIBRARY_STORAGE_KEY = 'patchwork.prompt-library';
 const TASK_NEW_TREE_VALUE = '__new__';
 const MAX_PROMPTS = 100;
@@ -62,7 +64,7 @@ const elements = Object.fromEntries(
     'task-model-select', 'task-reasoning-select',
     'chatgpt-project-select', 'new-project-fields', 'new-project-name',
     'refresh-projects-button', 'project-list-status',
-    'source-chatgpt-project-select', 'source-refresh-projects-button', 'source-project-list-status',
+    'source-ai-summary-model-select', 'source-chatgpt-project-select', 'source-refresh-projects-button', 'source-project-list-status',
     'trees-project-select', 'trees-refresh-projects-button',
     'create-task-button', 'task-status-title', 'task-status-copy', 'status-badge',
     'submit-task-button', 'copy-prompt-button', 'reveal-package-button',
@@ -141,6 +143,16 @@ function restoreTaskReasoningSelection() {
 
 function persistTaskReasoningSelection(event) {
   persistTaskSelectSelection(event.target, TASK_REASONING_STORAGE_KEY);
+}
+
+function restoreGitSummaryModelSelection() {
+  restoreTaskSelectSelection(elements['source-ai-summary-model-select'], GIT_SUMMARY_MODEL_STORAGE_KEY);
+  state.gitSummaryModel = elements['source-ai-summary-model-select'].value || 'luna';
+}
+
+function persistGitSummaryModelSelection(event) {
+  state.gitSummaryModel = event.target.value || 'luna';
+  persistTaskSelectSelection(event.target, GIT_SUMMARY_MODEL_STORAGE_KEY);
 }
 
 function createPromptId() {
@@ -1508,7 +1520,7 @@ function taskStatusText(task) {
       return ['Git Summary stopped', 'ChatGPT reported a generation failure for this summary.'];
     }
     if (task.state === 'submitted') {
-      return ['Generating Git Summary', 'Luna is reviewing the packaged working changes. Patchwork is monitoring the conversation and result file.'];
+      return ['Generating Git Summary', 'ChatGPT is reviewing the packaged working changes. Patchwork is monitoring the conversation and result file.'];
     }
     if (task.state === 'prepared') {
       return ['Preparing Git Summary', 'Patchwork is packaging the current working changes and preparing the ChatGPT request.'];
@@ -1664,6 +1676,7 @@ async function showSourceControl() {
   elements['trees-button'].classList.remove('active');
   elements['task-history-button'].classList.remove('active');
   window.patchwork.setBrowserVisible(false);
+  restoreGitSummaryModelSelection();
   restoreTaskProjectSelection();
   renderSourceChatGPTProjectSelection();
   renderSourceRepositories();
@@ -2025,6 +2038,7 @@ function renderGitStatus() {
     elements['source-remove-repository'].disabled = state.gitSummaryBusy;
     elements['source-ai-summary-button'].disabled = true;
     elements['source-commit-button'].disabled = true;
+    elements['source-ai-summary-model-select'].disabled = false;
     elements['source-chatgpt-project-select'].disabled = false;
     elements['source-refresh-projects-button'].disabled = false;
     elements['source-git-summary-prompt-button'].disabled = state.gitSummaryBusy;
@@ -2050,6 +2064,7 @@ function renderGitStatus() {
   elements['unstage-all-button'].disabled = staged.length === 0;
   elements['source-ai-summary-button'].disabled = total === 0 || state.gitSummaryBusy;
   elements['source-commit-button'].disabled = staged.length === 0 || state.gitSummaryBusy;
+  elements['source-ai-summary-model-select'].disabled = state.gitSummaryBusy;
   elements['source-repository-select'].disabled = state.gitSummaryBusy;
   elements['source-refresh'].disabled = state.gitSummaryBusy;
   elements['source-remove-repository'].disabled = state.gitSummaryBusy;
@@ -2167,6 +2182,7 @@ async function generateGitSummary() {
       repositoryPath,
       gitSummaryPrompt(),
       chatgptProject,
+      state.gitSummaryModel,
     );
     const task = result.task;
     upsertTask(task);
@@ -2322,6 +2338,7 @@ elements['task-target-select'].addEventListener('change', (event) => {
 elements['task-target-create-button'].addEventListener('click', createActiveTaskTargetTree);
 elements['task-model-select'].addEventListener('change', persistTaskModelSelection);
 elements['task-reasoning-select'].addEventListener('change', persistTaskReasoningSelection);
+elements['source-ai-summary-model-select'].addEventListener('change', persistGitSummaryModelSelection);
 elements['prompt-library-trigger'].addEventListener('click', togglePromptLibraryMenu);
 elements['prompt-library-manage-button'].addEventListener('click', () => openPromptManager());
 elements['prompt-library-new-button'].addEventListener('click', () => {
@@ -2545,6 +2562,13 @@ window.patchwork.onTaskEvent((event) => {
     elements['session-browser-status'].textContent = event.loading ? 'Loading…' : 'Persistent embedded session';
     elements['session-status-dot'].classList.toggle('loading', event.loading);
   }
+  if (event.type === 'browser-network-recovery') {
+    elements['browser-status'].textContent = 'Reconnecting…';
+    elements['browser-status-dot'].classList.add('loading');
+    elements['session-browser-status'].textContent = 'Reconnecting…';
+    elements['session-status-dot'].classList.add('loading');
+  }
+  if (event.type === 'browser-network-warning') showToast(event.message, true);
   if (event.type === 'browser-title' && event.title) {
     elements['browser-title'].textContent = event.title;
     elements['session-browser-title'].textContent = event.title;
@@ -2579,6 +2603,7 @@ async function initialize() {
     restoreTaskRepositorySelection();
     restoreTaskModelSelection();
     restoreTaskReasoningSelection();
+    restoreGitSummaryModelSelection();
     restoreTaskProjectSelection();
     loadPromptLibrary();
     renderTaskList();

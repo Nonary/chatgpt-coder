@@ -76,6 +76,8 @@ pnpm install
 pnpm start
 ```
 
+The embedded ChatGPT session uses a direct Chromium connection by default so OS-level proxy auto-discovery or PAC configuration cannot stall page bootstrap requests. If a network requires its system proxy, launch Patchwork with `PATCHWORK_USE_SYSTEM_PROXY=1` to restore Chromium's normal system-proxy behavior for that session.
+
 Verify the project:
 
 ```sh

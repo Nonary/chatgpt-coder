@@ -13,6 +13,18 @@ const NOTICE_EVENT_COOLDOWN_MILLISECONDS = 60_000;
 const SUBMISSION_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const TASK_REQUEST_CONFIRMATION_TIMEOUT_MILLISECONDS = 30_000;
 const HIDDEN_VIEW_BOUNDS = Object.freeze({ x: 0, y: 0, width: 0, height: 0 });
+const USE_SYSTEM_PROXY = process.env.PATCHWORK_USE_SYSTEM_PROXY === '1';
+const CONNECTIVITY_FAILURE_WINDOW_MILLISECONDS = 2_500;
+const CONNECTIVITY_RECOVERY_DELAY_MILLISECONDS = 1_500;
+const RECOVERABLE_NETWORK_ERRORS = new Set([
+  'ERR_CONNECTION_CLOSED',
+  'ERR_CONNECTION_RESET',
+  'ERR_INTERNET_DISCONNECTED',
+  'ERR_NETWORK_CHANGED',
+  'ERR_PROXY_CONNECTION_FAILED',
+  'ERR_TIMED_OUT',
+  'ERR_TUNNEL_CONNECTION_FAILED',
+]);
 const DISMISSIBLE_LIMIT_NOTICE = /(?:too many requests|messages? limit reached|usage (?:limit|cap) (?:reached|exceeded)|rate limit (?:reached|exceeded)|you(?:['’]ve| have) (?:reached|hit) (?:the |your )?(?:current |daily |monthly |plan )?(?:message |messages |usage |rate |chatgpt )?(?:limit|cap))/i;
 const DISMISSIVE_NOTICE_ACTION = /^(?:got it|close|dismiss|ok|okay)$/i;
 const CHATGPT_STREAM_STATUS_URL_PATTERN = /^https:\/\/chatgpt\.com\/backend-api\/conversation\/([^/]+)\/stream_status(?:\?.*)?$/i;
@@ -46,6 +58,20 @@ function sameBounds(left, right) {
     && left.y === right.y
     && left.width === right.width
     && left.height === right.height;
+}
+
+function isRecoverableChatGPTNetworkFailure(details = {}) {
+  const error = String(details.error || '').replace(/^net::/i, '').toUpperCase();
+  if (!RECOVERABLE_NETWORK_ERRORS.has(error)) return false;
+  let url;
+  try {
+    url = new URL(String(details.url || ''));
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:' || url.hostname !== 'chatgpt.com') return false;
+  if (details.resourceType === 'mainFrame') return true;
+  return url.pathname.startsWith('/backend-api/') || url.pathname.startsWith('/cdn/assets/');
 }
 
 function taskRequestConfiguration(model, reasoningMode) {
@@ -803,6 +829,8 @@ class ChatGPTView {
     this.dismissalBusy = false;
     this.dismissedNoticeEvents = new Map();
     this.configurationPickerTimer = null;
+    this.connectivityFailures = [];
+    this.connectivityRecoveryTimer = null;
     this.visible = false;
     this.windowFocused = this.mainWindow.isFocused?.() ?? false;
     this.browserBounds = { ...HIDDEN_VIEW_BOUNDS };
@@ -830,6 +858,7 @@ class ChatGPTView {
       setImmediate(() => this.syncViewPresentation());
     });
     this.installNavigationHandlers();
+    this.installConnectivityRecovery();
     this.installConversationStatusListener();
     this.installDownloadListener();
     this.installMergeDownloadListener();
@@ -838,10 +867,32 @@ class ChatGPTView {
     this.mainWindow.once('closed', () => {
       clearInterval(this.resultMonitor);
       clearTimeout(this.configurationPickerTimer);
+      clearTimeout(this.connectivityRecoveryTimer);
     });
-    this.view.webContents.loadURL(
+    this.networkReady = this.configureBrowserSessionNetwork();
+    this.networkReady.then(() => this.view.webContents.loadURL(
       this.activeMerge?.mergeConversationUrl || this.activeTask?.conversationUrl || CHATGPT_URL,
-    );
+    )).catch((error) => {
+      this.handleConnectivityFailure({
+        url: this.view.webContents.getURL() || CHATGPT_URL,
+        error: error?.code || error?.message,
+        resourceType: 'mainFrame',
+      });
+    });
+  }
+
+  async configureBrowserSessionNetwork() {
+    if (USE_SYSTEM_PROXY) return 'system';
+    try {
+      await this.view.webContents.session.setProxy({ mode: 'direct' });
+      return 'direct';
+    } catch (error) {
+      await this.onEvent({
+        type: 'browser-network-warning',
+        message: `Could not bypass the system proxy for ChatGPT: ${error.message}`,
+      });
+      return 'system';
+    }
   }
 
   installNavigationHandlers() {
@@ -869,6 +920,13 @@ class ChatGPTView {
       this.installResultWatcher();
       this.scheduleTaskConfigurationPicker();
     });
+    contents.on('did-fail-load', (_event, _errorCode, errorDescription, validatedURL, isMainFrame) => {
+      this.handleConnectivityFailure({
+        url: validatedURL || contents.getURL(),
+        error: errorDescription,
+        resourceType: isMainFrame ? 'mainFrame' : 'subFrame',
+      });
+    });
     contents.on('dom-ready', () => {
       this.installResultWatcher();
       this.scheduleTaskConfigurationPicker();
@@ -887,6 +945,56 @@ class ChatGPTView {
     contents.on('render-process-gone', (_event, details) => {
       this.onEvent({ type: 'task-failed', message: `The embedded ChatGPT renderer stopped: ${details.reason}` });
     });
+  }
+
+  installConnectivityRecovery() {
+    this.connectivityErrorListener = (details) => {
+      if (details.webContentsId && details.webContentsId !== this.view.webContents.id) return;
+      this.handleConnectivityFailure(details);
+    };
+    this.view.webContents.session.webRequest.onErrorOccurred(
+      { urls: ['https://chatgpt.com/*'] },
+      this.connectivityErrorListener,
+    );
+  }
+
+  handleConnectivityFailure(details) {
+    if (!isRecoverableChatGPTNetworkFailure(details)) return;
+    const now = Date.now();
+    this.connectivityFailures = this.connectivityFailures
+      .filter((startedAt) => now - startedAt <= CONNECTIVITY_FAILURE_WINDOW_MILLISECONDS);
+    this.connectivityFailures.push(now);
+    if (details.resourceType !== 'mainFrame' && this.connectivityFailures.length < 2) return;
+    this.scheduleConnectivityRecovery();
+  }
+
+  canAutomaticallyRecoverConnectivity() {
+    return this.activeTask?.state !== 'submitted'
+      && this.activeMerge?.mergeState !== 'submitted';
+  }
+
+  scheduleConnectivityRecovery() {
+    if (!this.canAutomaticallyRecoverConnectivity() || this.connectivityRecoveryTimer) return;
+    this.connectivityRecoveryTimer = setTimeout(() => {
+      this.connectivityRecoveryTimer = null;
+      this.recoverConnectivity().catch(() => {});
+    }, CONNECTIVITY_RECOVERY_DELAY_MILLISECONDS);
+    this.connectivityRecoveryTimer.unref?.();
+  }
+
+  async recoverConnectivity() {
+    if (!this.canAutomaticallyRecoverConnectivity()) return false;
+    await this.networkReady;
+    const contents = this.view.webContents;
+    const currentUrl = contents.getURL();
+    const targetUrl = /^https:\/\/chatgpt\.com\//i.test(currentUrl) ? currentUrl : CHATGPT_URL;
+    this.connectivityFailures = [];
+    await this.onEvent({
+      type: 'browser-network-recovery',
+      message: 'ChatGPT networking stalled. Retrying the embedded page…',
+    });
+    await contents.loadURL(targetUrl);
+    return true;
   }
 
   async handlePageTitleUpdated(title) {
@@ -1186,6 +1294,7 @@ class ChatGPTView {
   }
 
   async newChat(projectId = null, projectShortUrl = null) {
+    await this.networkReady;
     const targetUrl = projectId ? chatGPTProjectUrl(projectId, projectShortUrl) : CHATGPT_URL;
     if (this.view.webContents.getURL() !== targetUrl) {
       await this.view.webContents.loadURL(targetUrl);
@@ -1345,6 +1454,7 @@ class ChatGPTView {
   }
 
   async reload() {
+    await this.networkReady;
     this.view.webContents.reload();
     return true;
   }
@@ -2131,6 +2241,7 @@ module.exports = {
   conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  isRecoverableChatGPTNetworkFailure,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,

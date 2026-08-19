@@ -20,6 +20,7 @@ const {
   conversationIdFromStreamStatusUrl,
   isChatGPTConversationUrl,
   isDismissibleLimitNotice,
+  isRecoverableChatGPTNetworkFailure,
   normalizeConversationStreamStatus,
   recoverUnconfirmedSubmissions,
   rewriteConversationRequestBody,
@@ -196,7 +197,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
   assert.equal(result.result.commitMessage, 'fix(source-control): generate AI commit summaries');
 });
 
-test('Source Control summaries prepare a normal Luna Medium task and reuse standard task submission', async () => {
+test('Source Control summaries support a selectable model and reuse standard task submission', async () => {
   const appSource = await fs.readFile(path.join(__dirname, '../src/main/app.js'), 'utf8');
   const renderer = await fs.readFile(path.join(__dirname, '../src/renderer/app.js'), 'utf8');
   const markup = await fs.readFile(path.join(__dirname, '../src/renderer/index.html'), 'utf8');
@@ -206,7 +207,7 @@ test('Source Control summaries prepare a normal Luna Medium task and reuse stand
     appSource.indexOf("ipcMain.handle('trees:list'"),
   );
 
-  assert.match(summaryHandler, /model: 'luna',[\s\S]*reasoningMode: 'medium'/);
+  assert.match(summaryHandler, /model: model \|\| 'luna',[\s\S]*reasoningMode: 'medium'/);
   assert.match(summaryHandler, /chatgptProject/);
   assert.match(summaryHandler, /type: 'task-prepared'/);
   assert.match(summaryHandler, /await chatGPTView\.prepare\(task\)/);
@@ -218,7 +219,11 @@ test('Source Control summaries prepare a normal Luna Medium task and reuse stand
   assert.doesNotMatch(renderer, /const hiddenTask = Boolean\(event\.task\?\.summaryOnly\)/);
   assert.doesNotMatch(renderer, /function upsertTask\(task\) \{\s*if \(task\?\.summaryOnly\) return;/);
   assert.match(renderer, /task\.summaryOnly \|\| task\.state !== 'ready'/);
-  assert.match(renderer, /window\.patchwork\.gitSummary\([\s\S]*chatgptProject/);
+  assert.match(renderer, /window\.patchwork\.gitSummary\([\s\S]*chatgptProject,[\s\S]*state\.gitSummaryModel/);
+  assert.match(renderer, /GIT_SUMMARY_MODEL_STORAGE_KEY = 'patchwork\.git-summary-model'/);
+  assert.match(renderer, /source-ai-summary-model-select/);
+  assert.match(renderer, /function restoreGitSummaryModelSelection\(\)/);
+  assert.match(renderer, /function persistGitSummaryModelSelection\(event\)/);
   assert.match(renderer, /window\.patchwork\.submitTask\(task\.taskId\)/);
   assert.match(renderer, /useActiveGitSummary/);
   assert.match(renderer, /source-commit-message'\]\.value = completed\.result\.commitMessage/);
@@ -227,9 +232,14 @@ test('Source Control summaries prepare a normal Luna Medium task and reuse stand
   assert.match(renderer, /source-chatgpt-project-select'\]\.addEventListener\('change'[\s\S]*persistTaskProjectSelection\(event\)/);
   assert.match(renderer, /function renderSourceChatGPTProjectSelection\(\)/);
   assert.match(markup, /id="source-chatgpt-project-select"/);
+  assert.match(markup, /id="source-ai-summary-model-select"/);
+  assert.match(markup, /option value="default">ChatGPT default/);
+  assert.match(markup, /option value="sol">GPT-5\.6 Sol/);
+  assert.match(markup, /option value="luna" selected>GPT-5\.6 Luna/);
   assert.match(markup, /id="source-refresh-projects-button"/);
   assert.match(markup, /id="use-git-summary-button"[^>]*>Use in Source Control<\/button>/);
-  assert.match(preload, /gitSummary: \(repositoryPath, customPrompt, chatgptProject\)/);
+  assert.match(preload, /gitSummary: \(repositoryPath, customPrompt, chatgptProject, model\)/);
+  assert.match(preload, /ipcRenderer\.invoke\('git:summary', repositoryPath, customPrompt, chatgptProject, model\)/);
   assert.match(preload, /useGitSummary: \(taskId\) => ipcRenderer\.invoke\('task:use-git-summary', taskId\)/);
 });
 
@@ -947,6 +957,43 @@ test('background browser popups are denied while the app is unfocused', () => {
   view.windowFocused = true;
   assert.equal(openHandler({ url: 'https://example.com/' }).action, 'allow');
   assert.equal(openHandler({ url: 'file:///tmp/example.html' }).action, 'deny');
+});
+
+test('browser connectivity recovery targets ChatGPT bootstrap failures without reacting to telemetry', () => {
+  assert.equal(isRecoverableChatGPTNetworkFailure({
+    url: 'https://chatgpt.com/backend-api/conversations?offset=0&limit=28',
+    error: 'net::ERR_INTERNET_DISCONNECTED',
+    resourceType: 'xhr',
+  }), true);
+  assert.equal(isRecoverableChatGPTNetworkFailure({
+    url: 'https://chatgpt.com/cdn/assets/sprites-core.svg',
+    error: 'ERR_TIMED_OUT',
+    resourceType: 'image',
+  }), true);
+  assert.equal(isRecoverableChatGPTNetworkFailure({
+    url: 'https://chatgpt.com/',
+    error: 'ERR_PROXY_CONNECTION_FAILED',
+    resourceType: 'mainFrame',
+  }), true);
+  assert.equal(isRecoverableChatGPTNetworkFailure({
+    url: 'https://chatgpt.com/ces/v1/telemetry/intake',
+    error: 'net::ERR_TIMED_OUT',
+    resourceType: 'xhr',
+  }), false);
+  assert.equal(isRecoverableChatGPTNetworkFailure({
+    url: 'https://chatgpt.com/backend-api/conversations',
+    error: 'net::ERR_ABORTED',
+    resourceType: 'xhr',
+  }), false);
+});
+
+test('embedded ChatGPT networking bypasses the system proxy unless explicitly requested', async () => {
+  const source = await fs.readFile(path.join(__dirname, '../src/main/chatgpt-view.js'), 'utf8');
+  assert.match(source, /PATCHWORK_USE_SYSTEM_PROXY === '1'/);
+  assert.match(source, /session\.setProxy\(\{ mode: 'direct' \}\)/);
+  assert.match(source, /connectivityFailures\.length < 2/);
+  assert.match(source, /activeTask\?\.state !== 'submitted'/);
+  assert.match(source, /activeMerge\?\.mergeState !== 'submitted'/);
 });
 
 test('opening a task loads its saved ChatGPT conversation', async () => {

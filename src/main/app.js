@@ -178,7 +178,7 @@ function registerIpc() {
   ipcMain.handle('git:diff', async (_event, repositoryPath, filePath, staged) => (
     gitService.diff(repositoryPath, filePath, staged)
   ));
-  ipcMain.handle('git:summary', async (_event, repositoryPath, customPrompt, chatgptProject) => {
+  ipcMain.handle('git:summary', async (_event, repositoryPath, customPrompt, chatgptProject, model) => {
     const status = await gitService.status(repositoryPath);
     if (status.changes.length === 0) throw new Error('There are no uncommitted changes to summarize.');
 
@@ -186,7 +186,7 @@ function registerIpc() {
     const task = await taskService.createTask({
       taskText: prompt,
       repositories: [{ path: status.repository.path }],
-      model: 'luna',
+      model: model || 'luna',
       reasoningMode: 'medium',
       autoApply: false,
       summaryOnly: true,

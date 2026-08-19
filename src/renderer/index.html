@@ -88,6 +88,16 @@
               <div class="commit-box">
                 <div class="source-project-picker">
                   <div class="source-project-heading">
+                    <label for="source-ai-summary-model-select">AI Summary model</label>
+                  </div>
+                  <select id="source-ai-summary-model-select" class="field-control">
+                    <option value="default">ChatGPT default</option>
+                    <option value="sol">GPT-5.6 Sol</option>
+                    <option value="luna" selected>GPT-5.6 Luna</option>
+                  </select>
+                </div>
+                <div class="source-project-picker">
+                  <div class="source-project-heading">
                     <label for="source-chatgpt-project-select">AI Summary project</label>
                     <button id="source-refresh-projects-button" class="icon-button" type="button" title="Refresh ChatGPT projects" aria-label="Refresh ChatGPT projects">↻</button>
                   </div>
