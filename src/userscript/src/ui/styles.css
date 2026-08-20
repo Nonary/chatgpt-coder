@@ -125,6 +125,20 @@ button { cursor: pointer; }
 .panel-title small { display: block; margin-top: 1px; color: var(--text-tertiary); font-size: 12px; line-height: 15px; }
 .dock-header .spacer { flex: 1; }
 
+.update-notice {
+  display: flex; align-items: center; gap: 10px; margin: 0 12px 10px; padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 9%, transparent); color: var(--text-secondary);
+  font-size: 12px; line-height: 16px;
+}
+.update-notice[hidden] { display: none; }
+.update-notice.blocked {
+  border-color: color-mix(in srgb, var(--warning) 35%, transparent);
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+}
+.update-notice .grow { flex: 1; min-width: 0; }
+.update-notice button.secondary { min-height: 30px; padding: 0 11px; font-size: 12px; }
+
 /* ChatGPT's icon affordances are borderless circles that fill in on hover. */
 .icon-button {
   display: grid; place-items: center; width: 32px; height: 32px; flex: none;

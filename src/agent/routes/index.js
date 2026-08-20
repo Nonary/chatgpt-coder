@@ -7,7 +7,12 @@ const workspace = require('./workspace');
 const { version } = require('../../../package.json');
 
 function registerSystem(router, context) {
-  router.get('/health', async () => ({ ok: true, service: 'patchwork-agent', version }), { public: true });
+  router.get('/health', async () => ({
+    ok: true,
+    service: 'patchwork-agent',
+    version,
+    revision: context.updateService.runningRevision,
+  }), { public: true });
 
   router.get('/v1/config', async () => ({
     version,
@@ -16,6 +21,17 @@ function registerSystem(router, context) {
     models: TASK_MODEL_PICKER_OPTIONS,
     reasoningModes: TASK_REASONING_PICKER_OPTIONS,
   }));
+
+  router.get('/v1/update', async () => context.updateService.status({ fetch: true }));
+
+  router.post('/v1/update', async () => {
+    if (typeof context.requestRestart !== 'function') {
+      throw new Error('This Patchwork process cannot restart itself. Start it with patchwork-agent and try again.');
+    }
+    const result = await context.updateService.applyUpdate();
+    setTimeout(() => context.requestRestart(), 150).unref?.();
+    return result;
+  });
 
   // A place for the page to post what it actually measured, so layout and
   // selector problems are diagnosed from real numbers instead of guessed at.

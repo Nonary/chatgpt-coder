@@ -121,7 +121,17 @@ class Shell {
       }, svg(ICONS.close, { size: 18 })),
     );
 
-    this.dock = h('aside', { class: 'dock', hidden: true }, this.grip, this.header, this.navBar, this.viewport);
+    this.updateNotice = h('div', { class: 'update-notice', hidden: true });
+
+    this.dock = h(
+      'aside',
+      { class: 'dock', hidden: true },
+      this.grip,
+      this.header,
+      this.updateNotice,
+      this.navBar,
+      this.viewport,
+    );
     this.toast = h('div', { class: 'toast', hidden: true, role: 'status' });
     this.modalHost = h('div', { class: 'modal-host' });
 
@@ -297,6 +307,24 @@ class Shell {
 
   setStatus(text) {
     this.statusDot.textContent = text;
+  }
+
+  setUpdateNotice(notice) {
+    clear(this.updateNotice);
+    if (!notice) {
+      this.updateNotice.hidden = true;
+      return;
+    }
+    this.updateNotice.hidden = false;
+    this.updateNotice.classList.toggle('blocked', Boolean(notice.blocked));
+    this.updateNotice.append(
+      h('span', { class: 'grow' }, notice.message),
+      notice.actionLabel ? h('button', {
+        class: 'secondary',
+        disabled: Boolean(notice.disabled),
+        onclick: notice.onAction,
+      }, notice.actionLabel) : null,
+    );
   }
 
   setPendingBadge(value) {

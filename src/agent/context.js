@@ -7,6 +7,7 @@ const { PromptService } = require('./services/prompt-service');
 const { ResultService } = require('./services/result-service');
 const { SkillService } = require('./services/skill-service');
 const { TaskService } = require('./services/task-service');
+const { UpdateService } = require('./services/update-service');
 const { WorktreeService } = require('./services/worktree-service');
 const { isChatGPTConversationUrl } = require('../shared/chatgpt');
 
@@ -40,6 +41,8 @@ async function createContext(config) {
   const promptService = new PromptService(dataRoot);
   const taskService = new TaskService(dataRoot, skillService, iacService);
   await taskService.initialize();
+  const updateService = new UpdateService();
+  await updateService.initialize();
   const gitService = new GitService(dataRoot);
   await gitService.initialize();
   const worktreeService = new WorktreeService(dataRoot, emit, () => gitService.listRepositories());
@@ -83,7 +86,9 @@ async function createContext(config) {
     resultService,
     skillService,
     taskService,
+    updateService,
     worktreeService,
+    requestRestart: null,
   };
 
   await recoverUnconfirmedSubmissions(taskService);

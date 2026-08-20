@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { loadConfig } = require('./config');
 const { startServer } = require('./server');
 const { version } = require('./routes');
@@ -24,6 +26,35 @@ Patchwork userscript running inside chatgpt.com. Open its install page to add th
 userscript to your browser.
 `;
 
+function buildRestartArguments(argv, config) {
+  const cleaned = [argv[0]];
+  for (let index = 1; index < argv.length; index += 1) {
+    if (['--port', '--home', '--iac-settings'].includes(argv[index])) {
+      index += 1;
+      continue;
+    }
+    cleaned.push(argv[index]);
+  }
+  return [
+    ...cleaned,
+    '--port', String(config.port),
+    '--home', config.dataRoot,
+    '--iac-settings', config.iacSettingsPath,
+  ];
+}
+
+function relaunch(config) {
+  const child = spawn(process.execPath, buildRestartArguments(process.argv.slice(1), config), {
+    cwd: path.resolve(__dirname, '..', '..'),
+    env: process.env,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+  return child;
+}
+
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   if (options.help) {
@@ -31,7 +62,7 @@ async function main() {
     return;
   }
   const config = await loadConfig(options);
-  const { server } = await startServer(config);
+  const { context, server } = await startServer(config);
   const origin = `http://127.0.0.1:${config.port}`;
   process.stdout.write([
     `patchwork-agent ${version}`,
@@ -43,12 +74,27 @@ async function main() {
     '',
   ].join('\n'));
 
-  const shutdown = () => {
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 2_000).unref();
+  let shuttingDown = false;
+  let finished = false;
+  const shutdown = (restart = false) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    context.events.close();
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (restart) relaunch(config);
+      process.exit(0);
+    };
+    server.close(finish);
+    setTimeout(() => {
+      server.closeAllConnections?.();
+      finish();
+    }, 2_000).unref();
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  context.requestRestart = () => shutdown(true);
+  process.on('SIGINT', () => shutdown(false));
+  process.on('SIGTERM', () => shutdown(false));
 }
 
 if (require.main === module) {
@@ -58,4 +104,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseArguments };
+module.exports = { buildRestartArguments, main, parseArguments, relaunch };

@@ -59,6 +59,8 @@ function header() {
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
+// @updateURL    __PATCHWORK_ORIGIN__/patchwork.user.js?token=__PATCHWORK_TOKEN__
+// @downloadURL  __PATCHWORK_ORIGIN__/patchwork.user.js?token=__PATCHWORK_TOKEN__
 // @noframes
 // ==/UserScript==
 `;

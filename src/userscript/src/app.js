@@ -20,6 +20,8 @@ const { reportLayout } = require('./ui/layout-report');
 const { taskRequestConfiguration } = require('../../shared/chatgpt');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
+const UPDATE_CHECK_INTERVAL_MILLISECONDS = 30 * 60 * 1_000;
+const UPDATE_RECONNECT_TIMEOUT_MILLISECONDS = 60_000;
 
 class App {
   constructor({ api, transport, version }) {
@@ -224,6 +226,48 @@ class App {
     }
   }
 
+  showUpdateStatus(status) {
+    if (!status?.updateAvailable) {
+      this.shell.setUpdateNotice(null);
+      return;
+    }
+    const behind = status.behind > 0
+      ? `${status.behind} new commit${status.behind === 1 ? '' : 's'} on ${status.upstream}`
+      : 'Downloaded update ready to rebuild';
+    this.shell.setUpdateNotice({
+      message: status.canUpdate ? `${behind}.` : `${behind}. ${status.reason || 'Automatic update is unavailable.'}`,
+      actionLabel: status.canUpdate ? (status.restartPending ? 'Finish update' : 'Update') : null,
+      blocked: !status.canUpdate,
+      onAction: status.canUpdate ? () => this.actions.updateAgent() : null,
+    });
+  }
+
+  async checkForUpdate() {
+    try {
+      const status = await this.api.updateStatus();
+      this.showUpdateStatus(status);
+      return status;
+    } catch {
+      // Update discovery depends on the configured Git remote. A temporary
+      // network failure must not interfere with the local coding workspace.
+      return null;
+    }
+  }
+
+  async waitForRevision(revision) {
+    const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MILLISECONDS;
+    while (Date.now() < deadline) {
+      try {
+        const health = await this.api.health();
+        if (health.revision === revision) return health;
+      } catch {
+        // The expected gap while the old process releases the port.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error('Patchwork rebuilt, but the restarted agent did not come back on this port.');
+  }
+
   async refreshProjects(showErrors = false) {
     try {
       const projects = await chatgpt.listProjects();
@@ -248,6 +292,32 @@ class App {
       showTask(taskId) {
         app.store.set({ activeTaskId: taskId, activity: [] }, 'tasks');
         app.shell.show('tasks');
+      },
+
+      async updateAgent() {
+        const confirmed = await app.shell.confirm({
+          title: 'Update Patchwork?',
+          message: 'Patchwork will fast-forward from Git, refresh dependencies if needed, rebuild, and restart on this same port.',
+          confirmLabel: 'Update and restart',
+        });
+        if (!confirmed) return;
+        app.shell.setUpdateNotice({
+          message: 'Updating and rebuilding Patchwork…',
+          actionLabel: 'Updating…',
+          disabled: true,
+        });
+        try {
+          const result = await app.api.applyUpdate();
+          app.shell.setStatus('Restarting agent…');
+          app.shell.setUpdateNotice({ message: 'Rebuild complete. Waiting for Patchwork to restart…' });
+          await app.waitForRevision(result.revision);
+          app.shell.setUpdateNotice(null);
+          app.shell.setStatus(`Connected · ${app.transport.kind}`);
+          app.toast('Patchwork updated and reconnected.');
+        } catch (error) {
+          app.toast(error.message, true);
+          await app.checkForUpdate();
+        }
       },
 
       async chooseRepositories({ forSource = false } = {}) {
@@ -737,6 +807,8 @@ class App {
     setTimeout(() => reportLayout(this.api, this.shell), 2500);
     this.driver.start();
     this.pollEvents().catch(() => {});
+    this.checkForUpdate().catch(() => {});
+    setInterval(() => this.checkForUpdate().catch(() => {}), UPDATE_CHECK_INTERVAL_MILLISECONDS);
 
     const pending = navigate.takePendingNavigation();
     if (pending?.taskId) {

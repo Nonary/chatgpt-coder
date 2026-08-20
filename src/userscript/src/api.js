@@ -44,7 +44,13 @@ class Api {
   remove(path, options) { return this.call('DELETE', path, null, options); }
 
   /* system */
+  health() { return this.get('/health', { timeout: 3_000 }); }
+
   config() { return this.get('/v1/config'); }
+
+  updateStatus() { return this.get('/v1/update', { timeout: 60_000 }); }
+
+  applyUpdate() { return this.post('/v1/update', {}, { timeout: 600_000 }); }
 
   events(since) { return this.get(`/v1/events${query({ since })}`, { timeout: 40_000 }); }
 

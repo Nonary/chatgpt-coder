@@ -49,6 +49,14 @@ Then open <http://127.0.0.1:8787/install> and pick one:
 bundle. Keep the agent running while you use Patchwork — every Git and filesystem
 operation goes through it.
 
+Patchwork checks its own Git upstream when the dock starts and every 30 minutes.
+When the checked-out branch is behind, the dock offers **Update**. An automatic
+update requires a clean, non-diverged checkout; it fast-forwards to the configured
+upstream, refreshes dependencies when the lockfile changed, rebuilds the userscript,
+and restarts the agent on the same port. The existing process stays available until
+the rebuild succeeds, so a fetch or build failure is shown without taking Patchwork
+offline.
+
 Patchwork's dock opens on the right of the page and makes room for itself, so
 ChatGPT reflows instead of being covered. `Alt+P` toggles it, and the header's layout
 button switches to overlay if you prefer.
