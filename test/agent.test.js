@@ -143,6 +143,33 @@ test('unknown routes and wrong methods are reported distinctly', async (context)
   assert.match(wrongMethod.payload.error, /not allowed/);
 });
 
+test('choosing the original repositories never runs coding-tree validation', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-original-target-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const firstRepository = await createRepository(workspace, 'first-repository');
+  const secondRepository = await createRepository(workspace, 'second-repository');
+
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Update both original repositories.',
+    repositories: [{ path: firstRepository }, { path: secondRepository }],
+  });
+  assert.equal(created.status, 200);
+  assert.equal(created.payload.task.treeId, null);
+
+  const selected = await agent.call(
+    'POST',
+    `/v1/tasks/${created.payload.task.taskId}/target`,
+    { treeId: null },
+  );
+  assert.equal(selected.status, 200);
+  assert.equal(selected.payload.task.treeId, null);
+  assert.deepEqual(
+    selected.payload.task.repositories.map((repository) => repository.path),
+    [firstRepository, secondRepository],
+  );
+});
+
 test('a task travels create, download, submit, result, and apply entirely over HTTP', async (context) => {
   const agent = await startAgent(context);
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-repo-'));

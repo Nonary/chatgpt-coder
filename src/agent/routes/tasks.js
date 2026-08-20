@@ -274,6 +274,11 @@ function register(router, context) {
     if (['applied', 'rolled-back', 'resolved'].includes(task.state)) {
       throw new Error('This task can no longer change its apply target.');
     }
+    // Choosing the original repository for a task that already targets it is a
+    // no-op. Do not run worktree-only validation for that explicit choice.
+    if (!body.createTree && !body.treeId && !task.treeId) {
+      return { task };
+    }
     if (writableRepositories.length !== 1) {
       throw new Error('Worktree selection is only available for tasks with one writable repository.');
     }
