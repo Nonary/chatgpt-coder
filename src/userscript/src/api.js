@@ -57,6 +57,8 @@ class Api {
   /* filesystem */
   fsRoots() { return this.get('/v1/fs/roots'); }
 
+  selectDirectory() { return this.post('/v1/fs/select-directory', {}, { timeout: 600_000 }); }
+
   fsBrowse(path) { return this.get(`/v1/fs/browse${query({ path })}`); }
 
   fsDiscover(path, depth) { return this.get(`/v1/fs/discover${query({ path, depth })}`); }
@@ -65,6 +67,8 @@ class Api {
 
   /* workspace */
   repositories() { return this.get('/v1/workspace/repositories'); }
+
+  repositoryCatalog() { return this.get('/v1/workspace/repository-catalog'); }
 
   addRepositories(paths) { return this.post('/v1/workspace/repositories', { paths }); }
 

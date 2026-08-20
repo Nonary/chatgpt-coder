@@ -22,12 +22,61 @@ function expandHome(value, homeDirectory) {
   return raw;
 }
 
-// The browser cannot hand back a filesystem path, so the in-page directory
-// picker walks the disk through this service instead of a native dialog.
 class FsService {
-  constructor({ homeDirectory = os.homedir(), platform = process.platform } = {}) {
+  constructor({
+    homeDirectory = os.homedir(), platform = process.platform, execute = execFileAsync,
+  } = {}) {
     this.homeDirectory = homeDirectory;
     this.platform = platform;
+    this.execute = execute;
+  }
+
+  async selectDirectory() {
+    let command;
+    let args;
+    let options = {};
+    if (this.platform === 'win32') {
+      command = 'powershell.exe';
+      args = [
+        '-NoLogo', '-NoProfile', '-STA', '-NonInteractive', '-Command',
+        [
+          'Add-Type -AssemblyName System.Windows.Forms',
+          '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+          '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+          "$dialog.Description = 'Select a Git repository folder'",
+          '$dialog.SelectedPath = $env:PATCHWORK_PICKER_INITIAL_DIRECTORY',
+          'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {',
+          '  [Console]::Out.Write($dialog.SelectedPath)',
+          '}',
+        ].join('; '),
+      ];
+      options = {
+        windowsHide: true,
+        env: { ...process.env, PATCHWORK_PICKER_INITIAL_DIRECTORY: this.homeDirectory },
+      };
+    } else if (this.platform === 'darwin') {
+      command = 'osascript';
+      args = ['-e', 'POSIX path of (choose folder with prompt "Select a Git repository folder")'];
+    } else {
+      command = 'zenity';
+      args = ['--file-selection', '--directory', '--title=Select a Git repository folder'];
+    }
+
+    let stdout;
+    try {
+      ({ stdout } = await this.execute(command, args, options));
+    } catch (error) {
+      const canceled = (this.platform === 'darwin' && error.code === 1)
+        || (this.platform !== 'win32' && this.platform !== 'darwin' && error.code === 1);
+      if (canceled) return null;
+      throw new Error(`The operating system folder picker could not be opened: ${error.message}`);
+    }
+    const selectedPath = String(stdout || '').trim();
+    if (!selectedPath) return null;
+    const resolved = await fs.realpath(path.resolve(selectedPath));
+    const stat = await fs.stat(resolved);
+    if (!stat.isDirectory()) throw new Error(`Not a directory: ${resolved}`);
+    return resolved;
   }
 
   async roots() {

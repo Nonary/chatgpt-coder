@@ -394,8 +394,43 @@ button.wide { width: 100%; }
 .modal-footer { display: flex; align-items: center; gap: 8px; padding: 0 20px 20px; }
 .modal-footer .spacer { flex: 1; }
 
-.picker-path { display: flex; align-items: center; gap: 6px; color: var(--text-tertiary); font: 12px/18px var(--font-mono); word-break: break-all; }
-.picker-list { max-height: 320px; overflow-y: auto; }
+.repository-picker { display: flex; min-height: 0; flex-direction: column; gap: 10px; }
+.picker-search { min-height: 42px; padding-left: 14px; font-size: 15px; }
+.picker-toolbar, .picker-browser-toolbar {
+  display: flex; min-height: 30px; align-items: center; gap: 8px;
+}
+.picker-toolbar[hidden], .picker-browser-toolbar[hidden] { display: none; }
+.picker-result-meta { padding: 0 2px; }
+.picker-discovery {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface-raised) 45%, transparent);
+}
+.picker-discovery[hidden] { display: none; }
+.picker-section-label { color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+.picker-root-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.picker-root-actions[hidden] { display: none; }
+button.picker-root-action { min-height: 30px; padding: 0 10px; font-size: 12px; }
+button.picker-back { min-height: 30px; padding: 0 4px; }
+.picker-path {
+  display: flex; align-items: center; gap: 6px; padding: 0 2px;
+  color: var(--text-tertiary); font: 12px/18px var(--font-mono); word-break: break-all;
+}
+.picker-path[hidden] { display: none; }
+.picker-list { max-height: 360px; min-height: 120px; overflow-y: auto; }
+.repository-result { min-height: 52px; }
+.picker-check {
+  display: grid; place-items: center; width: 20px; height: 20px; flex: none;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  color: transparent; font-size: 12px; font-weight: 700;
+}
+.picker-check.active { border-color: var(--solid); background: var(--solid); color: var(--text-inverted); }
+.repository-result .status-badge { flex: none; }
+.picker-directory-row { gap: 4px; }
+.picker-directory-row > .list-item { flex: 1; min-width: 0; }
+.picker-manual[hidden] { display: none; }
+.picker-notice { min-height: 18px; padding: 0 2px; }
+.picker-overflow { padding: 10px; color: var(--text-tertiary); font-size: 12px; text-align: center; }
 
 /* -------------------------------------------------------------- toast/banner */
 

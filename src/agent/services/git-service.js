@@ -17,6 +17,31 @@ const STATUS_LABELS = {
 
 const MAX_DIFF_PREVIEW = 500_000;
 const MAX_COMPARE_ROWS = 20_000;
+const MAX_KNOWN_REPOSITORIES = 500;
+
+function repositoryPathKey(repositoryPath) {
+  const value = path.resolve(String(repositoryPath || ''));
+  return process.platform === 'win32' ? value.toLowerCase() : value;
+}
+
+function mergeKnownRepositories(...groups) {
+  const merged = [];
+  const seen = new Set();
+  for (const entry of groups.flat()) {
+    const repositoryPath = typeof entry === 'string' ? entry : entry?.path;
+    if (!repositoryPath) continue;
+    const resolved = path.resolve(repositoryPath);
+    const key = repositoryPathKey(resolved);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push({
+      name: String(entry?.name || path.basename(resolved) || resolved),
+      path: resolved,
+    });
+    if (merged.length >= MAX_KNOWN_REPOSITORIES) break;
+  }
+  return merged;
+}
 
 function splitLines(value) {
   if (!value) return [];
@@ -161,32 +186,63 @@ class GitService {
     try {
       await fs.access(this.workspaceFile);
     } catch {
-      await fs.writeFile(this.workspaceFile, '{"repositories":[]}\n');
+      await fs.writeFile(this.workspaceFile, '{"repositories":[],"knownRepositories":[]}\n');
     }
   }
 
-  async readWorkspace() {
+  async readWorkspaceState() {
     await this.initialize();
     const value = JSON.parse(await fs.readFile(this.workspaceFile, 'utf8'));
-    return Array.isArray(value.repositories) ? value.repositories : [];
+    const repositories = Array.isArray(value.repositories) ? value.repositories : [];
+    return {
+      repositories,
+      knownRepositories: mergeKnownRepositories(
+        Array.isArray(value.knownRepositories) ? value.knownRepositories : [],
+        repositories,
+      ),
+    };
   }
 
-  async writeWorkspace(repositoryPaths) {
-    await fs.writeFile(this.workspaceFile, `${JSON.stringify({ repositories: repositoryPaths }, null, 2)}\n`);
+  async readWorkspace() {
+    return (await this.readWorkspaceState()).repositories;
+  }
+
+  async writeWorkspaceState(state) {
+    const value = {
+      repositories: [...new Set(state.repositories || [])],
+      knownRepositories: mergeKnownRepositories(state.knownRepositories || []),
+    };
+    await fs.writeFile(this.workspaceFile, `${JSON.stringify(value, null, 2)}\n`);
+  }
+
+  async rememberRepositories(repositories) {
+    const state = await this.readWorkspaceState();
+    state.knownRepositories = mergeKnownRepositories(repositories, state.knownRepositories);
+    await this.writeWorkspaceState(state);
+    return state.knownRepositories;
   }
 
   async addRepositories(selectedPaths) {
     const inspected = await Promise.all(selectedPaths.map(inspectRepository));
-    const current = await this.readWorkspace();
-    const merged = [...new Set([...current, ...inspected.map((repository) => repository.path)])];
-    await this.writeWorkspace(merged);
-    return inspected;
+    const state = await this.readWorkspaceState();
+    state.repositories = [...new Set([
+      ...state.repositories,
+      ...inspected.map((repository) => repository.path),
+    ])];
+    state.knownRepositories = mergeKnownRepositories(inspected, state.knownRepositories);
+    await this.writeWorkspaceState(state);
+    return this.listRepositories();
   }
 
   async removeRepository(repositoryPath) {
-    const current = await this.readWorkspace();
-    await this.writeWorkspace(current.filter((item) => item !== repositoryPath));
+    const state = await this.readWorkspaceState();
+    state.repositories = state.repositories.filter((item) => item !== repositoryPath);
+    await this.writeWorkspaceState(state);
     return this.listRepositories();
+  }
+
+  async listKnownRepositories() {
+    return (await this.readWorkspaceState()).knownRepositories;
   }
 
   async listRepositories() {

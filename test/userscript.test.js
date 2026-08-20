@@ -276,6 +276,13 @@ test('the agent client builds authenticated request paths for every workspace ca
   await api.gitDiff('C:/repo', 'src/app.js', true);
   assert.equal(calls.at(-1).path, '/v1/workspace/diff?path=C%3A%2Frepo&file=src%2Fapp.js&staged=true');
 
+  await api.repositoryCatalog();
+  assert.equal(calls.at(-1).path, '/v1/workspace/repository-catalog');
+
+  await api.selectDirectory();
+  assert.equal(calls.at(-1).path, '/v1/fs/select-directory');
+  assert.equal(calls.at(-1).timeout, 600_000);
+
   await api.skills(['C:/one', 'C:/two']);
   assert.equal(calls.at(-1).path, '/v1/skills?repositories=C%3A%2Fone%0AC%3A%2Ftwo');
 
@@ -321,6 +328,33 @@ test('task labels and states match the states the agent can report', () => {
   assert.equal(taskStatusText({ summaryOnly: true, state: 'completed' })[0], 'Git Summary applied');
   assert.equal(taskStatusText({ answerOnly: true, state: 'submitted' })[0], 'Answer is running');
   assert.equal(taskStatusText({ answerOnly: true, state: 'completed' })[0], 'Answer complete');
+});
+
+test('repository search remembers unique paths and ranks names before path-only matches', () => {
+  const {
+    mergeRepositoryCatalog,
+    searchRepositoryCatalog,
+  } = require('../src/userscript/src/ui/dialogs/repository-picker');
+  const catalog = mergeRepositoryCatalog(
+    [{ name: 'sunshine', path: 'D:\\sources\\sunshine' }],
+    [
+      { name: 'Vibepollo', path: 'D:\\sources\\Vibepollo' },
+      { name: 'duplicate', path: 'd:/sources/SUNSHINE/' },
+      { name: 'tools', path: 'D:\\archive\\sunshine-tools' },
+    ],
+  );
+
+  assert.deepEqual(catalog.map((repository) => repository.name), ['sunshine', 'Vibepollo', 'tools']);
+  assert.deepEqual(
+    searchRepositoryCatalog(catalog, 'sunshine').map((repository) => repository.name),
+    ['sunshine', 'tools'],
+    'an exact repository name ranks before a path-only match',
+  );
+  assert.deepEqual(
+    searchRepositoryCatalog(catalog, 'sources vibe').map((repository) => repository.name),
+    ['Vibepollo'],
+    'search terms can match across the repository name and full path',
+  );
 });
 
 test('the userscript bundles every module it requires and keeps its install placeholders', () => {

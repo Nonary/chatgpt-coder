@@ -324,6 +324,7 @@ class App {
         openRepositoryPicker({
           shell: app.shell,
           api: app.api,
+          repositories: app.store.state.repositories,
           onChoose: async (paths) => {
             if (paths.length === 0) return;
             await app.run(async () => {

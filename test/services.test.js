@@ -1311,6 +1311,37 @@ test('source control stages, diffs, commits, and records history', async (contex
   assert.equal(diff.rows[0].afterType, 'unchanged');
 });
 
+test('source control keeps removed and discovered repositories in a durable picker catalog', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-known-repositories-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(root);
+  const secondRepositoryPath = await createRepository(path.join(root, 'other'));
+  const dataRoot = path.join(root, 'data');
+
+  const git = new GitService(dataRoot);
+  assert.equal((await git.addRepositories([firstRepositoryPath])).length, 1);
+  await git.rememberRepositories([{ name: 'other-repository', path: secondRepositoryPath }]);
+  await git.removeRepository(firstRepositoryPath);
+
+  assert.deepEqual(await git.listRepositories(), []);
+  const restarted = new GitService(dataRoot);
+  assert.deepEqual(await restarted.listKnownRepositories(), [
+    { name: 'other-repository', path: secondRepositoryPath },
+    { name: 'sample-repository', path: firstRepositoryPath },
+  ]);
+
+  const legacyDataRoot = path.join(root, 'legacy-data');
+  await fs.mkdir(legacyDataRoot);
+  await fs.writeFile(path.join(legacyDataRoot, 'workspace.json'), `${JSON.stringify({
+    repositories: [firstRepositoryPath],
+  })}\n`);
+  const migrated = new GitService(legacyDataRoot);
+  await migrated.removeRepository(firstRepositoryPath);
+  assert.deepEqual(await migrated.listKnownRepositories(), [
+    { name: 'sample-repository', path: firstRepositoryPath },
+  ], 'repositories from the old workspace format remain remembered after removal');
+});
+
 test('source control can unstage and create the first commit', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-unborn-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

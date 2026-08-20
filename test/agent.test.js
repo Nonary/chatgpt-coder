@@ -424,6 +424,49 @@ test('the filesystem service browses directories and finds repositories for the 
   await assert.rejects(() => service.browse(path.join(root, 'missing')));
 });
 
+test('the filesystem service opens the Windows folder picker and returns its selected directory', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-native-picker-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const calls = [];
+  const service = new FsService({
+    platform: 'win32',
+    homeDirectory: root,
+    execute: async (...args) => {
+      calls.push(args);
+      return { stdout: `${root}\r\n` };
+    },
+  });
+
+  assert.equal(await service.selectDirectory(), await fs.realpath(root));
+  assert.equal(calls[0][0], 'powershell.exe');
+  assert.ok(calls[0][1].includes('-STA'), 'the Windows dialog runs in a single-threaded apartment');
+  assert.equal(calls[0][2].env.PATCHWORK_PICKER_INITIAL_DIRECTORY, root);
+});
+
+test('canceling the native folder picker returns no directory', async () => {
+  const service = new FsService({
+    platform: 'win32',
+    execute: async () => ({ stdout: '' }),
+  });
+  assert.equal(await service.selectDirectory(), null);
+});
+
+test('filesystem discovery adds repositories to the durable picker catalog', async (context) => {
+  const agent = await startAgent(context);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-catalog-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root, 'remember-me');
+  const query = new URLSearchParams({ path: root });
+
+  const discovered = await agent.call('GET', `/v1/fs/discover?${query}`);
+  assert.equal(discovered.status, 200);
+  assert.deepEqual(discovered.payload.repositories.map((repository) => repository.name), ['remember-me']);
+
+  const catalog = await agent.call('GET', '/v1/workspace/repository-catalog');
+  assert.equal(catalog.status, 200);
+  assert.deepEqual(catalog.payload.repositories, [{ name: 'remember-me', path: repositoryPath }]);
+});
+
 test('prompt records are normalized and clamped before they are stored', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-prompt-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

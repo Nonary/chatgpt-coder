@@ -1,3 +1,5 @@
+const path = require('node:path');
+
 function register(router, context) {
   const {
     fsService, gitService, iacService, promptService, skillService,
@@ -5,14 +7,27 @@ function register(router, context) {
 
   router.get('/v1/fs/roots', async () => ({ roots: await fsService.roots() }));
 
-  router.get('/v1/fs/browse', async ({ url }) => fsService.browse(url.searchParams.get('path')));
+  router.post('/v1/fs/select-directory', async () => ({
+    path: await fsService.selectDirectory(),
+  }));
 
-  router.get('/v1/fs/discover', async ({ url }) => ({
-    repositories: await fsService.discoverRepositories(
+  router.get('/v1/fs/browse', async ({ url }) => {
+    const listing = await fsService.browse(url.searchParams.get('path'));
+    await gitService.rememberRepositories([
+      ...(listing.repository ? [{ name: path.basename(listing.path), path: listing.path }] : []),
+      ...listing.directories.filter((entry) => entry.repository),
+    ]);
+    return listing;
+  });
+
+  router.get('/v1/fs/discover', async ({ url }) => {
+    const repositories = await fsService.discoverRepositories(
       url.searchParams.get('path'),
       Number.parseInt(url.searchParams.get('depth') || '', 10) || undefined,
-    ),
-  }));
+    );
+    await gitService.rememberRepositories(repositories);
+    return { repositories };
+  });
 
   router.post('/v1/fs/reveal', async ({ body }) => {
     await fsService.reveal(body.path);
@@ -21,6 +36,10 @@ function register(router, context) {
 
   router.get('/v1/workspace/repositories', async () => ({
     repositories: await gitService.listRepositories(),
+  }));
+
+  router.get('/v1/workspace/repository-catalog', async () => ({
+    repositories: await gitService.listKnownRepositories(),
   }));
 
   router.post('/v1/workspace/repositories', async ({ body }) => {
