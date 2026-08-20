@@ -140,7 +140,7 @@ staged by the agent before packaging.
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `--port`, `PATCHWORK_PORT` | `8787` | Agent HTTP port |
+| `--port`, `PATCHWORK_PORT` | `8787` | Preferred agent HTTP port; an occupied port falls back to a random available port |
 | `--home`, `PATCHWORK_HOME` | `~/.patchwork` | Token, task storage, workspace, prompts |
 | `--iac-settings`, `PATCHWORK_IAC_SETTINGS` | `<home>/settings.json` | IaC repository list |
 

@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
@@ -86,6 +87,31 @@ test('the agent refuses every workspace route without its token and allows only 
   assert.equal(isAllowedOrigin('https://evil.example'), false);
   assert.equal(isAllowedOrigin('null'), false);
   assert.equal(isAllowedOrigin(undefined), false);
+});
+
+test('an occupied configured port falls back until a random port can be bound', async (context) => {
+  const blockers = [http.createServer(), http.createServer()];
+  await Promise.all(blockers.map((blocker) => (
+    new Promise((resolve) => blocker.listen(0, '127.0.0.1', resolve))
+  )));
+  const occupiedPorts = blockers.map((blocker) => blocker.address().port);
+  context.after(() => Promise.all(blockers.map((blocker) => (
+    new Promise((resolve) => blocker.close(resolve))
+  ))));
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-port-fallback-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const config = await loadConfig({ dataRoot: root, port: occupiedPorts[0] });
+  const candidates = [occupiedPorts[1], 0];
+  const started = await startServer(config, { randomPort: () => candidates.shift() });
+  context.after(() => new Promise((resolve) => started.server.close(resolve)));
+
+  assert.ok(!occupiedPorts.includes(started.address.port));
+  assert.deepEqual(candidates, [], 'the second collision causes another candidate to be tried');
+  assert.equal(config.port, started.address.port, 'generated install assets use the port that actually bound');
+  const source = await (await fetch(`http://127.0.0.1:${started.address.port}/patchwork.user.js`)).text();
+  assert.ok(source.includes(`http://127.0.0.1:${started.address.port}`));
+  assert.doesNotMatch(source, /127\.0\.0\.1:0\b/);
 });
 
 test('preflight answers the Private Network Access and embedder policy checks chatgpt.com needs', async (context) => {
