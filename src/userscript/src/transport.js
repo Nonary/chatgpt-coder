@@ -165,9 +165,12 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
           ...(contentTypeFor(body, options.headers) ? { 'Content-Type': contentTypeFor(body, options.headers) } : {}),
           ...options.headers,
         },
-        body: typeof body === 'string' ? body : null,
+        body,
         responseType: options.responseType || 'text',
       };
+      const bodyTransfer = body instanceof ArrayBuffer
+        ? [body]
+        : (ArrayBuffer.isView(body) ? [body.buffer] : []);
 
       // Keep the response path independent of MessageEvent.source. Chromium can
       // deliver a cross-origin popup request while leaving the source WindowProxy
@@ -190,7 +193,7 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
           popup.postMessage(
             { channel: BRIDGE_CHANNEL, type: 'request', id, request },
             origin,
-            [channel.port2],
+            [channel.port2, ...bodyTransfer],
           );
         });
       }
@@ -202,7 +205,11 @@ function createBridgeTransport({ origin, token, bridgeWindow = null }) {
         }, options.timeout || DEFAULT_TIMEOUT);
         const settle = (handler) => (value) => { clearTimeout(timer); handler(value); };
         pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
-        popup.postMessage({ channel: BRIDGE_CHANNEL, type: 'request', id, request }, origin);
+        popup.postMessage(
+          { channel: BRIDGE_CHANNEL, type: 'request', id, request },
+          origin,
+          bodyTransfer,
+        );
       });
     },
   };

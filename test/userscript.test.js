@@ -724,6 +724,40 @@ test('the popup bridge returns asynchronous replies over a transferred message p
   }
 });
 
+test('the popup bridge forwards attachment bytes instead of dropping binary request bodies', async () => {
+  const { createBridgeTransport } = require('../src/userscript/src/transport');
+  const previousWindow = global.window;
+  const bytes = new Uint8Array([11, 22, 33, 44]).buffer;
+  const popup = {
+    closed: false,
+    postMessage(message, origin, transfer) {
+      assert.equal(origin, 'http://127.0.0.1:8787');
+      assert.equal(message.request.path, '/v1/uploads?name=notes.txt');
+      assert.equal(message.request.method, 'POST');
+      assert.equal(message.request.headers['Content-Type'], 'application/octet-stream');
+      assert.deepEqual([...new Uint8Array(message.request.body)], [11, 22, 33, 44]);
+      assert.equal(transfer.length, 2, 'the reply port and attachment buffer are transferred');
+      assert.equal(transfer[1], message.request.body);
+      transfer[0].postMessage({ status: 200, text: '{"name":"notes.txt"}' });
+    },
+  };
+  global.window = {
+    addEventListener: () => {},
+  };
+  try {
+    const transport = createBridgeTransport({
+      origin: 'http://127.0.0.1:8787', token: 'test-token', bridgeWindow: popup,
+    });
+    assert.deepEqual(await transport.request({
+      method: 'POST', path: '/v1/uploads?name=notes.txt', body: bytes, timeout: 1_000,
+    }), {
+      status: 200, text: '{"name":"notes.txt"}', buffer: null,
+    });
+  } finally {
+    global.window = previousWindow;
+  }
+});
+
 test('project listing matches the sidebar shape a real session returns', async () => {
   const { installDocument: install } = require('./helpers/dom-stub');
   const previous = { fetch: global.fetch, location: global.location, localStorage: global.localStorage };
