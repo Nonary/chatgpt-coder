@@ -133,21 +133,47 @@ class Driver {
       await composer.clickSend({
         isConversationOpen: () => Boolean(conversationIdFromRouteUrl(location.href)),
       });
-      verified = await enforcement.wait();
+      const routeConfirmation = navigate.waitForConversationUrl().then(async (conversationUrl) => {
+        if (!conversationUrl) return new Promise(() => {});
+        // Give the request interceptor one turn to report a verified request or
+        // a hard attachment failure before accepting navigation as proof that
+        // ChatGPT sent the task through a transport the page wrapper could not see.
+        await composer.delay(250);
+        const selected = modelPicker.currentSelection();
+        return {
+          ok: true,
+          requestVerified: false,
+          conversationUrl,
+          conversationId: conversationIdFromRouteUrl(conversationUrl),
+          selectedModel: selected.model,
+          selectedReasoningMode: selected.reasoningMode,
+          selectionSource: modelPicker.isInstalled() ? 'patchwork-selector' : 'saved-task',
+        };
+      });
+      verified = await enforcement.wait(45_000, routeConfirmation);
     } finally {
       enforcement.dispose();
     }
 
-    this.report({
-      type: 'task-request-verified',
-      taskId: task.taskId,
-      message: `Verified request from ${verified.selectionSource === 'patchwork-selector' ? 'the composer picker' : 'the saved task'}: ${verified.model}${verified.thinkingEffort ? ` · ${verified.thinkingEffort}` : ''}.`,
-    });
+    if (verified.requestVerified === false) {
+      this.report({
+        type: 'task-request-unverified',
+        taskId: task.taskId,
+        message: 'The conversation opened, but the outgoing request could not be inspected. Continuing to monitor the task result.',
+      });
+    } else {
+      this.report({
+        type: 'task-request-verified',
+        taskId: task.taskId,
+        message: `Verified request from ${verified.selectionSource === 'patchwork-selector' ? 'the composer picker' : 'the saved task'}: ${verified.model}${verified.thinkingEffort ? ` · ${verified.thinkingEffort}` : ''}.`,
+      });
+    }
 
     // ChatGPT's own send request answers with an event stream that names the new
     // conversation, so the id is known before the SPA route catches up.
     const streamedId = await Promise.resolve(verified.conversationId).catch(() => null);
-    const routeUrl = await navigate.waitForConversationUrl(streamedId ? 8_000 : 45_000);
+    const routeUrl = verified.conversationUrl
+      || await navigate.waitForConversationUrl(streamedId ? 8_000 : 45_000);
     const conversationUrl = routeUrl || (streamedId ? `${CHATGPT_ORIGIN}/c/${streamedId}` : null);
     if (!conversationUrl) {
       throw new Error('No conversation could be confirmed after Send.');

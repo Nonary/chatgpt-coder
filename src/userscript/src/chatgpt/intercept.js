@@ -191,15 +191,22 @@ function beginEnforcement({ configuration, packageFilename = null }) {
   const active = enforcement;
 
   return {
-    async wait(timeoutMilliseconds = 45_000) {
+    async wait(timeoutMilliseconds = 45_000, fallbackConfirmation = null) {
+      let timeoutId;
       const timeout = new Promise((resolve) => {
-        const timer = setTimeout(
+        timeoutId = setTimeout(
           () => resolve({ ok: false, error: 'No conversation request was sent after Send.' }),
           timeoutMilliseconds,
         );
-        resultPromise.then(() => clearTimeout(timer));
       });
-      const result = await Promise.race([resultPromise, timeout]);
+      const candidates = [resultPromise, timeout];
+      if (fallbackConfirmation) candidates.push(Promise.resolve(fallbackConfirmation));
+      let result;
+      try {
+        result = await Promise.race(candidates);
+      } finally {
+        clearTimeout(timeoutId);
+      }
       if (!result.ok) {
         const error = new Error(result.error || 'Could not verify the outgoing model request.');
         error.retrySubmission = Boolean(result.retrySubmission);

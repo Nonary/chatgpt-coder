@@ -888,6 +888,61 @@ test('the request enforcer reads the picker at send time, not at task creation',
   }
 });
 
+test('conversation navigation can confirm a send that the page fetch wrapper did not observe', async () => {
+  delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  const { beginEnforcement } = require('../src/userscript/src/chatgpt/intercept');
+  const previous = { window: global.window, location: global.location };
+  global.location = { origin: 'https://chatgpt.com' };
+  global.window = { fetch: async () => new Response('', { status: 200 }) };
+  try {
+    const enforcement = beginEnforcement({ configuration: () => null });
+    const fallback = Promise.resolve({
+      ok: true,
+      requestVerified: false,
+      conversationUrl: 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+    });
+    const confirmed = await enforcement.wait(1_000, fallback);
+    enforcement.dispose();
+
+    assert.equal(confirmed.requestVerified, false);
+    assert.equal(confirmed.conversationUrl, 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22');
+  } finally {
+    global.window = previous.window;
+    global.location = previous.location;
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  }
+});
+
+test('conversation navigation does not override an intercepted attachment failure', async () => {
+  delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  const { beginEnforcement } = require('../src/userscript/src/chatgpt/intercept');
+  const previous = { window: global.window, location: global.location };
+  global.location = { origin: 'https://chatgpt.com' };
+  global.window = { fetch: async () => new Response('', { status: 200 }) };
+  try {
+    const enforcement = beginEnforcement({
+      configuration: () => ({ model: 'sol', reasoningMode: 'high', modelSlug: 'gpt-5-6-thinking' }),
+      packageFilename: 'chatgpt-ide-task-expected.zip',
+    });
+    await assert.rejects(
+      window.fetch('https://chatgpt.com/backend-api/f/conversation', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-4o', messages: [] }),
+      }),
+      /did not include the task ZIP attachment/,
+    );
+    await assert.rejects(
+      enforcement.wait(1_000, Promise.resolve({ ok: true, requestVerified: false })),
+      (error) => error.retrySubmission === true && /did not include the task ZIP attachment/.test(error.message),
+    );
+    enforcement.dispose();
+  } finally {
+    global.window = previous.window;
+    global.location = previous.location;
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  }
+});
+
 test('the picker governs ordinary sends, not only Patchwork task sends', async () => {
   delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
   const intercept = require('../src/userscript/src/chatgpt/intercept');
