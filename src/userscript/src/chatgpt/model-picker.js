@@ -166,6 +166,15 @@ function isInstalled() {
   return Boolean(session && document.getElementById(PICKER_ID));
 }
 
+// A new-chat transition removes and recreates ChatGPT's composer. The current
+// picker node is therefore briefly absent even though its selected model and
+// reasoning effort are still the user's active choice. Keep that session-level
+// fact separate from isInstalled(), which deliberately answers only whether the
+// visual control is mounted right now.
+function hasActiveSelection() {
+  return Boolean(session?.hasInstalledPicker);
+}
+
 /* ----------------------------------------------------------------- DOM helpers */
 
 function el(tag, attributes = {}, children = []) {
@@ -442,6 +451,7 @@ function replaceNativePickers(scanLabels = true) {
   }
   mountPicker(picker, slot);
   resizeLayoutSlot(picker);
+  session.hasInstalledPicker = true;
   return picker;
 }
 
@@ -482,7 +492,10 @@ function install({
     };
   }
   uninstallDom();
-  session = { onChange: onChange || previous?.onChange || null };
+  session = {
+    onChange: onChange || previous?.onChange || null,
+    hasInstalledPicker: Boolean(previous?.hasInstalledPicker),
+  };
   previous?.observer?.disconnect();
   clearInterval(previous?.guard);
   if (previous?.outsideHandler) {
@@ -583,6 +596,7 @@ module.exports = {
   currentSelection,
   displayLabel,
   displayModel,
+  hasActiveSelection,
   install,
   installWhenReady,
   isChecked,

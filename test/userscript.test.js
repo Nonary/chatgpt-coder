@@ -1015,3 +1015,21 @@ test('the picker mounts inside the composer rather than floating over the page',
   assert.match(source, /currentPicker\?\.isConnected && currentSlot\?\.isConnected/, 'task sends reuse the live picker');
   assert.match(source, /MUTATION_SETTLE_MILLISECONDS = 250/, 'composer replacement scans are throttled');
 });
+
+test('the first send after a new-chat composer remount retains the active selection', () => {
+  const appSource = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'),
+    'utf8',
+  );
+  const pickerSource = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'chatgpt', 'model-picker.js'),
+    'utf8',
+  );
+
+  // isInstalled() describes the transient DOM node. The ambient request
+  // resolver must instead survive the moment ChatGPT removes that node while
+  // changing to a fresh conversation.
+  assert.match(pickerSource, /function hasActiveSelection\(\)/);
+  assert.match(appSource, /modelPicker\.hasActiveSelection\(\)/);
+  assert.doesNotMatch(appSource, /if \(!modelPicker\.isInstalled\(\)\) return null/);
+});

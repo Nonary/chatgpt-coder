@@ -759,7 +759,10 @@ class App {
     // Ordinary chats are sent with whatever the picker shows too, not only the
     // chats Patchwork drives; without this the picker would be decorative.
     intercept.setAmbientConfiguration(() => {
-      if (!modelPicker.isInstalled()) return null;
+      // ChatGPT tears down the composer while navigating to a fresh chat. That
+      // DOM gap must not turn the first message into an unmodified native send:
+      // the choice remains active until Patchwork itself is uninstalled.
+      if (!modelPicker.hasActiveSelection()) return null;
       const selected = modelPicker.currentSelection();
       return {
         ...taskRequestConfiguration(selected.model, selected.reasoningMode),
