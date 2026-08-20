@@ -28,6 +28,8 @@ const NATIVE_PICKER_SELECTOR = [
 ].join(', ');
 
 const NATIVE_PICKER_LABEL = /^(?:ChatGPT(?:\s+5(?:\.\d+)*)?|GPT-5(?:\.\d+)*(?:\s+(?:Sol|Luna|Instant|Thinking|Auto|Pro))?|5\.6\s+(?:Sol|Luna)|Instant|Thinking(?:\s+mini)?|Auto|Pro)$/i;
+const COMPOSER_PROMPT_SELECTOR = '#prompt-textarea, [data-testid=\"prompt-textarea\"]';
+const COMPOSER_SEND_SELECTOR = '[data-testid=\"send-button\"], button[aria-label^=\"Send\" i]';
 
 const MENU_ITEMS = [
   { section: 'Model' },
@@ -366,6 +368,35 @@ function findNativePickers(scanLabels = true) {
     .filter((candidate) => !candidate.closest(PICKER_TAG));
 }
 
+function findComposerActionRow() {
+  const prompt = document.querySelector(COMPOSER_PROMPT_SELECTOR);
+  const composer = prompt?.closest('form, [data-composer-surface]');
+  const sendButton = composer?.querySelector(COMPOSER_SEND_SELECTOR);
+  if (!prompt || !composer || !sendButton) return null;
+
+  let candidate = sendButton.parentElement;
+  let fallback = candidate;
+  while (candidate && candidate !== composer) {
+    if (!candidate.contains(prompt)) {
+      fallback = candidate;
+      if (candidate.querySelectorAll('button, [role=\"button\"]').length > 1) return candidate;
+    }
+    candidate = candidate.parentElement;
+  }
+  return fallback;
+}
+
+function ensureComposerFallbackSlot(slot) {
+  if (slot?.isConnected) return slot;
+  const actionRow = findComposerActionRow();
+  if (!actionRow) return null;
+  const fallbackSlot = el(SLOT_TAG, { id: SLOT_ID, 'data-fallback': 'composer-actions' });
+  actionRow.insertBefore(fallbackSlot, actionRow.firstChild);
+  fallbackSlot.dataset.nativeWidth = '0';
+  fallbackSlot.dataset.nativeHeight = String(actionRow.getBoundingClientRect().height || 32);
+  return fallbackSlot;
+}
+
 function replaceNativePickers(scanLabels = true) {
   const nativePickers = findNativePickers(scanLabels);
   const visible = nativePickers.find((candidate) => {
@@ -395,10 +426,10 @@ function replaceNativePickers(scanLabels = true) {
     slot.dataset.nativeHeight = String(nativeBounds.height);
   }
 
-  // Without an anchor in the composer there is nowhere legitimate to put the
-  // picker. v2 floated it at a fixed viewport offset in that case, which is how
-  // it ended up stranded on top of the dock; now it simply is not installed and
-  // ChatGPT keeps its own behaviour.
+  // Project conversations can omit ChatGPT's native model control. In that case
+  // use the composer's own action row rather than falling back to viewport
+  // coordinates, so the picker remains attached to the composer as it moves.
+  slot = ensureComposerFallbackSlot(slot);
   if (!slot?.isConnected) {
     document.getElementById(PICKER_ID)?.remove();
     return null;

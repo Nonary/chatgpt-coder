@@ -1001,7 +1001,11 @@ test('the picker mounts inside the composer rather than floating over the page',
   assert.match(source, /slot\.append\(picker\)/);
   assert.doesNotMatch(source, /positionPicker/, 'no snapshotted viewport coordinates remain');
   assert.doesNotMatch(source, /visibility:hidden/, 'the slot now shows the picker instead of hiding');
-  // With no anchor in the composer the picker is not installed at all.
+  // Project composers can omit ChatGPT's native model control, so the picker
+  // falls back to the composer's action row without using viewport coordinates.
+  assert.match(source, /function findComposerActionRow/);
+  assert.match(source, /data-fallback': 'composer-actions'/);
+  assert.match(source, /ensureComposerFallbackSlot\(slot\)/);
   assert.match(source, /if \(!slot\?\.isConnected\)/);
   assert.match(source, /--patchwork-dock-width/, 'the menu is kept clear of the dock');
   assert.match(source, /if \(!externalMutation\) return/, 'the observer ignores Patchwork-owned mutations');
