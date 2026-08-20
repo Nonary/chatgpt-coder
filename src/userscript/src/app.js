@@ -814,6 +814,8 @@ class App {
     const pending = navigate.takePendingNavigation();
     if (pending?.taskId) {
       this.actions.submitTask(pending.taskId).catch(() => {});
+    } else if (pending?.merge?.treeId) {
+      this.driver.submitMerge(pending.merge).catch(() => {});
     }
   }
 }

@@ -52,11 +52,12 @@ class Driver {
     this.monitorTimer = null;
   }
 
-  async submitTask(task, { project = null } = {}) {
+  async submitTask(task, { project = undefined } = {}) {
+    const destination = project === undefined ? task.chatgptProject : project;
     let lastError = null;
     for (let attempt = 0; attempt <= MAX_SUBMISSION_RETRIES; attempt += 1) {
       try {
-        return await this.submitTaskOnce(task, { project, attempt });
+        return await this.submitTaskOnce(task, { project: destination, attempt });
       } catch (error) {
         lastError = error;
         if (!error.retrySubmission || attempt >= MAX_SUBMISSION_RETRIES) break;
@@ -65,7 +66,7 @@ class Driver {
           taskId: task.taskId,
           message: `${error.message} Reopening a fresh composer and retrying (${attempt + 1}/${MAX_SUBMISSION_RETRIES}).`,
         });
-        await navigate.openFreshChat(project || task.chatgptProject);
+        await navigate.openFreshChat(destination, { taskId: task.taskId });
       }
     }
     await this.api.taskFailed(task.taskId, lastError.message).catch(() => {});
@@ -75,7 +76,7 @@ class Driver {
   async submitTaskOnce(task, { project = null, attempt = 0 } = {}) {
     this.activeTaskId = task.taskId;
     this.activeMerge = null;
-    const destination = project === undefined ? task.chatgptProject : (project || task.chatgptProject);
+    const destination = project;
     this.report({
       type: 'automation-started',
       taskId: task.taskId,
@@ -84,7 +85,7 @@ class Driver {
         : 'Opening a chat for this task…',
     });
 
-    if (attempt === 0) await navigate.openFreshChat(destination);
+    if (attempt === 0) await navigate.openFreshChat(destination, { taskId: task.taskId });
     if (!await composer.waitForComposer()) {
       throw new Error('Not signed in. Sign in and try again.');
     }
@@ -166,7 +167,7 @@ class Driver {
   async submitMerge(request) {
     this.activeTaskId = null;
     this.activeMerge = { treeId: request.treeId, resultFilename: request.resultFilename };
-    await navigate.openFreshChat(request.chatgptProject);
+    await navigate.openFreshChat(request.chatgptProject, { merge: request });
     if (!await composer.waitForComposer()) {
       throw new Error('Not signed in. Sign in and try again.');
     }

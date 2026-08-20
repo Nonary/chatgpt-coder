@@ -54,6 +54,90 @@ test('project URLs reject identifiers that do not belong to the project', () => 
   assert.throws(() => chatGPTProjectUrl('g-p-abc123', 'g-p-other'), /invalid project URL/);
 });
 
+test('fresh project routes are distinguished from project conversations and other projects', () => {
+  const { workspaceRouteMatches } = require('../src/userscript/src/chatgpt/navigate');
+  const projectId = 'g-p-6a81d72f0e9c81918ec8a18a72244337';
+  assert.equal(workspaceRouteMatches(
+    `https://chatgpt.com/g/${projectId}-coding/project`,
+    projectId,
+  ), true);
+  assert.equal(workspaceRouteMatches(
+    `https://chatgpt.com/g/${projectId}-coding/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22`,
+    projectId,
+  ), false, 'an existing project conversation is not a fresh destination');
+  assert.equal(workspaceRouteMatches('https://chatgpt.com/g/g-p-other/project', projectId), false);
+  assert.equal(workspaceRouteMatches('https://chatgpt.com/', null), true);
+});
+
+test('a selected project already open as a fresh route is reused instead of clicking global New chat', () => {
+  const { navigateInPage } = require('../src/userscript/src/chatgpt/navigate');
+  const projectId = 'g-p-6a81d72f0e9c81918ec8a18a72244337';
+  const projectUrl = `https://chatgpt.com/g/${projectId}-coding/project`;
+  const previous = {
+    document: global.document,
+    getComputedStyle: global.getComputedStyle,
+    HTMLAnchorElement: global.HTMLAnchorElement,
+    location: global.location,
+  };
+  const newChat = {
+    disabled: false,
+    clicks: 0,
+    click() { this.clicks += 1; },
+    getAttribute: (name) => (name === 'aria-label' ? 'New chat' : null),
+    matches: () => true,
+    textContent: 'New chat',
+  };
+  global.document = { querySelectorAll: (selector) => (selector === 'a[href], button' ? [newChat] : []) };
+  global.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+  global.HTMLAnchorElement = class HTMLAnchorElement {};
+  global.location = {
+    href: projectUrl,
+    origin: 'https://chatgpt.com',
+    pathname: `/g/${projectId}-coding/project`,
+    search: '',
+    hash: '',
+  };
+  try {
+    assert.deepEqual(navigateInPage(projectUrl, { preferNewChat: true, workspaceId: projectId }), {
+      navigated: true,
+      method: 'reuse-fresh-route',
+    });
+    assert.equal(newChat.clicks, 0, 'global New chat would drop the project context');
+  } finally {
+    global.document = previous.document;
+    global.getComputedStyle = previous.getComputedStyle;
+    global.HTMLAnchorElement = previous.HTMLAnchorElement;
+    global.location = previous.location;
+  }
+});
+
+test('a fresh route is not ready while the previous conversation is still rendered', () => {
+  const { freshRouteReady } = require('../src/userscript/src/chatgpt/navigate');
+  const projectId = 'g-p-6a81d72f0e9c81918ec8a18a72244337';
+  const previous = {
+    document: global.document,
+    getComputedStyle: global.getComputedStyle,
+    location: global.location,
+  };
+  const oldTurn = {
+    getBoundingClientRect: () => ({ width: 700, height: 180 }),
+  };
+  global.document = { querySelectorAll: () => [oldTurn] };
+  global.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+  global.location = {
+    href: `https://chatgpt.com/g/${projectId}-coding/project`,
+  };
+  try {
+    assert.equal(freshRouteReady(projectId), false);
+    oldTurn.getBoundingClientRect = () => ({ width: 0, height: 0 });
+    assert.equal(freshRouteReady(projectId), true);
+  } finally {
+    global.document = previous.document;
+    global.getComputedStyle = previous.getComputedStyle;
+    global.location = previous.location;
+  }
+});
+
 test('stream status and conversation titles normalize the way the task timer expects', () => {
   assert.equal(normalizeConversationStreamStatus('IS_STREAMING'), 'streaming');
   assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
