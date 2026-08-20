@@ -11,7 +11,8 @@ const PICKER_ID = 'patchwork-task-model-selector';
 const MENU_ID = 'patchwork-task-model-menu';
 const SLOT_ID = 'patchwork-task-model-selector-slot';
 const SUPPRESSION_ID = 'patchwork-native-model-selector-suppression';
-const GUARD_INTERVAL_MILLISECONDS = 400;
+const GUARD_INTERVAL_MILLISECONDS = 2_000;
+const MUTATION_SETTLE_MILLISECONDS = 250;
 const MENU_HEIGHT = 374;
 const MENU_WIDTH = 260;
 
@@ -345,22 +346,28 @@ function buildPicker() {
 
 /* ------------------------------------------------------- native picker takeover */
 
-function findNativePickers() {
-  const labelMatched = [...document.querySelectorAll('button, [role="button"]')].filter((candidate) => {
-    const bounds = candidate.getBoundingClientRect();
-    const labels = [candidate, ...candidate.querySelectorAll(':scope > span')]
-      .map((value) => String(value?.textContent ?? '').replace(/\s+/g, ' ').trim());
-    return bounds.width > 0 && bounds.width <= 360
-      && bounds.height > 0 && bounds.height <= 64
-      && labels.some((text) => NATIVE_PICKER_LABEL.test(text));
-  });
-  return [...new Set([...document.querySelectorAll(NATIVE_PICKER_SELECTOR), ...labelMatched]
+function findNativePickers(scanLabels = true) {
+  const selectorMatched = [...document.querySelectorAll(NATIVE_PICKER_SELECTOR)];
+  // The semantic fallback measures every button on the page. Use it only for
+  // the initial/periodic guard scan; ordinary ChatGPT mutations first take the
+  // cheap selector path used by its current composer.
+  const labelMatched = selectorMatched.length > 0 || !scanLabels
+    ? []
+    : [...document.querySelectorAll('button, [role="button"]')].filter((candidate) => {
+      const bounds = candidate.getBoundingClientRect();
+      const labels = [candidate, ...candidate.querySelectorAll(':scope > span')]
+        .map((value) => String(value?.textContent ?? '').replace(/\s+/g, ' ').trim());
+      return bounds.width > 0 && bounds.width <= 360
+        && bounds.height > 0 && bounds.height <= 64
+        && labels.some((text) => NATIVE_PICKER_LABEL.test(text));
+    });
+  return [...new Set([...selectorMatched, ...labelMatched]
     .map((anchor) => anchor.closest('button, [role="button"], [aria-haspopup="menu"]') || anchor))]
     .filter((candidate) => !candidate.closest(PICKER_TAG));
 }
 
-function replaceNativePickers() {
-  const nativePickers = findNativePickers();
+function replaceNativePickers(scanLabels = true) {
+  const nativePickers = findNativePickers(scanLabels);
   const visible = nativePickers.find((candidate) => {
     const bounds = candidate.getBoundingClientRect();
     return bounds.width > 0 && bounds.height > 0;
@@ -427,6 +434,22 @@ function install({
     selection.taskId = taskId;
   }
   const previous = session;
+  const currentPicker = document.getElementById(PICKER_ID);
+  const currentSlot = document.getElementById(SLOT_ID);
+  // Task submission updates the existing picker; rebuilding it used to remove
+  // ChatGPT's already-replaced native control and then poll for up to four
+  // seconds waiting for React to render another one.
+  if (previous && currentPicker?.isConnected && currentSlot?.isConnected) {
+    previous.onChange = onChange || previous.onChange || null;
+    currentPicker.setAttribute('data-task-id', String(selection.taskId || ''));
+    currentPicker.__patchworkRender?.();
+    previous.menu?.renderMenu?.();
+    return {
+      installed: true,
+      reason: null,
+      selection: currentSelection(),
+    };
+  }
   uninstallDom();
   session = { onChange: onChange || previous?.onChange || null };
   previous?.observer?.disconnect();
@@ -439,6 +462,7 @@ function install({
   const picker = replaceNativePickers();
 
   let pending = false;
+  const activeSession = session;
   const observer = new MutationObserver((records) => {
     const externalMutation = records.some((record) => {
       const target = record.target?.nodeType === 1 ? record.target : record.target?.parentElement;
@@ -447,16 +471,13 @@ function install({
     if (!externalMutation) return;
     if (pending) return;
     pending = true;
-    queueMicrotask(() => {
+    setTimeout(() => {
       pending = false;
-      if (session) replaceNativePickers();
-    });
+      if (session === activeSession) replaceNativePickers(false);
+    }, MUTATION_SETTLE_MILLISECONDS);
   });
   if (document.body) {
     observer.observe(document.body, {
-      attributes: true,
-      attributeFilter: ['aria-label', 'data-testid', 'role', 'style'],
-      characterData: true,
       childList: true,
       subtree: true,
     });

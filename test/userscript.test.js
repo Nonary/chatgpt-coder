@@ -917,4 +917,8 @@ test('the picker mounts inside the composer rather than floating over the page',
   assert.match(source, /--patchwork-dock-width/, 'the menu is kept clear of the dock');
   assert.match(source, /if \(!externalMutation\) return/, 'the observer ignores Patchwork-owned mutations');
   assert.doesNotMatch(source, /slot\.style\.cssText\s*=/, 'slot resizing does not blindly retrigger style observation');
+  assert.doesNotMatch(source, /characterData:\s*true/, 'streamed transcript text does not retrigger picker discovery');
+  assert.doesNotMatch(source, /attributes:\s*true/, 'unrelated page attribute churn does not retrigger picker discovery');
+  assert.match(source, /currentPicker\?\.isConnected && currentSlot\?\.isConnected/, 'task sends reuse the live picker');
+  assert.match(source, /MUTATION_SETTLE_MILLISECONDS = 250/, 'composer replacement scans are throttled');
 });
