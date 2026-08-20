@@ -196,7 +196,7 @@ function attachmentStatus(filename, dismissDuplicateNotice = false) {
   };
 }
 
-async function waitForAttachment(filename, timeoutMilliseconds = 120_000) {
+async function waitForAttachment(filename, timeoutMilliseconds = 60_000) {
   const startedAt = Date.now();
   let readyChecks = 0;
   let lastRedispatchAt = startedAt;
