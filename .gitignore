@@ -3,6 +3,7 @@ node_modules/
 dist/
 dist-*/
 release/
+.runtime/
 *.log
 .DS_Store
 
