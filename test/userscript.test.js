@@ -165,6 +165,54 @@ test('a fresh route is not ready while the previous conversation is still render
   }
 });
 
+test('conversation titles come from the matching ChatGPT DOM entry before falling back to the page title', () => {
+  const { conversationTitleFromDom } = require('../src/userscript/src/chatgpt/conversation-title');
+  const taskId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  const otherId = '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33';
+  const matching = {
+    href: `https://chatgpt.com/c/${taskId}`,
+    getAttribute: (name) => (name === 'aria-label' ? 'Generated task title' : null),
+  };
+  const other = {
+    href: `https://chatgpt.com/c/${otherId}`,
+    textContent: 'Other conversation',
+    getAttribute: () => null,
+  };
+  const root = {
+    title: 'Generated task title - ChatGPT',
+    querySelector: () => ({
+      getAttribute: (name) => (name === 'aria-label' ? 'Generated task title' : null),
+    }),
+    querySelectorAll: () => [other, matching],
+  };
+
+  assert.equal(conversationTitleFromDom(taskId, { root, currentUrl: matching.href }), 'Generated task title');
+  assert.equal(conversationTitleFromDom(taskId, {
+    root: {
+      title: 'Other conversation - ChatGPT',
+      querySelector: root.querySelector,
+      querySelectorAll: () => [matching],
+    },
+    currentUrl: other.href,
+  }), 'Generated task title');
+  assert.equal(conversationTitleFromDom(taskId, {
+    root: {
+      title: 'Other conversation - ChatGPT',
+      querySelector: root.querySelector,
+      querySelectorAll: () => [],
+    },
+    currentUrl: other.href,
+  }), '');
+  assert.equal(conversationTitleFromDom(taskId, {
+    root: { title: 'Page title - ChatGPT', querySelectorAll: () => [] },
+    currentUrl: matching.href,
+  }), 'Page title');
+  assert.equal(conversationTitleFromDom(taskId, {
+    root: { title: 'Another conversation - ChatGPT', querySelectorAll: () => [] },
+    currentUrl: `https://chatgpt.com/c/${otherId}`,
+  }), '');
+});
+
 test('stream status and conversation titles normalize the way the task timer expects', () => {
   assert.equal(normalizeConversationStreamStatus('IS_STREAMING'), 'streaming');
   assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
@@ -432,6 +480,17 @@ test('the agent client builds authenticated request paths for every workspace ca
 
   await api.skills(['C:/one', 'C:/two']);
   assert.equal(calls.at(-1).path, '/v1/skills?repositories=C%3A%2Fone%0AC%3A%2Ftwo');
+
+  await api.taskTitle('task-1', {
+    conversationId: '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+    title: 'Generated task title',
+  });
+  assert.equal(calls.at(-1).method, 'POST');
+  assert.equal(calls.at(-1).path, '/v1/tasks/task-1/title');
+  assert.deepEqual(calls.at(-1).body, {
+    conversationId: '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+    title: 'Generated task title',
+  });
 
   await api.taskResult('task-1', 'PATCHWORK_RESULT_V1');
   assert.equal(calls.at(-1).method, 'POST');

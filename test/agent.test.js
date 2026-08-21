@@ -211,6 +211,19 @@ test('a task travels create, download, submit, result, and apply entirely over H
   assert.equal(submitted.payload.task.state, 'submitted');
   assert.equal(submitted.payload.task.chatStatus, 'streaming');
 
+  const renamed = await agent.call('POST', `/v1/tasks/${task.taskId}/title`, {
+    conversationId: '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+    title: '  Generated   task title  ',
+  });
+  assert.equal(renamed.status, 200);
+  assert.equal(renamed.payload.task.conversationTitle, 'Generated task title');
+
+  const wrongConversation = await agent.call('POST', `/v1/tasks/${task.taskId}/title`, {
+    conversationId: '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33',
+    title: 'Wrong conversation',
+  });
+  assert.equal(wrongConversation.status, 400);
+
   const rejected = await agent.call('POST', `/v1/tasks/${task.taskId}/submitted`, { conversationUrl: 'https://chatgpt.com/' });
   assert.equal(rejected.status, 400, 'a task is never marked submitted without a real conversation');
 

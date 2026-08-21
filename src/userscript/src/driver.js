@@ -4,6 +4,7 @@ const navigate = require('./chatgpt/navigate');
 const modelPicker = require('./chatgpt/model-picker');
 const notices = require('./chatgpt/notices');
 const resultScan = require('./chatgpt/result-scan');
+const { conversationTitleFromDom, observeConversationTitle } = require('./chatgpt/conversation-title');
 const { beginEnforcement } = require('./chatgpt/intercept');
 const {
   CHATGPT_ORIGIN,
@@ -57,6 +58,7 @@ class Driver {
     this.activeMerge = null;
     this.watchGeneration = 0;
     this.stopDomWatch = null;
+    this.stopConversationTitleWatch = null;
     this.seenTaskResultFiles = new Map();
   }
 
@@ -64,6 +66,8 @@ class Driver {
     this.watchGeneration += 1;
     this.stopDomWatch?.();
     this.stopDomWatch = null;
+    this.stopConversationTitleWatch?.();
+    this.stopConversationTitleWatch = null;
   }
 
   forgetTask(taskId) {
@@ -200,7 +204,9 @@ class Driver {
     const { task: submitted } = await this.api.taskSubmitted(task.taskId, {
       conversationUrl,
       conversationId: conversationIdFromRouteUrl(conversationUrl) || streamedId,
-      conversationTitle: normalizeConversationTitle(document.title),
+      conversationTitle: conversationTitleFromDom(
+        conversationIdFromRouteUrl(conversationUrl) || streamedId,
+      ) || normalizeConversationTitle(document.title),
       model: verified.selectedModel,
       reasoningMode: verified.selectedReasoningMode,
     });
@@ -361,6 +367,37 @@ class Driver {
     return task.answerOnly ? task.state === 'submitted' : task.state === 'submitted';
   }
 
+  watchConversationTitle(task) {
+    const conversationId = this.conversationIdFor(task);
+    if (!conversationId) return;
+    this.stopConversationTitleWatch?.();
+    this.stopConversationTitleWatch = null;
+
+    const currentTitle = normalizeConversationTitle(task.conversationTitle);
+    if (currentTitle) return;
+
+    this.stopConversationTitleWatch = observeConversationTitle(conversationId, {
+      onTitle: async (title, stop) => {
+        try {
+          const { task: updated } = await this.api.taskTitle(task.taskId, {
+            conversationId,
+            title,
+          });
+          stop();
+          this.report({ type: 'task-renamed', task: updated });
+          return true;
+        } catch (error) {
+          this.report({
+            type: 'task-title-error',
+            taskId: task.taskId,
+            message: error.message,
+          });
+          return false;
+        }
+      },
+    });
+  }
+
   resultFileSet(taskId) {
     let files = this.seenTaskResultFiles.get(taskId);
     if (!files) {
@@ -490,7 +527,7 @@ class Driver {
       const { task: submitted } = await this.api.taskSubmitted(task.taskId, {
         conversationUrl,
         conversationId,
-        conversationTitle: normalizeConversationTitle(document.title),
+        conversationTitle: conversationTitleFromDom(conversationId) || normalizeConversationTitle(document.title),
         model: task.model,
         reasoningMode: task.reasoningMode,
       });
@@ -550,6 +587,7 @@ class Driver {
     if (!this.canWatchTask(task)) return;
     this.stop();
     this.activeTaskId = task.taskId;
+    this.watchConversationTitle(task);
     const generation = this.watchGeneration;
     const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
     let currentTask = task;
@@ -584,6 +622,8 @@ class Driver {
         const updated = await this.reconcileTask(currentTask, { knownStatus: 'completed' });
         if (updated) currentTask = updated;
         if (!this.canWatchTask(currentTask)) {
+          this.stopConversationTitleWatch?.();
+          this.stopConversationTitleWatch = null;
           this.activeTaskId = null;
           return;
         }
@@ -607,6 +647,10 @@ class Driver {
         if (latest) currentTask = latest;
       }
       if (generation === this.watchGeneration && this.canWatchTask(currentTask)) arm();
+      else if (!this.canWatchTask(currentTask)) {
+        this.stopConversationTitleWatch?.();
+        this.stopConversationTitleWatch = null;
+      }
     };
 
     if (responseComplete) Promise.resolve(responseComplete).then((complete) => {

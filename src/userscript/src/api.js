@@ -154,6 +154,8 @@ class Api {
 
   taskSubmitted(taskId, input) { return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/submitted`, input); }
 
+  taskTitle(taskId, input) { return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/title`, input); }
+
   taskChatStatus(taskId, input) { return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/chat-status`, input); }
 
   taskFailed(taskId, message) { return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/failed`, { message }); }

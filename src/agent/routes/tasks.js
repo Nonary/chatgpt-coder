@@ -6,7 +6,11 @@ const {
   buildFollowUpPrompt, followUpTurn, resolveGitSummaryPrompt, resolveTreeTaskRepositories,
 } = require('../services/task-service');
 const { validateCommitMessage } = require('../services/worktree-service');
-const { isChatGPTConversationUrl, normalizeConversationStreamStatus } = require('../../shared/chatgpt');
+const {
+  conversationIdFromRouteUrl,
+  isChatGPTConversationUrl,
+  normalizeConversationStreamStatus,
+} = require('../../shared/chatgpt');
 
 const MAX_RESULT_TEXT_BYTES = 128 * 1024 * 1024;
 
@@ -190,6 +194,24 @@ function register(router, context) {
     const attachment = (task.attachments || []).find((item) => item.name === params.name);
     if (!attachment) throw new Error(`Unknown task attachment: ${params.name}`);
     return sendFile(attachment.path, 'application/octet-stream', attachment.name);
+  });
+
+  router.post('/v1/tasks/:taskId/title', async ({ params, body }) => {
+    const task = await taskService.getTask(params.taskId);
+    const conversationId = String(body?.conversationId || '').trim();
+    const savedConversationId = task.conversationId || conversationIdFromRouteUrl(task.conversationUrl);
+    if (conversationId && savedConversationId && conversationId !== savedConversationId) {
+      throw new Error('The task title update does not match the saved ChatGPT conversation.');
+    }
+    const title = String(body?.title || '').trim();
+    if (!title) throw new Error('The ChatGPT conversation does not have a usable title yet.');
+    const updated = await taskService.updateConversationTitle(task.taskId, title);
+    emit({
+      type: 'task-renamed',
+      task: updated,
+      taskId: updated.taskId,
+    });
+    return { task: updated };
   });
 
   router.post('/v1/tasks/:taskId/submitted', async ({ params, body }) => {

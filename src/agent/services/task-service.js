@@ -12,7 +12,11 @@ const {
 } = require('./git');
 const { IacService } = require('./iac-service');
 const { SkillService } = require('./skill-service');
-const { conversationIdFromRouteUrl, isChatGPTConversationUrl } = require('../../shared/chatgpt');
+const {
+  conversationIdFromRouteUrl,
+  isChatGPTConversationUrl,
+  normalizeConversationTitle,
+} = require('../../shared/chatgpt');
 
 const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
@@ -212,7 +216,7 @@ ${summaryOnly
 
 ${DETAILED_COMMIT_MESSAGE_REQUIREMENTS}
 
-The generated commit message is part of the machine-readable result contract, not just the chat response. Put the complete message, including its detailed body and optional footer, in the JSON `commitMessage` field. Do not put the detailed commit message only in `summary`, do not shorten it to a subject line, and do not wrap the payload value in Markdown fences. The `commitMessage` value must be valid as a Conventional Commit and must reflect the final cumulative result, including all follow-up changes. `summary` remains a separate concise human-readable implementation summary.
+The generated commit message is part of the machine-readable result contract, not just the chat response. Put the complete message, including its detailed body and optional footer, in the JSON \`commitMessage\` field. Do not put the detailed commit message only in \`summary\`, do not shorten it to a subject line, and do not wrap the payload value in Markdown fences. The \`commitMessage\` value must be valid as a Conventional Commit and must reflect the final cumulative result, including all follow-up changes. \`summary\` remains a separate concise human-readable implementation summary.
 
 ## Produce the plain-text result
 
@@ -245,7 +249,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
 
 \`PATCHWORK_RESULT_END\`
 
-The complete `commitMessage` field is required for every non-answer task, including tasks without a coding tree. Its first line must follow Conventional Commits: \`type(optional-scope): concise description\`, and the full value must be the detailed message generated from the final cumulative diff. Patchwork may apply the result to a coding tree chosen after this task finishes, so this field is also the source for the commit and Source Control AI Summary/Suggestion. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
+The complete \`commitMessage\` field is required for every non-answer task, including tasks without a coding tree. Its first line must follow Conventional Commits: \`type(optional-scope): concise description\`, and the full value must be the detailed message generated from the final cumulative diff. Patchwork may apply the result to a coding tree chosen after this task finishes, so this field is also the source for the commit and Source Control AI Summary/Suggestion. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
 
 ${summaryOnly ? 'For this read-only Git summary task, set `commitMessage` to the single Conventional Commit message requested by `TASK.md`, set every repository `patch` value to an empty string, and do not include code changes in the result.' : ''}
 `;
@@ -765,6 +769,13 @@ class TaskService {
     const next = { ...task, ...update, updatedAt: new Date().toISOString() };
     await this.saveTask(next);
     return next;
+  }
+
+  async updateConversationTitle(taskId, title) {
+    const task = await this.getTask(taskId);
+    const conversationTitle = normalizeConversationTitle(title).slice(0, 240);
+    if (!conversationTitle || conversationTitle === task.conversationTitle) return task;
+    return this.updateTask(taskId, { conversationTitle });
   }
 
   async createFollowUp(taskId, input = {}) {
