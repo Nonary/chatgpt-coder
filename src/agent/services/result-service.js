@@ -254,12 +254,10 @@ class ResultService {
         localPath: outputPath,
       });
     }
-    // A result can be redirected to a coding tree after it is downloaded. New
-    // packages require a Conventional Commit message; retain compatibility with
-    // older no-tree tasks by giving a missing message a safe tree-ready fallback.
-    const commitMessage = manifest.commitMessage == null
-      ? 'chore(patchwork): apply task result'
-      : validateCommitMessage(manifest.commitMessage);
+    // The result payload is the source of truth for the AI-generated commit
+    // message. Require and validate it so Source Control never falls back to a
+    // generic message after a task is applied or redirected to a coding tree.
+    const commitMessage = validateCommitMessage(manifest.commitMessage);
     return {
       summary: String(manifest.summary || '').trim(),
       commitMessage,

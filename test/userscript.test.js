@@ -47,6 +47,33 @@ test('only real ChatGPT conversation routes are accepted as submission proof', (
   assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/not-a-uuid'), null);
 });
 
+test('opening a task conversation uses a new tab without changing the current route', () => {
+  const { openConversationInNewTab } = require('../src/userscript/src/chatgpt/navigate');
+  const previousDocument = global.document;
+  const clicks = [];
+  global.document = {
+    createElement: (tagName) => {
+      assert.equal(tagName, 'a');
+      return {
+        href: '',
+        target: '',
+        rel: '',
+        click() { clicks.push(this); },
+      };
+    },
+  };
+  try {
+    const url = 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+    assert.deepEqual(openConversationInNewTab(url), { navigated: false, method: 'new-tab' });
+    assert.equal(clicks.length, 1);
+    assert.equal(clicks[0].href, url);
+    assert.equal(clicks[0].target, '_blank');
+    assert.equal(clicks[0].rel, 'noopener noreferrer');
+  } finally {
+    global.document = previousDocument;
+  }
+});
+
 test('project URLs reject identifiers that do not belong to the project', () => {
   assert.equal(chatGPTProjectUrl('g-p-abc123'), 'https://chatgpt.com/g/g-p-abc123/project');
   assert.equal(chatGPTProjectUrl('g-p-abc123', 'g-p-abc123-tasks'), 'https://chatgpt.com/g/g-p-abc123-tasks/project');

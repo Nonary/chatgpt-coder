@@ -64,12 +64,6 @@ class Store {
         mode: 'ask',
         taskText: '',
       },
-      taskConversation: {
-        taskId: null,
-        loading: false,
-        error: null,
-        messages: [],
-      },
     };
   }
 
@@ -111,11 +105,6 @@ class Store {
       mode,
       taskText: '',
     };
-    this.notify(reason);
-  }
-
-  setTaskConversation(patch, reason = 'task-conversation') {
-    Object.assign(this.state.taskConversation, patch);
     this.notify(reason);
   }
 

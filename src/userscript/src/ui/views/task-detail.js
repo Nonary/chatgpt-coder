@@ -4,7 +4,7 @@ const {
 const {
   taskConfigurationLabel, taskLabel, taskStateLabel, taskStatusText,
 } = require('../labels');
-const { renderTaskConversation, renderTaskFollowUpComposer } = require('./task-follow-up');
+const { renderTaskFollowUpComposer, renderTaskTurnList } = require('./task-follow-up');
 
 const NEW_TREE_VALUE = '__new__';
 const MISSING_TREE_VALUE = '__missing__';
@@ -246,10 +246,15 @@ function renderTaskDetail(ctx, task, { followUpComposer = null } = {}) {
       h('p', { class: 'field-help' }, `${taskLabel(task)} · created ${formatDateTime(task.createdAt)}`),
       primaryActions,
     ),
-    renderTaskConversation(ctx, task),
     renderTargetCard(ctx, task),
     renderResultCard(ctx, task),
-    h('div', { class: 'card' }, h('h3', {}, 'Activity'), activity),
+    h(
+      'div',
+      { class: 'card' },
+      h('h3', {}, 'Activity'),
+      renderTaskTurnList(task),
+      activity,
+    ),
     renderTaskFollowUpComposer(ctx, task, followUpComposer),
   ].filter(Boolean);
 }

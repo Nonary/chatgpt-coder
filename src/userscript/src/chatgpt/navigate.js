@@ -216,6 +216,18 @@ async function openConversation(conversationUrl) {
   return navigate(conversationUrl);
 }
 
+function openConversationInNewTab(conversationUrl) {
+  if (!isChatGPTConversationUrl(conversationUrl)) {
+    throw new Error('This task has an invalid saved conversation URL.');
+  }
+  const link = document.createElement('a');
+  link.href = conversationUrl;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.click();
+  return { navigated: false, method: 'new-tab' };
+}
+
 async function waitForConversationUrl(timeoutMilliseconds = 45_000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMilliseconds) {
@@ -232,6 +244,7 @@ module.exports = {
   navigate,
   navigateInPage,
   openConversation,
+  openConversationInNewTab,
   openFreshChat,
   projectUrl,
   rememberPendingNavigation,

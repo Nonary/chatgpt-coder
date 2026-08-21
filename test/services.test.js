@@ -277,6 +277,9 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   assert.match(agentInstructions, /PATCHWORK_RESULT_V1/);
   assert.match(agentInstructions, new RegExp(`chatgpt-ide-result-${task.taskId}\\.txt`));
   assert.match(agentInstructions, /do not print or paste the result envelope/i);
+  assert.match(agentInstructions, /detailed Conventional Commit message/i);
+  assert.match(agentInstructions, /complete message.*commitMessage/i);
+  assert.match(task.handoffPrompt, /Source Control AI Summary\/Suggestion/i);
   const packagedBundle = entries.get(`repositories/${repository.id}.bundle`).getData();
   const sourceBundle = await fs.readFile(path.join(tasks.taskDirectory(task.taskId), 'repositories', `${repository.id}.bundle`));
   assert.deepEqual(packagedBundle, sourceBundle);
@@ -1010,6 +1013,7 @@ test('an unborn repository is snapshotted without changing the source and accept
     taskId: task.taskId,
     status: 'completed',
     summary: 'Updated the uncommitted greeting.',
+    commitMessage: 'fix(greeting): update the uncommitted greeting',
     repositories: [{
       id: taskRepository.id,
       baseCommit: taskRepository.baseCommit,
@@ -1050,6 +1054,7 @@ test('a matching ChatGPT result validates, applies, and rolls back', async (cont
     taskId: task.taskId,
     status: 'completed',
     summary: 'Updated the greeting.',
+    commitMessage: 'fix(greeting): update the greeting',
     repositories: [{
       id: repository.id,
       baseCommit: repository.baseCommit,
@@ -1244,6 +1249,7 @@ test('a downloaded text result file validates and applies automatically', async 
     taskId: task.taskId,
     status: 'completed',
     summary: 'Changed the greeting through the downloaded result file.',
+    commitMessage: 'fix(greeting): update the downloaded greeting',
     repositories: [{
       id: repository.id,
       baseCommit: repository.baseCommit,
@@ -1932,6 +1938,7 @@ test('a downloaded plain-text ChatGPT result validates and applies automatically
     taskId: task.taskId,
     status: 'completed',
     summary: 'Changed the greeting through the downloaded result file.',
+    commitMessage: 'fix(greeting): update the greeting from the downloaded result',
     repositories: [{
       id: repository.id,
       baseCommit: repository.baseCommit,
@@ -1946,4 +1953,35 @@ test('a downloaded plain-text ChatGPT result validates and applies automatically
   assert.equal(current.state, 'applied');
   assert.equal(current.result.transport, 'plain-text-base64');
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'plain text result\n');
+});
+
+test('plain-text task results require a valid Conventional Commit message in the payload', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-required-commit-message-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting.', repositories: [repository], autoApply: false,
+  });
+
+  const responseText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Updated the greeting.',
+    repositories: [{
+      id: repository.id,
+      baseCommit: repository.baseCommit,
+      patchEncoding: 'base64',
+      patch: '',
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+
+  await assert.rejects(
+    ingestDownloadedText(new ResultService(tasks), tasks, task, responseText),
+    /did not provide a commit message/i,
+  );
 });

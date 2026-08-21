@@ -26,33 +26,6 @@ const ELAPSED_TICK_MILLISECONDS = 1_000;
 const UPDATE_CHECK_INTERVAL_MILLISECONDS = 30 * 60 * 1_000;
 const UPDATE_RECONNECT_TIMEOUT_MILLISECONDS = 60_000;
 
-function conversationMessageText(message) {
-  const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
-  const text = parts
-    .filter((part) => typeof part === 'string')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .join('\n');
-  if (text) return text;
-  const value = message?.content?.text?.value;
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function conversationMessages(record) {
-  return Object.values(record?.mapping || {})
-    .map((node) => node?.message)
-    .filter((message) => ['user', 'assistant'].includes(message?.author?.role))
-    .map((message) => ({
-      id: message.id || null,
-      role: message.author.role,
-      text: conversationMessageText(message),
-      at: message.create_time ? new Date(Number(message.create_time) * 1000).toISOString() : null,
-      createTime: Number(message.create_time) || 0,
-    }))
-    .filter((message) => message.text)
-    .sort((left, right) => left.createTime - right.createTime)
-    .slice(-14);
-}
 
 class App {
   constructor({ api, transport, version }) {
@@ -227,15 +200,6 @@ class App {
     if (['task-applied', 'task-rolled-back', 'task-conflicted'].includes(event.type)) {
       this.refreshSource().catch(() => {});
     }
-    if (event.task && event.task.taskId === this.store.state.activeTaskId
-      && (event.type === 'task-submitted'
-        || event.type === 'task-follow-up-submitted'
-        || event.type === 'task-follow-up-failed'
-        || event.type === 'task-follow-up-completed'
-        || event.type === 'task-chat-status' && ['completed', 'failed'].includes(event.chatStatus)
-        || event.type === 'result-ready')) {
-      this.refreshTaskConversation(event.task.taskId).catch(() => {});
-    }
     this.renderActiveView();
   }
 
@@ -273,8 +237,6 @@ class App {
     if (current) {
       this.store.set({ activeTaskId: current.taskId }, 'silent');
       this.store.resetFollowUp(current, 'silent');
-      this.store.setTaskConversation({ taskId: current.taskId, loading: true, error: null, messages: [] }, 'silent');
-      this.refreshTaskConversation(current.taskId).catch(() => {});
       this.driver.adoptTask(current);
     } else if (running) {
       this.driver.adoptTask(running);
@@ -403,29 +365,6 @@ class App {
     throw new Error('Patchwork rebuilt, but the restarted agent did not come back on this port.');
   }
 
-  async refreshTaskConversation(taskId) {
-    const task = this.store.task(taskId) || (await this.api.task(taskId)).task;
-    const conversationId = task?.conversationId || conversationIdFromRouteUrl(task?.conversationUrl);
-    if (!conversationId) {
-      this.store.setTaskConversation({ taskId, loading: false, error: 'This task has no saved ChatGPT conversation yet.', messages: [] }, 'task-conversation');
-      return [];
-    }
-    this.store.setTaskConversation({ taskId, loading: true, error: null }, 'task-conversation');
-    try {
-      const record = await chatgpt.conversation(conversationId);
-      const messages = conversationMessages(record);
-      if (this.store.state.activeTaskId === taskId) {
-        this.store.setTaskConversation({ taskId, loading: false, error: null, messages }, 'task-conversation');
-      }
-      return messages;
-    } catch (error) {
-      if (this.store.state.activeTaskId === taskId) {
-        this.store.setTaskConversation({ taskId, loading: false, error: error.message, messages: [] }, 'task-conversation');
-      }
-      return [];
-    }
-  }
-
   async refreshProjects(showErrors = false) {
     try {
       const projects = await chatgpt.listProjects();
@@ -451,10 +390,8 @@ class App {
       showTask(taskId) {
         const task = app.store.task(taskId);
         if (task) app.store.resetFollowUp(task, 'silent');
-        app.store.setTaskConversation({ taskId, loading: true, error: null, messages: [] }, 'silent');
         app.store.set({ activeTaskId: taskId, activity: [] }, 'tasks');
         app.shell.show('tasks');
-        app.refreshTaskConversation(taskId).catch(() => {});
       },
 
       checkForUpdates() {
@@ -572,7 +509,6 @@ class App {
           const submitted = await app.driver.submitFollowUp(prepared, turn, attachments);
           app.store.upsertTask(submitted);
           app.store.setFollowUp({ taskId, taskText: '', attachments: [], skillIds: [], promptIds: [] }, 'silent');
-          await app.refreshTaskConversation(taskId);
           app.renderActiveView();
           return submitted;
         }, { failure: 'The follow-up could not be sent.' });
@@ -669,11 +605,10 @@ class App {
         });
       },
 
-      async openConversation(taskId) {
+      openConversation(taskId) {
         const task = app.store.task(taskId);
         if (!task?.conversationUrl) return;
-        await navigate.openConversation(task.conversationUrl);
-        app.driver.adoptTask(task);
+        navigate.openConversationInNewTab(task.conversationUrl);
       },
 
       async copyPrompt(taskId) {

@@ -649,41 +649,8 @@ button.picker-back { min-height: 30px; padding: 0 4px; }
   .composer-settings-action button { width: 100%; }
 }
 
-/* ----------------------------------------------------------- task conversation */
-
-.task-conversation-heading, .task-follow-up-heading {
-  display: flex; align-items: flex-start; gap: 12px; justify-content: space-between;
-}
-.task-conversation-original {
-  margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
-  background: var(--surface-muted);
-}
-.task-conversation-original-label {
-  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-tertiary);
-}
-.task-conversation-original-copy {
-  margin-top: 4px; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere;
-}
-.task-conversation-messages {
-  display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto;
-  margin-top: 12px;
-}
-.task-conversation-empty {
-  padding: 12px; border: 1px dashed var(--border); border-radius: var(--radius);
-  color: var(--text-tertiary); font-size: 13px; line-height: 18px;
-}
-.task-message {
-  padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--surface-raised);
-}
-.task-message-user { background: color-mix(in srgb, var(--accent) 7%, var(--surface-raised)); }
-.task-message-heading { display: flex; align-items: baseline; gap: 8px; color: var(--text-secondary); font-size: 12px; }
-.task-message-heading time { margin-left: auto; color: var(--text-tertiary); }
-.task-message-copy {
-  margin-top: 6px; color: var(--text); font-size: 13px; line-height: 19px;
-  white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto;
-}
-.task-turns { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.task-follow-up-heading { display: flex; align-items: flex-start; gap: 12px; justify-content: space-between; }
+.task-turns { margin-top: 4px; padding-top: 4px; }
 .task-turns-heading { margin-bottom: 8px; color: var(--text-secondary); font-size: 12px; font-weight: 600; }
 .task-turn { display: flex; gap: 9px; padding: 7px 0; }
 .task-turn-marker {

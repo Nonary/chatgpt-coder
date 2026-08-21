@@ -86,51 +86,6 @@ function renderTaskTurnList(task) {
   );
 }
 
-function renderTaskConversation(ctx, task) {
-  const { taskConversation } = ctx.store.state;
-  const body = h('div', { class: 'task-conversation-messages' });
-  if (taskConversation.taskId !== task.taskId || taskConversation.loading) {
-    replace(body, h('div', { class: 'task-conversation-empty' }, 'Loading the saved conversation…'));
-  } else if (taskConversation.messages.length > 0) {
-    replace(body, ...taskConversation.messages.map((message) => h(
-      'article',
-      { class: `task-message ${message.role === 'user' ? 'task-message-user' : 'task-message-assistant'}` },
-      h(
-        'div',
-        { class: 'task-message-heading' },
-        h('strong', {}, message.role === 'user' ? 'You' : 'ChatGPT'),
-        message.at ? h('time', {}, formatDateTime(message.at)) : null,
-      ),
-      h('div', { class: 'task-message-copy' }, message.text),
-    )));
-  } else {
-    replace(body, h('div', { class: 'task-conversation-empty' }, taskConversation.error || 'The conversation transcript is unavailable. The task turn history below remains available.'));
-  }
-
-  return h(
-    'div',
-    { class: 'card task-conversation' },
-    h('div', { class: 'task-conversation-heading' },
-      h('div', {}, h('h3', { style: { margin: '0' } }, 'Conversation'),
-        h('p', { class: 'field-help', style: { margin: '3px 0 0' } }, 'This stays on the same ChatGPT conversation and task.'),
-      ),
-      task.conversationUrl
-        ? h('button', { class: 'secondary', type: 'button', onclick: () => ctx.actions.openConversation(task.taskId) }, 'Open in ChatGPT')
-        : null,
-    ),
-    task.taskText
-      ? h(
-        'div',
-        { class: 'task-conversation-original' },
-        h('div', { class: 'task-conversation-original-label' }, 'Original request'),
-        h('div', { class: 'task-conversation-original-copy' }, task.taskText),
-      )
-      : null,
-    body,
-    renderTaskTurnList(task),
-  );
-}
-
 function restoreFocus(ctx, cursor) {
   requestAnimationFrame(() => {
     const input = ctx.shell.view('tasks')?.querySelector('.task-follow-up-card .composer-textarea');
@@ -671,6 +626,6 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
 module.exports = {
   canFollowUp,
   canSendFollowUp,
-  renderTaskConversation,
   renderTaskFollowUpComposer,
+  renderTaskTurnList,
 };

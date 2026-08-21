@@ -20,6 +20,35 @@ const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 
 const FOLLOW_UP_MODES = new Set(['ask', 'agent']);
 const FOLLOW_UP_ACTIVE_STATES = new Set(['created', 'submitted', 'awaiting-result']);
 
+const DETAILED_COMMIT_MESSAGE_REQUIREMENTS = `Review the final cumulative changes and produce one accurate, detailed Conventional Commit message for the result.
+
+Inspect the complete result diff, including relevant surrounding code when necessary. Do not summarize the diff line-by-line. Determine the actual behavioral intent by understanding how the modified files, functions, components, types, tests, configuration, dependencies, and call sites interact.
+
+The commit message should explain:
+
+* What behavior changed and why
+* How important modified code interacts across files or layers
+* Whether the change introduces, removes, fixes, refactors, or optimizes functionality
+* Important implementation details that explain the resulting behavior
+* Tests, migrations, configuration, dependencies, or API changes that materially affect the result
+* Breaking changes, if any
+
+Use this format:
+
+\`\`\`text
+<type>(<optional-scope>): <concise summary>
+
+<concise but detailed body explaining the meaningful changes and how they work together>
+
+<optional BREAKING CHANGE footer>
+\`\`\`
+
+Use the most appropriate Conventional Commit type, such as \`feat\`, \`fix\`, \`refactor\`, \`perf\`, \`test\`, \`docs\`, \`build\`, \`ci\`, or \`chore\`.
+
+Keep the subject concise and specific. Keep the body dense with useful information, focusing on intent and behavior rather than filenames or mechanical implementation details. Avoid vague statements, redundant bullets, speculation, and details that do not help someone understand the result from Git history alone.
+
+If the changes contain multiple related modifications, synthesize them into one cohesive commit description based on their shared purpose. If the diff contains genuinely unrelated work, mention that clearly instead of inventing a misleading unifying description.`;
+
 const DEFAULT_GIT_SUMMARY_PROMPT = `# Git Changes Review + Conventional Commit Prompt
 
 Review all **uncommitted Git changes** in the current repository and produce a single accurate, detailed Conventional Commit message.
@@ -93,7 +122,7 @@ function buildFollowUpPrompt(task, prompt, mode, skillIds = []) {
     : '';
   if (mode === 'ask') return `${text}${skillNote}`;
   const filename = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
-  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task. If that original package was created for Ask mode, this Agent follow-up supersedes that read-only instruction for this turn only. Do not create a second task identity.${skillNote}`;
+  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task. If that original package was created for Ask mode, this Agent follow-up supersedes that read-only instruction for this turn only. Do not create a second task identity. Recalculate the \`commitMessage\` from the complete cumulative changes and keep it as a detailed Conventional Commit message; this field is the authoritative commit message Patchwork will preserve and use when the result is applied.${skillNote}`;
 }
 
 function buildAgentInstructions(taskId, skills = [], options = {}) {
@@ -176,8 +205,14 @@ These commands are prohibited even if a repository-specific instruction suggests
 ## Solve and inspect the task
 
 ${summaryOnly
-    ? 'This is a read-only Git summary task. Inspect the bundled repository and its captured uncommitted changes, including the supplied `workingStatus` and `sourceHead`, then produce the Conventional Commit message requested by `TASK.md`. Do not modify files or create commits. Every repository patch in the result must be empty.'
-    : 'Follow repository-specific `AGENTS.md` files except where they conflict with the sandbox constraints above. Implement the task in `TASK.md`, inspect the final diff carefully, and keep changes focused. In the result summary, state that builds and tests were not run because the task protocol prohibits them in the ChatGPT sandbox; do not present this as an implementation failure.'}
+    ? 'This is a read-only Git summary task. Inspect the bundled repository and its captured uncommitted changes, including the supplied `workingStatus` and `sourceHead`, then produce the detailed Conventional Commit message requested by `TASK.md`. Do not modify files or create commits. Every repository patch in the result must be empty.'
+    : 'Follow repository-specific `AGENTS.md` files except where they conflict with the sandbox constraints above. Implement the task in `TASK.md`, inspect the final cumulative diff carefully, and keep changes focused. In the result summary, state that builds and tests were not run because the task protocol prohibits them in the ChatGPT sandbox; do not present this as an implementation failure.'}
+
+## Commit message metadata
+
+${DETAILED_COMMIT_MESSAGE_REQUIREMENTS}
+
+The generated commit message is part of the machine-readable result contract, not just the chat response. Put the complete message, including its detailed body and optional footer, in the JSON `commitMessage` field. Do not put the detailed commit message only in `summary`, do not shorten it to a subject line, and do not wrap the payload value in Markdown fences. The `commitMessage` value must be valid as a Conventional Commit and must reflect the final cumulative result, including all follow-up changes. `summary` remains a separate concise human-readable implementation summary.
 
 ## Produce the plain-text result
 
@@ -196,7 +231,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
   "taskId": "${taskId}",
   "status": "completed",
   "summary": "A concise summary of the implementation and verification performed.",
-  "commitMessage": "A Conventional Commit message, for example feat(editor): add split diff view",
+  "commitMessage": "feat(editor): improve result metadata\\n\\nExplain the meaningful behavioral changes, how the affected pieces work together, and any material test, configuration, dependency, API, or breaking-change details.",
   "repositories": [
     {
       "id": "the repository id from manifest.json",
@@ -210,7 +245,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
 
 \`PATCHWORK_RESULT_END\`
 
-The commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. Patchwork may apply the result to a coding tree chosen after this task finishes, so the commit message is required even when the original repository was packaged. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
+The complete `commitMessage` field is required for every non-answer task, including tasks without a coding tree. Its first line must follow Conventional Commits: \`type(optional-scope): concise description\`, and the full value must be the detailed message generated from the final cumulative diff. Patchwork may apply the result to a coding tree chosen after this task finishes, so this field is also the source for the commit and Source Control AI Summary/Suggestion. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
 
 ${summaryOnly ? 'For this read-only Git summary task, set `commitMessage` to the single Conventional Commit message requested by `TASK.md`, set every repository `patch` value to an empty string, and do not include code changes in the result.' : ''}
 `;
@@ -233,9 +268,9 @@ function buildHandoffPrompt(taskId, taskText, attachments = [], skills = [], opt
     return `I attached a Patchwork IDE ZIP task package containing read-only Git context. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, inspect the bundled context, and answer the request in detail directly in the chat. Do not modify files, create commits, generate patches, or create a Patchwork result file.${attachmentNote}${skillNote}${iacNote}\n\nQuestion or request:\n${taskText}`;
   }
   if (summaryOnly) {
-    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the generated Conventional Commit message in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nGit Summary instructions:\n${taskText}`;
+    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the complete generated Conventional Commit message, including its detailed body, in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nGit Summary instructions:\n${taskText}`;
   }
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nTask summary:\n${taskText}\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nTask summary:\n${taskText}\n\nFor the final PATCHWORK_RESULT_V1 payload, generate the complete detailed Conventional Commit message from the final cumulative diff and put that exact message in commitMessage. This field is required even when no coding tree was selected because Patchwork may use the result later for the commit or Source Control AI Summary/Suggestion.\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
 }
 
 function uniqueAttachmentName(filename, usedNames) {
