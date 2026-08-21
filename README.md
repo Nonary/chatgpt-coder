@@ -55,7 +55,13 @@ update requires a clean, non-diverged checkout; it fast-forwards to the configur
 upstream, refreshes dependencies when the lockfile changed, rebuilds the userscript,
 and restarts the agent on the same port. The existing process stays available until
 the rebuild succeeds, so a fetch or build failure is shown without taking Patchwork
-offline.
+offline. The header's update button checks on demand and also offers **Rebuild and
+restart** when Git is already current.
+
+The installed userscript is a small loader rather than a frozen copy of the dock.
+Each ChatGPT page load retrieves the runtime compiled by the local agent, so future
+Git updates and rebuilds appear after a normal page reload without reinstalling the
+userscript.
 
 Patchwork's dock opens on the right of the page and makes room for itself, so
 ChatGPT reflows instead of being covered. `Alt+P` toggles it, and the header's layout

@@ -1,6 +1,6 @@
 {
   "name": "patchwork-chatgpt",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "A userscript that turns chatgpt.com into a coding workspace, backed by a local Git agent.",
   "packageManager": "pnpm@11.19.0",
   "main": "src/agent/cli.js",

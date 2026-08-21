@@ -71,9 +71,10 @@ function writeStorage(key, value) {
 // adopted through CSSOM rather than a <style> tag so the page's style-src CSP
 // can never suppress it.
 class Shell {
-  constructor({ onNavigate, onPushIneffective } = {}) {
+  constructor({ onNavigate, onPushIneffective, onCheckForUpdates } = {}) {
     this.onNavigate = onNavigate || (() => {});
     this.onPushIneffective = onPushIneffective || null;
+    this.onCheckForUpdates = onCheckForUpdates || (() => {});
     this.pushWarned = false;
     this.views = new Map();
     this.navButtons = new Map();
@@ -108,6 +109,11 @@ class Shell {
       { class: 'dock-header' },
       h('div', { class: 'panel-title' }, h('strong', {}, 'Workspace'), this.statusDot),
       h('div', { class: 'spacer' }),
+      this.updateButton = h('button', {
+        class: 'icon-button update-button',
+        title: 'Check for Patchwork updates',
+        onclick: () => this.onCheckForUpdates(),
+      }, svg(ICONS.refresh, { size: 18 })),
       this.layoutButton = h('button', {
         class: 'icon-button',
         title: 'Dock covers the page instead',
@@ -307,6 +313,17 @@ class Shell {
 
   setStatus(text) {
     this.statusDot.textContent = text;
+  }
+
+  setUpdateButtonState({ checking = false, available = false, blocked = false } = {}) {
+    this.updateButton.disabled = checking;
+    this.updateButton.classList.toggle('checking', checking);
+    this.updateButton.classList.toggle('update-available', available);
+    this.updateButton.classList.toggle('blocked', blocked);
+    if (checking) this.updateButton.title = 'Checking for Patchwork updates…';
+    else if (available && blocked) this.updateButton.title = 'Patchwork update needs attention';
+    else if (available) this.updateButton.title = 'Patchwork update available';
+    else this.updateButton.title = 'Check for Patchwork updates';
   }
 
   setUpdateNotice(notice) {

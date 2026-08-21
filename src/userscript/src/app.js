@@ -31,6 +31,7 @@ class App {
     this.store = new Store();
     this.shell = new Shell({
       onNavigate: () => this.renderActiveView(),
+      onCheckForUpdates: () => this.actions?.checkForUpdates(),
       onPushIneffective: (result) => {
         this.store.addActivity(`The page did not reflow around the dock (content reaches ${result.worst}px of ${result.limit}px). Use the layout button for overlay.`);
         this.toast('The page did not reflow around the panel. Try the layout button in the header.', true);
@@ -39,6 +40,7 @@ class App {
     this.driver = new Driver({ api, report: (event) => this.handleEvent(event) });
     this.diff = null;
     this.eventSequence = 0;
+    this.notifiedUpdateKey = null;
     this.actions = this.buildActions();
     this.setupViews();
   }
@@ -226,9 +228,25 @@ class App {
     }
   }
 
-  showUpdateStatus(status) {
+  showUpdateStatus(status, { manual = false } = {}) {
+    if (!status?.supported) {
+      this.shell.setUpdateNotice(manual ? {
+        message: status?.reason || 'Patchwork could not inspect its Git checkout.',
+        actionLabel: 'Check again',
+        blocked: true,
+        onAction: () => this.actions.checkForUpdates(),
+      } : null);
+      return;
+    }
     if (!status?.updateAvailable) {
-      this.shell.setUpdateNotice(null);
+      const currentMessage = status.ahead > 0
+        ? `Patchwork is not behind ${status.upstream} and has ${status.ahead} local commit${status.ahead === 1 ? '' : 's'} ahead.`
+        : `Patchwork is up to date with ${status.upstream}.`;
+      this.shell.setUpdateNotice(manual ? {
+        message: currentMessage,
+        actionLabel: 'Rebuild and restart',
+        onAction: () => this.actions.updateAgent({ rebuild: true }),
+      } : null);
       return;
     }
     const behind = status.behind > 0
@@ -236,20 +254,39 @@ class App {
       : 'Downloaded update ready to rebuild';
     this.shell.setUpdateNotice({
       message: status.canUpdate ? `${behind}.` : `${behind}. ${status.reason || 'Automatic update is unavailable.'}`,
-      actionLabel: status.canUpdate ? (status.restartPending ? 'Finish update' : 'Update') : null,
+      actionLabel: status.canUpdate ? (status.restartPending && status.behind === 0 ? 'Rebuild and restart' : 'Update') : 'Check again',
       blocked: !status.canUpdate,
-      onAction: status.canUpdate ? () => this.actions.updateAgent() : null,
+      onAction: status.canUpdate
+        ? () => this.actions.updateAgent({ rebuild: status.behind === 0 })
+        : () => this.actions.checkForUpdates(),
     });
   }
 
-  async checkForUpdate() {
+  async checkForUpdate({ announce = false, manual = false } = {}) {
+    this.shell.setUpdateButtonState({ checking: true });
     try {
       const status = await this.api.updateStatus();
-      this.showUpdateStatus(status);
+      this.showUpdateStatus(status, { manual });
+      this.shell.setUpdateButtonState({
+        available: status.updateAvailable,
+        blocked: status.updateAvailable && !status.canUpdate,
+      });
+      const updateKey = `${status.latestRevision || ''}:${status.runningRevision || ''}`;
+      if (announce && status.updateAvailable && this.notifiedUpdateKey !== updateKey) {
+        this.notifiedUpdateKey = updateKey;
+        const message = status.canUpdate
+          ? (status.behind > 0 ? 'A Patchwork update is available.' : 'Patchwork needs to rebuild and restart.')
+          : `Patchwork needs attention before it can update. ${status.reason || ''}`;
+        this.toast(message, !status.canUpdate);
+      } else if (manual && !status.updateAvailable) {
+        this.toast('Patchwork is up to date. You can rebuild and restart it from the update panel.');
+      }
       return status;
-    } catch {
+    } catch (error) {
       // Update discovery depends on the configured Git remote. A temporary
       // network failure must not interfere with the local coding workspace.
+      this.shell.setUpdateButtonState({ blocked: true });
+      if (manual) this.toast(error.message, true);
       return null;
     }
   }
@@ -294,11 +331,17 @@ class App {
         app.shell.show('tasks');
       },
 
-      async updateAgent() {
+      checkForUpdates() {
+        return app.checkForUpdate({ announce: true, manual: true });
+      },
+
+      async updateAgent({ rebuild = false } = {}) {
         const confirmed = await app.shell.confirm({
-          title: 'Update Patchwork?',
-          message: 'Patchwork will fast-forward from Git, refresh dependencies if needed, rebuild, and restart on this same port.',
-          confirmLabel: 'Update and restart',
+          title: rebuild ? 'Rebuild Patchwork?' : 'Update Patchwork?',
+          message: rebuild
+            ? 'Patchwork will rebuild the current checkout and restart on this same port. Local source changes are kept.'
+            : 'Patchwork will fast-forward from Git, refresh dependencies if needed, rebuild, and restart on this same port.',
+          confirmLabel: rebuild ? 'Rebuild and restart' : 'Update and restart',
         });
         if (!confirmed) return;
         app.shell.setUpdateNotice({
@@ -307,7 +350,7 @@ class App {
           disabled: true,
         });
         try {
-          const result = await app.api.applyUpdate();
+          const result = await app.api.applyUpdate({ rebuild });
           app.shell.setStatus('Restarting agent…');
           app.shell.setUpdateNotice({ message: 'Rebuild complete. Waiting for Patchwork to restart…' });
           await app.waitForRevision(result.revision);
@@ -811,8 +854,8 @@ class App {
     setTimeout(() => reportLayout(this.api, this.shell), 2500);
     this.driver.start();
     this.pollEvents().catch(() => {});
-    this.checkForUpdate().catch(() => {});
-    setInterval(() => this.checkForUpdate().catch(() => {}), UPDATE_CHECK_INTERVAL_MILLISECONDS);
+    this.checkForUpdate({ announce: true }).catch(() => {});
+    setInterval(() => this.checkForUpdate({ announce: true }).catch(() => {}), UPDATE_CHECK_INTERVAL_MILLISECONDS);
 
     const pending = navigate.takePendingNavigation();
     if (pending?.taskId) {

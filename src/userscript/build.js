@@ -4,6 +4,7 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..', '..');
 const ENTRY = path.join(__dirname, 'src', 'main.js');
 const OUTPUT = path.join(__dirname, 'dist', 'patchwork.user.js');
+const RUNTIME_OUTPUT = path.join(__dirname, 'dist', 'patchwork.runtime.js');
 const REQUIRE_PATTERN = /\brequire\(\s*(['"])([^'"]+)\1\s*\)/g;
 
 const { version } = require(path.join(ROOT, 'package.json'));
@@ -98,16 +99,69 @@ ${entries}
 `;
 }
 
+function loader() {
+  return `${header()}
+(function () {
+  'use strict';
+  var token = '__PATCHWORK_TOKEN__';
+  var origin = '__PATCHWORK_ORIGIN__';
+  var request = typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'
+    ? GM.xmlHttpRequest.bind(GM)
+    : (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null);
+  if (!request) {
+    console.error('[patchwork] The userscript manager did not provide GM_xmlhttpRequest.');
+    return;
+  }
+  request({
+    method: 'GET',
+    url: origin + '/patchwork.runtime.js?token=' + encodeURIComponent(token),
+    headers: { Authorization: 'Bearer ' + token },
+    onload: function (response) {
+      if (response.status < 200 || response.status >= 300) {
+        console.error('[patchwork] The local agent refused the runtime request (' + response.status + ').');
+        return;
+      }
+      window.__patchworkBootstrap = { origin: origin, token: token, transport: 'gm' };
+      var element = document.createElement('script');
+      element.src = URL.createObjectURL(new Blob([response.responseText], { type: 'text/javascript' }));
+      element.addEventListener('load', function () { URL.revokeObjectURL(element.src); });
+      element.addEventListener('error', function () {
+        URL.revokeObjectURL(element.src);
+        console.error('[patchwork] ChatGPT blocked the local Patchwork runtime.');
+      });
+      document.documentElement.append(element);
+    },
+    onerror: function () {
+      console.error('[patchwork] The local Patchwork agent is not reachable at ' + origin + '.');
+    },
+  });
+})();
+`;
+}
+
 function build() {
-  const output = bundle();
+  const output = loader();
+  const runtime = bundle();
   fs.mkdirSync(path.dirname(OUTPUT), { recursive: true });
   fs.writeFileSync(OUTPUT, output);
-  return { path: OUTPUT, bytes: Buffer.byteLength(output, 'utf8') };
+  fs.writeFileSync(RUNTIME_OUTPUT, runtime);
+  return {
+    path: OUTPUT,
+    bytes: Buffer.byteLength(output, 'utf8'),
+    runtimePath: RUNTIME_OUTPUT,
+    runtimeBytes: Buffer.byteLength(runtime, 'utf8'),
+  };
 }
 
 if (require.main === module) {
   const result = build();
-  process.stdout.write(`Built ${path.relative(ROOT, result.path)} (${(result.bytes / 1024).toFixed(1)} KB)\n`);
+  process.stdout.write([
+    `Built ${path.relative(ROOT, result.path)} (${(result.bytes / 1024).toFixed(1)} KB)`,
+    `Built ${path.relative(ROOT, result.runtimePath)} (${(result.runtimeBytes / 1024).toFixed(1)} KB)`,
+    '',
+  ].join('\n'));
 }
 
-module.exports = { ENTRY, OUTPUT, build, bundle, collect, resolveModule };
+module.exports = {
+  ENTRY, OUTPUT, RUNTIME_OUTPUT, build, bundle, collect, loader, resolveModule,
+};

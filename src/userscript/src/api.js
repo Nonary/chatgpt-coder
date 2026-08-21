@@ -50,7 +50,9 @@ class Api {
 
   updateStatus() { return this.get('/v1/update', { timeout: 60_000 }); }
 
-  applyUpdate() { return this.post('/v1/update', {}, { timeout: 600_000 }); }
+  applyUpdate({ rebuild = false } = {}) {
+    return this.post('/v1/update', { rebuild }, { timeout: 600_000 });
+  }
 
   events(since) { return this.get(`/v1/events${query({ since })}`, { timeout: 40_000 }); }
 

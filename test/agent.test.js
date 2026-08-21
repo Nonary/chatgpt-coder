@@ -580,6 +580,14 @@ test('the served userscript has its placeholders replaced and no CORS grant', as
   assert.doesNotMatch(source, /__PATCHWORK_ORIGIN__/);
   assert.ok(source.includes(agent.config.token));
   assert.ok(source.includes(`http://127.0.0.1:${agent.config.port}`));
+  assert.match(source, /patchwork\.runtime\.js/, 'the installed script loads the current runtime from the agent');
+
+  const runtimeResponse = await fetch(`http://127.0.0.1:${agent.port}/patchwork.runtime.js`);
+  assert.equal(runtimeResponse.status, 200);
+  const runtime = await runtimeResponse.text();
+  assert.doesNotMatch(runtime, /__PATCHWORK_TOKEN__/);
+  assert.ok(runtime.includes(agent.config.token));
+  assert.match(runtime, /__patchworkRequire/, 'the runtime contains the compiled application');
 });
 
 test('a submitted task without a confirmed conversation is recovered on agent start', async (context) => {

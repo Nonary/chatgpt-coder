@@ -3,6 +3,7 @@ const path = require('node:path');
 const { sendBuffer, sendText } = require('./http');
 
 const USERSCRIPT_PATH = path.join(__dirname, '..', 'userscript', 'dist', 'patchwork.user.js');
+const RUNTIME_PATH = path.join(__dirname, '..', 'userscript', 'dist', 'patchwork.runtime.js');
 
 function agentOrigin(config) {
   return `http://127.0.0.1:${config.port}`;
@@ -15,6 +16,21 @@ async function readUserscript(config) {
   } catch {
     // The bundle is build output rather than a checked-in artifact, so the agent
     // builds it on demand the first time someone opens the install page.
+    // eslint-disable-next-line global-require
+    source = require('../userscript/build').bundle();
+  }
+  return source
+    .replaceAll('__PATCHWORK_TOKEN__', config.token)
+    .replaceAll('__PATCHWORK_ORIGIN__', agentOrigin(config))
+    .replaceAll('__PATCHWORK_PORT__', String(config.port));
+}
+
+async function readRuntime(config) {
+  let source;
+  try {
+    source = await fs.readFile(RUNTIME_PATH, 'utf8');
+  } catch {
+    // Keep bookmarklet and loader startup functional before the first explicit build.
     // eslint-disable-next-line global-require
     source = require('../userscript/build').bundle();
   }
@@ -230,7 +246,7 @@ function installPage(config) {
     <li>Reload <code>chatgpt.com</code>.</li>
   </ol>
   <a class="button" href="/patchwork.user.js">Install patchwork.user.js</a>
-  <small>Your agent token is baked into the script, so nothing has to be typed.</small>
+  <small>Your agent token is baked into a small loader. It retrieves the current compiled runtime from this agent whenever ChatGPT loads.</small>
 </section>
 
 <section>
@@ -338,7 +354,7 @@ function bridgePage(config) {
   });
 
   if (params.get('boot') === '1' && window.opener) {
-    fetch(AGENT + '/patchwork.user.js?token=' + encodeURIComponent(token))
+    fetch(AGENT + '/patchwork.runtime.js?token=' + encodeURIComponent(token))
       .then((response) => response.text())
       .then((source) => {
         for (const target of ALLOWED) {
@@ -388,14 +404,22 @@ function register(router, context) {
     sendBuffer(response, 200, Buffer.from(source, 'utf8'), 'text/javascript; charset=utf-8');
     return null;
   }, { public: true });
+
+  router.get('/patchwork.runtime.js', async ({ response }) => {
+    const source = await readRuntime(config);
+    sendBuffer(response, 200, Buffer.from(source, 'utf8'), 'text/javascript; charset=utf-8');
+    return null;
+  }, { public: true });
 }
 
 module.exports = {
+  RUNTIME_PATH,
   USERSCRIPT_PATH,
   agentOrigin,
   bookmarkletSource,
   bridgePage,
   installPage,
   readUserscript,
+  readRuntime,
   register,
 };

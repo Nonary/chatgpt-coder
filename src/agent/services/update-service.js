@@ -124,8 +124,9 @@ class UpdateService {
     const restartPending = Boolean(this.runningRevision && revision !== this.runningRevision);
     const diverged = ahead > 0 && behind > 0;
     const updateAvailable = behind > 0 || restartPending;
+    const fastForwardBlocked = behind > 0 && (dirty || diverged || ahead > 0);
     let reason = null;
-    if (dirty && updateAvailable) reason = 'The Patchwork checkout has local changes. Commit or stash them before updating.';
+    if (dirty && behind > 0) reason = 'The Patchwork checkout has local changes. Commit or stash them before pulling an update.';
     else if (diverged) reason = `${branch} and ${upstream} have diverged, so Patchwork cannot fast-forward safely.`;
     else if (this.updating && updateAvailable) reason = 'Another Patchwork tab is already updating.';
 
@@ -144,21 +145,22 @@ class UpdateService {
       diverged,
       restartPending,
       updateAvailable,
-      canUpdate: updateAvailable && !dirty && !diverged && ahead === 0 && !this.updating,
+      canUpdate: updateAvailable && !fastForwardBlocked && !this.updating,
+      canRebuild: behind === 0 && !this.updating,
       reason,
       lastError: this.lastError,
     };
   }
 
-  async applyUpdate() {
+  async applyUpdate({ rebuild = false } = {}) {
     if (this.updating) throw new Error('Patchwork is already updating.');
     this.updating = true;
     this.lastError = null;
     try {
       const before = await this.status({ fetch: true });
       if (!before.supported) throw new Error(before.reason);
-      if (!before.updateAvailable) throw new Error('Patchwork is already up to date.');
-      if (before.dirty || before.diverged || before.ahead > 0) {
+      if (!before.updateAvailable && !rebuild) throw new Error('Patchwork is already up to date.');
+      if (before.behind > 0 && (before.dirty || before.diverged || before.ahead > 0)) {
         throw new Error(before.reason || 'Patchwork cannot update this checkout safely.');
       }
 
@@ -186,6 +188,7 @@ class UpdateService {
         previousRevision: this.runningRevision,
         upstream: before.upstream,
         dependenciesChanged,
+        rebuilt: true,
         restarting: true,
       };
     } catch (error) {

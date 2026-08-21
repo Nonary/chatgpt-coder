@@ -98,6 +98,44 @@ test('the updater refuses to replace a checkout with local changes', async (cont
   assert.equal(await fs.readFile(path.join(local, 'local-note.txt'), 'utf8'), 'do not overwrite\n');
 });
 
+test('a pending restart can rebuild dirty local source when no pull is needed', async (context) => {
+  const { local } = await createUpdateRepositories(context);
+  const commands = [];
+  const updater = new UpdateService({
+    projectRoot: local,
+    runPackageManager: async (_root, args) => { commands.push(args); },
+  });
+  await updater.initialize();
+  await fs.writeFile(path.join(local, 'app.txt'), 'second\n');
+  await runGit(local, ['add', 'app.txt']);
+  await runGit(local, ['commit', '-m', 'New local revision']);
+  await fs.writeFile(path.join(local, 'local-note.txt'), 'keep this change\n');
+
+  const status = await updater.status();
+  assert.equal(status.behind, 0);
+  assert.equal(status.restartPending, true);
+  assert.equal(status.dirty, true);
+  assert.equal(status.canUpdate, true, 'no Git mutation is needed, so dirty source can be rebuilt');
+  const result = await updater.applyUpdate({ rebuild: true });
+  assert.equal(result.rebuilt, true);
+  assert.deepEqual(commands, [['build']]);
+  assert.equal(await fs.readFile(path.join(local, 'local-note.txt'), 'utf8'), 'keep this change\n');
+});
+
+test('an up-to-date checkout can be rebuilt and restarted manually', async (context) => {
+  const { local } = await createUpdateRepositories(context);
+  const commands = [];
+  const updater = new UpdateService({
+    projectRoot: local,
+    runPackageManager: async (_root, args) => { commands.push(args); },
+  });
+  await updater.initialize();
+  assert.equal((await updater.status()).updateAvailable, false);
+  const result = await updater.applyUpdate({ rebuild: true });
+  assert.equal(result.revision, updater.runningRevision);
+  assert.deepEqual(commands, [['build']]);
+});
+
 test('restart arguments preserve ordinary flags while pinning the live agent settings', () => {
   assert.deepEqual(buildRestartArguments([
     'D:/sources/chatgpt-coder/src/agent/cli.js',
@@ -127,10 +165,26 @@ test('the userscript API exposes update status, apply, and revision health calls
   });
   await api.health();
   await api.updateStatus();
-  await api.applyUpdate();
+  await api.applyUpdate({ rebuild: true });
   assert.deepEqual(calls.map(({ method, path, timeout }) => ({ method, path, timeout })), [
     { method: 'GET', path: '/health', timeout: 3_000 },
     { method: 'GET', path: '/v1/update', timeout: 60_000 },
     { method: 'POST', path: '/v1/update', timeout: 600_000 },
   ]);
+  assert.deepEqual(calls.at(-1).body, { rebuild: true });
+});
+
+test('the dock always exposes a manual update control and rebuild action', async () => {
+  const shellSource = await fs.readFile(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'shell.js'),
+    'utf8',
+  );
+  const appSource = await fs.readFile(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'),
+    'utf8',
+  );
+  assert.match(shellSource, /title: 'Check for Patchwork updates'/);
+  assert.match(shellSource, /class: 'icon-button update-button'/);
+  assert.match(appSource, /actionLabel: 'Rebuild and restart'/);
+  assert.match(appSource, /checkForUpdate\(\{ announce: true, manual: true \}\)/);
 });

@@ -149,6 +149,16 @@ button { cursor: pointer; }
 .icon-button:hover { color: var(--text); background: var(--surface-hover); }
 .icon-button:active { background: var(--surface-active); }
 .icon-button.active { color: var(--text); background: var(--surface-hover); }
+.update-button { position: relative; }
+.update-button.checking svg { animation: patchwork-spin .8s linear infinite; }
+.update-button.update-available { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.update-button.update-available::after {
+  content: ''; position: absolute; top: 4px; right: 4px; width: 6px; height: 6px;
+  border-radius: 999px; background: var(--accent);
+}
+.update-button.blocked { color: var(--warning); }
+.update-button.blocked::after { background: var(--warning); }
+@keyframes patchwork-spin { to { transform: rotate(360deg); } }
 
 /* ------------------------------------------------------------------ nav tabs */
 

@@ -444,12 +444,14 @@ test('repository search remembers unique paths and ranks names before path-only 
 test('the userscript bundles every module it requires and keeps its install placeholders', () => {
   const build = require('../src/userscript/build');
   const bundle = build.bundle();
-  assert.match(bundle, /^\/\/ ==UserScript==/);
-  assert.match(bundle, /@match\s+https:\/\/chatgpt\.com\/\*/);
-  assert.match(bundle, /@grant\s+GM_xmlhttpRequest/);
-  assert.match(bundle, /@connect\s+127\.0\.0\.1/);
-  assert.ok(bundle.includes('__PATCHWORK_TOKEN__'), 'the agent injects the token at download time');
-  assert.ok(bundle.includes('__PATCHWORK_ORIGIN__'), 'the agent injects its own origin at download time');
+  const loader = build.loader();
+  assert.match(loader, /^\/\/ ==UserScript==/);
+  assert.match(loader, /@match\s+https:\/\/chatgpt\.com\/\*/);
+  assert.match(loader, /@grant\s+GM_xmlhttpRequest/);
+  assert.match(loader, /@connect\s+127\.0\.0\.1/);
+  assert.match(loader, /patchwork\.runtime\.js/);
+  assert.ok(loader.includes('__PATCHWORK_TOKEN__'), 'the agent injects the token at download time');
+  assert.ok(loader.includes('__PATCHWORK_ORIGIN__'), 'the agent injects its own origin at download time');
 
   const modules = build.collect(build.ENTRY);
   const ids = [...modules.keys()];
@@ -468,6 +470,11 @@ test('the built userscript on disk is current', () => {
   // Compared by digest so a stale bundle reports one line instead of 160 KB.
   assert.equal(
     digest(fs.readFileSync(build.OUTPUT, 'utf8')),
+    digest(build.loader()),
+    'run `pnpm build:userscript` after changing userscript sources',
+  );
+  assert.equal(
+    digest(fs.readFileSync(build.RUNTIME_OUTPUT, 'utf8')),
     digest(build.bundle()),
     'run `pnpm build:userscript` after changing userscript sources',
   );

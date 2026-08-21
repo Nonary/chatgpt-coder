@@ -24,11 +24,11 @@ function registerSystem(router, context) {
 
   router.get('/v1/update', async () => context.updateService.status({ fetch: true }));
 
-  router.post('/v1/update', async () => {
+  router.post('/v1/update', async ({ body }) => {
     if (typeof context.requestRestart !== 'function') {
       throw new Error('This Patchwork process cannot restart itself. Start it with patchwork-agent and try again.');
     }
-    const result = await context.updateService.applyUpdate();
+    const result = await context.updateService.applyUpdate({ rebuild: body.rebuild === true });
     setTimeout(() => context.requestRestart(), 150).unref?.();
     return result;
   });
