@@ -52,7 +52,7 @@ class Store {
         projectSelection: readPreference('task-project', ''),
         newProjectName: '',
         includeIac: readPreference('task-iac', 'false') === 'true',
-        answerOnly: readPreference('task-answer-only', 'false') === 'true',
+        answerOnly: true,
         taskText: '',
       },
     };

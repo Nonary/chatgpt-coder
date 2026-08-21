@@ -125,6 +125,16 @@ function messageAttachments(message) {
   return files;
 }
 
+function conversationHasAttachment(conversationRecord, filename) {
+  const expected = String(filename || '').trim().toLowerCase();
+  if (!expected) return false;
+  return Object.values(conversationRecord?.mapping || {}).some((node) => {
+    const message = node?.message;
+    if (!message || message.author?.role !== 'user') return false;
+    return messageAttachments(message).some((file) => file.name.toLowerCase() === expected);
+  });
+}
+
 // Generated result files are read straight out of the conversation record instead
 // of scraped from rendered markup.
 function findGeneratedFile(conversationRecord, predicate) {
@@ -194,6 +204,7 @@ async function downloadFileText(fileOrId, conversationId = null) {
 module.exports = {
   conversation,
   conversationCompletionStatus,
+  conversationHasAttachment,
   createProject,
   downloadFileText,
   findGeneratedFile,

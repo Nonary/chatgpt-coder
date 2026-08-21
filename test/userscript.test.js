@@ -205,6 +205,20 @@ test('attachment verification accepts ChatGPT file assets as well as the origina
   assert.equal(conversationRequestIncludesAttachment('not json', filename), false);
 });
 
+test('manual task recovery recognizes the task package in a user message', () => {
+  const { conversationHasAttachment } = require('../src/userscript/src/chatgpt/api');
+  const filename = 'chatgpt-ide-task-3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22.zip';
+  const record = {
+    mapping: {
+      user: { message: { author: { role: 'user' }, metadata: { attachments: [{ id: 'file-task', name: filename }] } } },
+      assistant: { message: { author: { role: 'assistant' }, metadata: { attachments: [{ id: 'file-result', name: filename }] } } },
+    },
+  };
+
+  assert.equal(conversationHasAttachment(record, filename), true);
+  assert.equal(conversationHasAttachment(record, 'different-task.zip'), false);
+});
+
 test('generated result files are found in the conversation record, newest first', () => {
   const { findGeneratedFile } = require('../src/userscript/src/chatgpt/api');
   const record = {

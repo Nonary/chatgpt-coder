@@ -113,12 +113,8 @@ class Driver {
       const zipBytes = await this.api.taskPackage(task.taskId);
       await composer.attachFile(toFile(zipBytes, zipName, 'application/zip'));
       await composer.waitForAttachment(zipName);
-
-      for (const attachment of task.attachments || []) {
-        const bytes = await this.api.taskAttachment(task.taskId, attachment.name);
-        await composer.attachFile(toFile(bytes, attachment.name));
-        await composer.waitForAttachment(attachment.name);
-      }
+      // Supporting files are already bundled under attachments/. Uploading them a
+      // second time can make ChatGPT reject types such as .patch and stall Send.
 
       this.report({ type: 'automation-progress', taskId: task.taskId, message: 'Sending the task…' });
       await composer.clickSend({
@@ -209,11 +205,13 @@ class Driver {
       || conversationIdFromRouteUrl(location.href);
   }
 
-  async reconcileTask(task, { knownStatus = null } = {}) {
+  async reconcileTask(task, { knownStatus = null, record = undefined } = {}) {
     const conversationId = this.conversationIdFor(task);
     if (!conversationId) return;
-    const record = await chatgpt.conversation(conversationId).catch(() => null);
-    const status = chatgpt.conversationCompletionStatus(record) || knownStatus;
+    const conversationRecord = record === undefined
+      ? await chatgpt.conversation(conversationId).catch(() => null)
+      : record;
+    const status = chatgpt.conversationCompletionStatus(conversationRecord) || knownStatus;
     let statusTask = null;
     if (status) {
       const result = await this.api.taskChatStatus(task.taskId, { status, conversationId }).catch(() => null);
@@ -224,10 +222,42 @@ class Driver {
       this.activeTaskId = null;
       return statusTask || task;
     }
-    return this.ingestTaskResult(statusTask || task, conversationId, record).catch((error) => {
+    return this.ingestTaskResult(statusTask || task, conversationId, conversationRecord).catch((error) => {
       this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
       return null;
     });
+  }
+
+  async refreshTask(task) {
+    const conversationId = this.conversationIdFor(task);
+    if (!conversationId) {
+      throw new Error('Open the manually submitted ChatGPT conversation, then refresh this task.');
+    }
+    const record = await chatgpt.conversation(conversationId);
+    let tracked = task;
+    if (task.state !== 'submitted') {
+      const expectedPackage = packageFilename(task);
+      if (!chatgpt.conversationHasAttachment(record, expectedPackage)) {
+        throw new Error(`The open conversation does not contain this task package (${expectedPackage}).`);
+      }
+      const currentConversationId = conversationIdFromRouteUrl(location.href);
+      const conversationUrl = currentConversationId === conversationId
+        ? location.href
+        : task.conversationUrl || `${CHATGPT_ORIGIN}/c/${conversationId}`;
+      const { task: submitted } = await this.api.taskSubmitted(task.taskId, {
+        conversationUrl,
+        conversationId,
+        conversationTitle: normalizeConversationTitle(document.title),
+        model: task.model,
+        reasoningMode: task.reasoningMode,
+      });
+      tracked = submitted;
+    }
+
+    const updated = await this.reconcileTask(tracked, { record });
+    const latest = updated || (await this.api.task(tracked.taskId)).task;
+    if (latest.state === 'submitted') this.watchTask(latest);
+    return latest;
   }
 
   async ingestTaskResult(task, conversationId, record = undefined) {

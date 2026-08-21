@@ -151,7 +151,6 @@ function renderComposer(ctx) {
     checked: composer.answerOnly,
     onchange: () => {
       ctx.store.setComposer({ answerOnly: answerOnlyCheckbox.checked }, 'silent');
-      ctx.persist('task-answer-only', String(answerOnlyCheckbox.checked));
     },
   });
 

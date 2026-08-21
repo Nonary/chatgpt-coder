@@ -199,13 +199,13 @@ function attachmentStatus(filename, dismissDuplicateNotice = false) {
 async function waitForAttachment(filename, timeoutMilliseconds = 60_000) {
   const startedAt = Date.now();
   let readyChecks = 0;
-  let lastRedispatchAt = startedAt;
+  let redispatched = false;
   while (Date.now() - startedAt < timeoutMilliseconds) {
     const status = attachmentStatus(filename, true);
     readyChecks = status.attached && !status.busy ? readyChecks + 1 : 0;
     if (readyChecks >= 2) return true;
-    if (!status.attached && status.selectedByInput && Date.now() - lastRedispatchAt >= 1_000) {
-      lastRedispatchAt = Date.now();
+    if (!status.attached && status.selectedByInput && !redispatched && Date.now() - startedAt >= 1_000) {
+      redispatched = true;
       redispatchSelection(filename);
     }
     await delay(500);

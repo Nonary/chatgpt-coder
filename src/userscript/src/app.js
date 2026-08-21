@@ -323,6 +323,7 @@ class App {
     const app = this;
     return {
       showComposer() {
+        app.store.setComposer({ answerOnly: true }, 'silent');
         app.store.set({ activeTaskId: null }, 'tasks');
         app.shell.show('tasks');
       },
@@ -504,6 +505,21 @@ class App {
           app.renderActiveView();
           return submitted;
         }, { failure: 'The send failed.' });
+      },
+
+      async refreshTask(taskId) {
+        const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
+        return app.run(async () => {
+          const refreshed = await app.driver.refreshTask(task);
+          app.store.upsertTask(refreshed);
+          app.renderActiveView();
+          return refreshed;
+        }, {
+          success: (refreshed) => (['ready', 'completed'].includes(refreshed.state)
+            ? 'Task completion detected.'
+            : 'Task status refreshed.'),
+          failure: 'The task could not be refreshed.',
+        });
       },
 
       async openConversation(taskId) {
@@ -743,7 +759,7 @@ class App {
       /* ---------------------------------------------------------- coding trees */
 
       startTreeTask(treeId = NEW_TREE_VALUE) {
-        app.store.setComposer({ treeSelection: treeId });
+        app.store.setComposer({ answerOnly: true, treeSelection: treeId });
         app.persist('task-tree', treeId);
         app.store.set({ activeTaskId: null }, 'tasks');
         app.shell.show('tasks');

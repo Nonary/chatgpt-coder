@@ -168,6 +168,9 @@ function renderTaskDetail(ctx, task) {
     !task.summaryOnly && ['prepared', 'failed'].includes(task.state)
       ? h('button', { class: 'primary', onclick: () => ctx.actions.submitTask(task.taskId) }, 'Send')
       : null,
+    ['prepared', 'submitted', 'failed'].includes(task.state)
+      ? h('button', { class: 'secondary', onclick: () => ctx.actions.refreshTask(task.taskId) }, 'Refresh status')
+      : null,
     task.conversationUrl
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.openConversation(task.taskId) }, 'Open conversation')
       : null,
