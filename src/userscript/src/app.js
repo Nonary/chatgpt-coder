@@ -567,6 +567,10 @@ class App {
           const { task } = await app.api.applyTask(taskId);
           app.store.upsertTask(task);
           app.renderActiveView();
+          if (task.state !== 'applied') {
+            throw new Error(task.error || 'The result could not be applied to the selected target.');
+          }
+          return task;
         }, { success: 'Result applied.' });
       },
 
@@ -646,24 +650,6 @@ class App {
           if (app.taskTargetUpdates.get(taskId) === update) app.taskTargetUpdates.delete(taskId);
         }).catch(() => {});
         return update;
-      },
-
-      createTaskTargetAndApply(taskId, treeName) {
-        if (!treeName) {
-          app.toast('Enter a name for the new coding tree.', true);
-          return null;
-        }
-        return app.run(async () => {
-          const pendingTarget = app.taskTargetUpdates.get(taskId);
-          if (pendingTarget) await pendingTarget;
-          const { task: targeted } = await app.api.setTaskTarget(taskId, { createTree: true, treeName });
-          app.store.upsertTask(targeted);
-          const { task } = await app.api.applyTask(taskId);
-          app.store.upsertTask(task);
-          await app.refreshTrees();
-          app.renderActiveView();
-          return task;
-        }, { success: 'Coding tree created and result applied.' });
       },
 
       /* -------------------------------------------------------- source control */

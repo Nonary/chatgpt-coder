@@ -316,6 +316,58 @@ test('creating an apply target sends the ready result to that new tree', async (
   );
 });
 
+test('a ready result applies to an existing coding tree when that target is selected', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-existing-apply-tree-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+  const tree = await agent.context.worktreeService.create(repositoryPath, 'Existing apply target');
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Add a file in an existing coding tree.',
+    repositories: [{ path: repositoryPath }],
+  });
+  const task = created.payload.task;
+  const patch = [
+    'diff --git a/existing-tree.txt b/existing-tree.txt',
+    'new file mode 100644',
+    'index 0000000..aead3b7',
+    '--- /dev/null',
+    '+++ b/existing-tree.txt',
+    '@@ -0,0 +1 @@',
+    '+existing tree',
+    '',
+  ].join('\n');
+  const envelope = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Added existing-tree.txt.',
+    commitMessage: 'feat(tree): apply to existing tree',
+    repositories: [{
+      id: task.repositories[0].id,
+      baseCommit: task.repositories[0].baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patch).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+
+  const ready = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(ready.payload.task.state, 'ready');
+  const targeted = await agent.call('POST', `/v1/tasks/${task.taskId}/target`, { treeId: tree.id });
+  assert.equal(targeted.status, 200);
+  assert.equal(targeted.payload.task.treeId, tree.id);
+
+  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/apply`);
+  assert.equal(applied.payload.task.state, 'applied');
+  assert.equal(await fs.readFile(path.join(tree.path, 'existing-tree.txt'), 'utf8'), 'existing tree\n');
+  assert.equal(await fs.access(path.join(repositoryPath, 'existing-tree.txt')).then(() => true, () => false), false);
+  assert.equal(
+    (await runGit(tree.path, ['log', '-1', '--pretty=%s'])).stdout.trim(),
+    'feat(tree): apply to existing tree',
+  );
+});
+
 test('answer-only tasks complete with the ChatGPT response and reject result uploads', async (context) => {
   const agent = await startAgent(context);
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-answer-only-'));

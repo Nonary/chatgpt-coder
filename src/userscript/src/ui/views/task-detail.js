@@ -15,6 +15,11 @@ function canChangeTaskTarget(task) {
     && (task.repositories || []).filter((repository) => !repository.readOnly).length === 1;
 }
 
+function applyActionLabel(task) {
+  if (task.treeId) return `Apply to coding tree: ${task.treeName || 'selected tree'}`;
+  return 'Apply to original repository';
+}
+
 function renderTargetCard(ctx, task) {
   if (!canChangeTaskTarget(task)) return null;
   const { trees } = ctx.store.state;
@@ -30,22 +35,17 @@ function renderTargetCard(ctx, task) {
   const treeNameInput = h('input', {
     type: 'text', class: 'field-control', maxlength: 80, placeholder: 'For example: Fix task target',
   });
-  const applyButton = task.state === 'ready'
-    ? h('button', {
-      class: 'primary',
-      onclick: () => ctx.actions.applyTask(task.taskId),
-    }, 'Apply')
-    : null;
   const createRow = h(
     'div',
     { class: 'row', hidden: true },
     treeNameInput,
     h('button', {
       class: 'secondary',
-      onclick: () => (task.state === 'ready'
-        ? ctx.actions.createTaskTargetAndApply(task.taskId, treeNameInput.value.trim())
-        : ctx.actions.setTaskTarget(task.taskId, { createTree: true, treeName: treeNameInput.value.trim() })),
-    }, task.state === 'ready' ? 'Create and apply' : 'Create and use'),
+      onclick: () => ctx.actions.setTaskTarget(task.taskId, {
+        createTree: true,
+        treeName: treeNameInput.value.trim(),
+      }),
+    }, 'Create coding tree'),
   );
 
   const select = h(
@@ -55,11 +55,9 @@ function renderTargetCard(ctx, task) {
       onchange: () => {
         if (select.value === NEW_TREE_VALUE) {
           createRow.hidden = false;
-          if (applyButton) applyButton.hidden = true;
           return;
         }
         createRow.hidden = true;
-        if (applyButton) applyButton.hidden = false;
         ctx.actions.setTaskTarget(task.taskId, { treeId: select.value || null });
       },
     },
@@ -90,7 +88,6 @@ function renderTargetCard(ctx, task) {
     h('h3', {}, 'Apply target'),
     select,
     createRow,
-    applyButton,
     h('p', { class: 'field-help' }, status),
   );
 }
@@ -124,8 +121,8 @@ function renderResultCard(ctx, task) {
     task.summaryOnly && task.state === 'ready'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.useGitSummary(task.taskId) }, 'Use in Source Control')
       : null,
-    !task.summaryOnly && task.state === 'ready' && !canChangeTaskTarget(task)
-      ? h('button', { class: 'primary', onclick: () => ctx.actions.applyTask(task.taskId) }, 'Apply')
+    !task.summaryOnly && !task.answerOnly && task.state === 'ready'
+      ? h('button', { class: 'primary', onclick: () => ctx.actions.applyTask(task.taskId) }, applyActionLabel(task))
       : null,
     task.state === 'conflicted'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.retryApply(task.taskId) }, 'Retry apply')
@@ -208,4 +205,4 @@ function renderTaskDetail(ctx, task) {
   ];
 }
 
-module.exports = { canChangeTaskTarget, renderTaskDetail };
+module.exports = { applyActionLabel, canChangeTaskTarget, renderTaskDetail };

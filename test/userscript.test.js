@@ -414,6 +414,16 @@ test('task labels and states match the states the agent can report', () => {
   assert.equal(taskStatusText({ answerOnly: true, state: 'completed' })[0], 'Answer complete');
 });
 
+test('ready task results name the repository or coding tree they will apply to', () => {
+  const { applyActionLabel } = require('../src/userscript/src/ui/views/task-detail');
+
+  assert.equal(applyActionLabel({ treeId: null }), 'Apply to original repository');
+  assert.equal(
+    applyActionLabel({ treeId: 'tree-123', treeName: 'Parser repair' }),
+    'Apply to coding tree: Parser repair',
+  );
+});
+
 test('repository search remembers unique paths and ranks names before path-only matches', () => {
   const {
     mergeRepositoryCatalog,
