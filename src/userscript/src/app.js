@@ -740,6 +740,22 @@ class App {
         }, { success: 'Commit message added to Source Control.' });
       },
 
+      useTaskCommitMessage(taskId) {
+        return app.run(async () => {
+          const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
+          const repositoryPath = app.store.state.sourceRepositoryPath;
+          const appliesToRepository = (task?.repositories || []).some((repository) => (
+            !repository.readOnly && repository.path === repositoryPath
+          ));
+          if (task?.state !== 'applied' || !task?.result?.commitMessage || !appliesToRepository) {
+            throw new Error('This task does not contain a commit message for the selected Source Control repository.');
+          }
+          app.store.set({ sourceCommitMessage: task.result.commitMessage }, 'source');
+          app.shell.show('source');
+          app.renderActiveView();
+        }, { success: 'Commit message added to Source Control.' });
+      },
+
       setTaskTarget(taskId, input) {
         if (input.createTree && !input.treeName) {
           app.toast('Enter a name for the new coding tree.', true);

@@ -557,6 +557,47 @@ test('task labels and states match the states the agent can report', () => {
   );
 });
 
+test('an applied task result becomes the newest Source Control AI suggestion for its target repository', () => {
+  const { latestSourceSuggestionTask } = require('../src/userscript/src/ui/views/source');
+  const summaryTask = {
+    taskId: 'summary-1',
+    summaryOnly: true,
+    sourceRepositoryPath: '/repo/a',
+    createdAt: '2026-08-21T18:00:00.000Z',
+    state: 'ready',
+    repositories: [{ path: '/repo/a', name: 'alpha', readOnly: true }],
+    result: { commitMessage: 'chore(alpha): summarize existing changes' },
+  };
+  const pendingTask = {
+    taskId: 'task-pending',
+    summaryOnly: false,
+    createdAt: '2026-08-21T18:01:00.000Z',
+    state: 'ready',
+    repositories: [{ path: '/repo/a', name: 'alpha', readOnly: false }],
+    result: { commitMessage: 'fix(alpha): not applied yet' },
+  };
+  const appliedTask = {
+    ...pendingTask,
+    taskId: 'task-applied',
+    state: 'applied',
+    appliedAt: '2026-08-21T18:02:00.000Z',
+    result: { commitMessage: 'fix(alpha): apply the generated changes' },
+  };
+  const treeTask = {
+    ...appliedTask,
+    taskId: 'task-tree',
+    repositories: [{ path: '/tree/a', name: 'alpha tree', readOnly: false }],
+    sourceRepositoryPath: '/repo/a',
+    appliedAt: '2026-08-21T18:03:00.000Z',
+  };
+
+  assert.equal(latestSourceSuggestionTask([summaryTask, pendingTask], '/repo/a')?.taskId, 'summary-1');
+  assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask], '/repo/a')?.taskId, 'task-applied');
+  assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask, treeTask], '/repo/a')?.taskId, 'task-applied');
+  assert.equal(latestSourceSuggestionTask([summaryTask, treeTask], '/tree/a')?.taskId, 'task-tree');
+  assert.equal(latestSourceSuggestionTask([summaryTask], '/repo/missing'), null);
+});
+
 test('Git Summary source-control state stays tied to its originating repository and snapshot', () => {
   const {
     gitSummaryIsStale, gitSummaryPhase, latestGitSummaryTask,
