@@ -11,7 +11,7 @@ const { openPromptManager } = require('./ui/dialogs/prompts');
 const { openRepositoryPicker } = require('./ui/dialogs/repository-picker');
 const { openSkillDrawer } = require('./ui/dialogs/skills');
 const { renderComposer, NEW_PROJECT_VALUE, NEW_TREE_VALUE } = require('./ui/views/composer');
-const { renderDiffOverlay, renderSource } = require('./ui/views/source');
+const { latestGitSummaryTask, renderDiffOverlay, renderSource } = require('./ui/views/source');
 const { renderHistory } = require('./ui/views/history');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
@@ -212,7 +212,14 @@ class App {
       });
     }
     if (event.type === 'git-summary-ready' && event.commitMessage) {
-      this.store.set({ sourceCommitMessage: event.commitMessage, gitSummaryTaskId: event.task?.taskId || null });
+      const repositoryPath = event.repositoryPath || event.task?.sourceRepositoryPath || event.task?.repositories?.[0]?.path;
+      if (repositoryPath === this.store.state.sourceRepositoryPath) {
+        this.refreshSource()
+          .then(() => {
+            if (this.shell.activeView === 'source') this.renderActiveView();
+          })
+          .catch(() => {});
+      }
     }
     if (['merge-completed', 'merge-failed', 'merge-submitted', 'tree-created', 'tree-removed'].includes(event.type)) {
       this.refreshTrees().catch(() => {});
@@ -308,7 +315,8 @@ class App {
       return null;
     }
     try {
-      const status = await this.api.gitStatus(path);
+      const summaryTask = latestGitSummaryTask(this.store.state.tasks, path);
+      const status = await this.api.gitStatus(path, { fingerprint: Boolean(summaryTask) });
       this.store.set({ sourceStatus: status }, 'source');
       return status;
     } catch (error) {
@@ -781,11 +789,20 @@ class App {
 
       useGitSummary(taskId) {
         return app.run(async () => {
+          const existing = app.store.task(taskId) || (await app.api.task(taskId)).task;
+          const repositoryPath = existing?.sourceRepositoryPath || existing?.repositories?.[0]?.path;
+          if (!existing?.summaryOnly || !repositoryPath) throw new Error('This Git Summary is not associated with a repository.');
+          if (app.store.state.sourceRepositoryPath !== repositoryPath) {
+            app.store.set({ sourceRepositoryPath: repositoryPath, sourceStatus: null }, 'source');
+            app.persist('source-repository', repositoryPath);
+          }
           const { task } = await app.api.useGitSummary(taskId);
           app.store.upsertTask(task);
-          app.store.set({ sourceCommitMessage: task.result.commitMessage });
+          app.store.set({ sourceCommitMessage: task.result.commitMessage }, 'source');
+          await app.refreshSource();
           app.shell.show('source');
-        }, { success: 'Commit message moved to Source control.' });
+          app.renderActiveView();
+        }, { success: 'Commit message added to Source Control.' });
       },
 
       setTaskTarget(taskId, input) {
@@ -857,7 +874,9 @@ class App {
       mutateSource(operation) {
         return app.run(async () => {
           const status = await operation();
-          app.store.set({ sourceStatus: status }, 'source');
+          const summaryTask = latestGitSummaryTask(app.store.state.tasks, app.store.state.sourceRepositoryPath);
+          if (summaryTask) await app.refreshSource();
+          else app.store.set({ sourceStatus: status }, 'source');
           app.renderActiveView();
         });
       },
@@ -869,7 +888,9 @@ class App {
         }
         return app.run(async () => {
           const status = await app.api.gitCommit(app.store.state.sourceRepositoryPath, message);
+          const summaryTask = latestGitSummaryTask(app.store.state.tasks, app.store.state.sourceRepositoryPath);
           app.store.set({ sourceStatus: status, sourceCommitMessage: '' });
+          if (summaryTask) await app.refreshSource();
           app.renderActiveView();
         }, { success: 'Commit created.' });
       },
@@ -880,6 +901,7 @@ class App {
           app.store.upsertTask(task);
           const submitted = await app.driver.submitTask(task);
           app.store.upsertTask(submitted);
+          await app.refreshSource();
           app.renderActiveView();
         }, { failure: 'The Git summary could not be generated.' });
       },

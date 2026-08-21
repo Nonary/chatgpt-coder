@@ -70,7 +70,7 @@ function taskStateLabel(task) {
   }
   if (latestTaskTurn(task)?.state === 'failed') return 'Needs attention';
   if (task.summaryOnly) {
-    if (task.state === 'completed') return 'Summary applied';
+    if (task.state === 'completed') return 'Summary used';
     if (task.state === 'ready') return 'Summary ready';
     if (task.state === 'submitted' && task.chatStatus === 'completed') return 'Response complete';
     if (task.state === 'submitted' && task.chatStatus === 'failed') return 'Generation stopped';
@@ -119,7 +119,7 @@ function taskStatusText(task) {
   }
   if (task.summaryOnly) {
     if (task.state === 'completed') {
-      return ['Git Summary applied', 'The generated Conventional Commit message was moved to the Source Control commit editor.'];
+      return ['Git Summary used', 'The generated Conventional Commit message was moved to the Source Control commit editor.'];
     }
     if (task.state === 'ready') {
       return ['Git Summary ready', 'Review the message below, then use it in Source Control to complete this task.'];
@@ -128,7 +128,7 @@ function taskStatusText(task) {
       return ['Response complete', 'The summary is finished. The result file is downloading.'];
     }
     if (task.state === 'submitted' && task.chatStatus === 'failed') {
-      return ['Git Summary stopped', 'Generation failed for this summary.'];
+      return ['Git Summary stopped', 'Generation stopped before a commit message was produced.'];
     }
     if (task.state === 'submitted') {
       return ['Generating Git Summary', 'Monitoring the conversation and result file.'];

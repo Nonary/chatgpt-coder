@@ -1568,6 +1568,13 @@ test('source control stages, diffs, commits, and records history', async (contex
   await git.addRepositories([repositoryPath]);
   let status = await git.status(repositoryPath);
   assert.equal(status.unstagedCount, 2);
+  const initialFingerprint = (await git.status(repositoryPath, { includeFingerprint: true })).changeFingerprint;
+  assert.match(initialFingerprint, /^[0-9a-f]{64}$/);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'changed greeting again\n');
+  const changedFingerprint = (await git.status(repositoryPath, { includeFingerprint: true })).changeFingerprint;
+  assert.notEqual(changedFingerprint, initialFingerprint);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'changed greeting\n');
+  assert.equal((await git.status(repositoryPath)).changeFingerprint, undefined);
   assert.equal(status.stagedCount, 0);
   let diff = await git.diff(repositoryPath, 'hello.txt', false);
   assert.match(diff.content, /changed greeting/);

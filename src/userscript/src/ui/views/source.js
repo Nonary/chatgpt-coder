@@ -10,6 +10,45 @@ function statusClass(change) {
   return 'modified';
 }
 
+function taskRepositoryPath(task) {
+  return task?.sourceRepositoryPath || task?.repositories?.[0]?.path || '';
+}
+
+function latestGitSummaryTask(tasks, repositoryPath) {
+  if (!repositoryPath) return null;
+  return (Array.isArray(tasks) ? tasks : [])
+    .filter((task) => task?.summaryOnly && taskRepositoryPath(task) === repositoryPath)
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.createdAt || '') || 0;
+      const rightTime = Date.parse(right.createdAt || '') || 0;
+      return rightTime - leftTime;
+    })[0] || null;
+}
+
+function gitSummaryPhase(task) {
+  if (!task) return null;
+  if (task.state === 'failed' || (task.state === 'submitted' && task.chatStatus === 'failed')) return 'failed';
+  if (task.state === 'completed') return 'completed';
+  if (task.state === 'ready') return 'ready';
+  if (task.state === 'submitted' && task.chatStatus === 'completed') return 'finalizing';
+  if (task.state === 'submitted') return 'running';
+  if (task.state === 'prepared') return 'preparing';
+  return task.state || 'preparing';
+}
+
+function gitSummaryIsStale(task, status) {
+  if (!task || !status) return false;
+  const originPath = taskRepositoryPath(task);
+  const repository = (task.repositories || []).find((entry) => entry.path === originPath)
+    || task.repositories?.[0];
+  if (!repository) return false;
+  if (Object.prototype.hasOwnProperty.call(repository, 'sourceHead')
+    && repository.sourceHead !== status.repository?.baseCommit) return true;
+  return Boolean(repository.snapshotFingerprint
+    && status.changeFingerprint
+    && repository.snapshotFingerprint !== status.changeFingerprint);
+}
+
 function fileRow(ctx, change, staged) {
   return h(
     'div',
@@ -50,9 +89,109 @@ function group(ctx, title, changes, staged, allAction) {
   );
 }
 
+function renderGitSummaryCard(ctx, task) {
+  const phase = gitSummaryPhase(task);
+  const message = task.result?.commitMessage || '';
+  const stale = ['ready', 'completed'].includes(phase) && gitSummaryIsStale(task, ctx.store.state.sourceStatus);
+  const repository = (task.repositories || []).find((entry) => entry.path === taskRepositoryPath(task))
+    || task.repositories?.[0];
+  const statusLabels = {
+    preparing: 'Preparing',
+    running: 'Generating',
+    finalizing: 'Finishing',
+    ready: 'Ready',
+    completed: 'Used',
+    failed: 'Generation stopped',
+  };
+  const statusClasses = {
+    preparing: 'prepared',
+    running: 'submitted',
+    finalizing: 'submitted',
+    ready: 'ready',
+    completed: 'completed',
+    failed: 'failed',
+  };
+
+  const actions = h(
+    'div',
+    { class: 'row wrap' },
+    phase === 'failed'
+      ? h('button', { class: 'primary', onclick: () => ctx.actions.generateGitSummary() }, 'Regenerate')
+      : null,
+    message && ['ready', 'completed'].includes(phase)
+      ? h('button', {
+        class: 'primary',
+        onclick: () => ctx.actions.useGitSummary(task.taskId),
+      }, stale ? 'Use anyway' : 'Use suggestion')
+      : null,
+    phase !== 'failed' && ['ready', 'completed'].includes(phase)
+      ? h('button', { class: 'secondary', onclick: () => ctx.actions.generateGitSummary() }, 'Regenerate')
+      : null,
+  );
+
+  if (['preparing', 'running', 'finalizing'].includes(phase)) {
+    return h(
+      'div',
+      { class: 'card git-summary-card' },
+      h(
+        'div',
+        { class: 'row' },
+        h('span', { class: `status-badge ${statusClasses[phase]}` }, `✦ ${statusLabels[phase]}`),
+        h('div', { class: 'spacer' }),
+        h('button', { class: 'secondary', onclick: () => ctx.actions.showTask(task.taskId) }, 'View task'),
+      ),
+      h('h3', { style: { marginBottom: '4px' } }, 'Generating commit message'),
+      h('p', { class: 'field-help', style: { margin: '0' } }, 'Reviewing the current Git changes. You can keep working in Source Control while this runs.'),
+    );
+  }
+
+  if (phase === 'failed') {
+    return h(
+      'div',
+      { class: 'card git-summary-card' },
+      h(
+        'div',
+        { class: 'row' },
+        h('span', { class: 'status-badge failed' }, '✦ Generation stopped'),
+        h('div', { class: 'spacer' }),
+        h('button', { class: 'secondary', onclick: () => ctx.actions.showTask(task.taskId) }, 'View task'),
+      ),
+      h('h3', { style: { marginBottom: '4px' } }, 'Commit message not generated'),
+      h('p', { class: 'field-help', style: { margin: '0' } }, 'The Git Summary task stopped before a commit message was available. Your Source Control draft was left unchanged.'),
+      actions,
+    );
+  }
+
+  return h(
+    'div',
+    { class: `card git-summary-card ${stale ? 'stale' : ''}` },
+    h(
+      'div',
+      { class: 'row' },
+      h('span', { class: `status-badge ${statusClasses[phase] || 'ready'}` }, `✦ ${statusLabels[phase] || 'Ready'}`),
+      h('div', { class: 'spacer' }),
+      h('button', { class: 'secondary', onclick: () => ctx.actions.showTask(task.taskId) }, 'View task'),
+    ),
+    h('h3', { style: { marginBottom: '4px' } }, 'AI suggestion'),
+    repository
+      ? h('p', { class: 'field-help', style: { margin: '0' } }, `Based on ${repository.name || 'this repository'} changes captured at ${formatDateTime(task.createdAt)}${repository.branch ? ` · ${repository.branch}` : ''}.`)
+      : null,
+    message
+      ? h('pre', { class: 'git-summary-preview' }, message)
+      : h('p', { class: 'field-help', style: { margin: '8px 0 0' } }, 'The task is complete, but no commit message is available yet. Open the task for details.'),
+    stale
+      ? h('div', { class: 'git-summary-warning' }, 'Your working changes changed after this task started. This suggestion may be stale. Regenerate to analyze the latest changes.')
+      : null,
+    actions,
+  );
+}
+
 function renderSource(ctx) {
   const { state } = ctx.store;
   const status = state.sourceStatus;
+  const summaryTask = latestGitSummaryTask(state.tasks, state.sourceRepositoryPath);
+  const summaryPhase = gitSummaryPhase(summaryTask);
+  const summaryBusy = ['preparing', 'running', 'finalizing'].includes(summaryPhase);
 
   const repositorySelect = h(
     'select',
@@ -98,7 +237,10 @@ function renderSource(ctx) {
   );
 
   if (!status) {
-    return [header, h('div', { class: 'empty-state' }, 'Choose a repository to see its working changes.')];
+    return [
+      header,
+      summaryTask ? renderGitSummaryCard(ctx, summaryTask) : h('div', { class: 'empty-state' }, 'Choose a repository to see its working changes.'),
+    ];
   }
 
   const staged = status.changes.filter((change) => change.staged);
@@ -114,8 +256,9 @@ function renderSource(ctx) {
       { class: 'row' },
       h('button', {
         class: 'secondary',
+        disabled: summaryBusy || status.changes.length === 0,
         onclick: () => ctx.actions.generateGitSummary(),
-      }, '✦ AI summary'),
+      }, summaryBusy ? '✦ Generating…' : '✦ Generate commit message'),
       h('div', { class: 'spacer' }),
       h('button', {
         class: 'primary',
@@ -147,6 +290,7 @@ function renderSource(ctx) {
   return [
     header,
     commitCard,
+    summaryTask ? renderGitSummaryCard(ctx, summaryTask) : null,
     group(ctx, 'Staged changes', staged, true, () => ctx.actions.gitUnstageAll()),
     group(ctx, 'Changes', unstaged, false, () => ctx.actions.gitStageAll()),
     history,
@@ -192,4 +336,11 @@ function renderDiffOverlay(ctx, diff) {
   );
 }
 
-module.exports = { renderDiffOverlay, renderSource };
+module.exports = {
+  gitSummaryIsStale,
+  gitSummaryPhase,
+  latestGitSummaryTask,
+  renderDiffOverlay,
+  renderSource,
+  taskRepositoryPath,
+};

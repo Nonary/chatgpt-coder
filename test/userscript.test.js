@@ -453,7 +453,7 @@ test('task labels and states match the states the agent can report', () => {
   assert.equal(taskStateLabel({ summaryOnly: true, state: 'ready' }), 'Summary ready');
 
   assert.equal(taskStatusText({ state: 'conflicted' })[0], 'Conflict needs resolution');
-  assert.equal(taskStatusText({ summaryOnly: true, state: 'completed' })[0], 'Git Summary applied');
+  assert.equal(taskStatusText({ summaryOnly: true, state: 'completed' })[0], 'Git Summary used');
   assert.equal(taskStatusText({ answerOnly: true, state: 'submitted' })[0], 'Ask is running');
   assert.equal(taskStatusText({ answerOnly: true, state: 'completed' })[0], 'Ask complete');
   assert.equal(taskStatusText({ state: 'completed' })[0], 'Task complete');
@@ -470,6 +470,49 @@ test('task labels and states match the states the agent can report', () => {
     'GPT-5.6 Sol · High',
   );
 });
+
+test('Git Summary source-control state stays tied to its originating repository and snapshot', () => {
+  const {
+    gitSummaryIsStale, gitSummaryPhase, latestGitSummaryTask,
+  } = require('../src/userscript/src/ui/views/source');
+  const repositoryTask = {
+    taskId: 'summary-a',
+    summaryOnly: true,
+    sourceRepositoryPath: '/repo/a',
+    createdAt: '2026-08-21T18:00:00.000Z',
+    state: 'ready',
+    repositories: [{
+      path: '/repo/a',
+      name: 'alpha',
+      sourceHead: 'head-a',
+      snapshotFingerprint: 'snapshot-a',
+    }],
+    result: { commitMessage: 'fix(alpha): preserve state' },
+  };
+  const newerSameRepository = {
+    ...repositoryTask,
+    taskId: 'summary-a-new',
+    createdAt: '2026-08-21T18:02:00.000Z',
+  };
+  const newerOtherRepository = {
+    ...repositoryTask,
+    taskId: 'summary-b',
+    sourceRepositoryPath: '/repo/b',
+    createdAt: '2026-08-21T18:01:00.000Z',
+    repositories: [{ ...repositoryTask.repositories[0], path: '/repo/b', name: 'beta' }],
+  };
+  assert.equal(latestGitSummaryTask([repositoryTask, newerSameRepository, newerOtherRepository], '/repo/a')?.taskId, 'summary-a-new');
+  assert.equal(latestGitSummaryTask([repositoryTask, newerOtherRepository], '/repo/b')?.taskId, 'summary-b');
+  assert.equal(latestGitSummaryTask([repositoryTask], '/repo/missing'), null);
+  assert.equal(gitSummaryPhase({ summaryOnly: true, state: 'submitted' }), 'running');
+  assert.equal(gitSummaryPhase({ summaryOnly: true, state: 'submitted', chatStatus: 'failed' }), 'failed');
+  assert.equal(gitSummaryPhase({ summaryOnly: true, state: 'completed' }), 'completed');
+  assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-a' }, changeFingerprint: 'snapshot-a' }), false);
+  assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-a' }, changeFingerprint: 'snapshot-b' }), true);
+  assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-b' }, changeFingerprint: 'snapshot-a' }), true);
+  assert.equal(gitSummaryIsStale({ ...repositoryTask, repositories: [{ ...repositoryTask.repositories[0], sourceHead: null }] }, { repository: { baseCommit: 'head-b' }, changeFingerprint: 'snapshot-a' }), true);
+});
+
 
 test('composer mode maps Ask and Agent to the existing answer-only task contract', () => {
   const { createTaskInput } = require('../src/userscript/src/task-input');

@@ -76,7 +76,7 @@ class Api {
 
   removeRepository(path) { return this.post('/v1/workspace/repositories/remove', { path }); }
 
-  gitStatus(path) { return this.get(`/v1/workspace/status${query({ path })}`); }
+  gitStatus(path, { fingerprint = false } = {}) { return this.get(`/v1/workspace/status${query({ path, fingerprint: fingerprint ? 'true' : undefined })}`); }
 
   gitHistory(path, limit) { return this.get(`/v1/workspace/history${query({ path, limit })}`); }
 

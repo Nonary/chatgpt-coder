@@ -53,7 +53,9 @@ function register(router, context) {
   }));
 
   router.get('/v1/workspace/status', async ({ url }) => (
-    gitService.status(url.searchParams.get('path'))
+    gitService.status(url.searchParams.get('path'), {
+      includeFingerprint: url.searchParams.get('fingerprint') === 'true',
+    })
   ));
 
   router.get('/v1/workspace/history', async ({ url }) => ({

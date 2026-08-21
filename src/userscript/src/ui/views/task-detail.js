@@ -106,8 +106,35 @@ function renderTargetCard(ctx, task) {
   );
 }
 
+function renderSummaryResultCard(ctx, task) {
+  if (!task.result?.commitMessage) return null;
+  const repository = (task.repositories || []).find((entry) => entry.path === task.sourceRepositoryPath)
+    || task.repositories?.[0];
+  const canUse = ['ready', 'completed'].includes(task.state);
+  return h(
+    'div',
+    { class: 'card' },
+    h('h3', {}, 'Generated commit message'),
+    h('p', { class: 'muted', style: { margin: '0' } }, task.result.summary || 'A validated Conventional Commit message was generated from this Git change set.'),
+    repository
+      ? h('p', { class: 'field-help' }, `Repository: ${repository.name || repository.path}${repository.branch ? ` · ${repository.branch}` : ''}`)
+      : null,
+    h('p', { class: 'field-help' }, `Changes captured at ${formatDateTime(task.createdAt)}.`),
+    h('pre', { class: 'git-summary-preview' }, task.result.commitMessage),
+    h(
+      'div',
+      { class: 'row wrap' },
+      canUse
+        ? h('button', { class: 'primary', onclick: () => ctx.actions.useGitSummary(task.taskId) }, 'Use in Source Control')
+        : null,
+    ),
+  );
+}
+
 function renderResultCard(ctx, task) {
   if (!task.result) return null;
+  if (task.summaryOnly) return renderSummaryResultCard(ctx, task);
+
   const patches = h('div', { class: 'patch-list' });
   replace(
     patches,
@@ -132,9 +159,6 @@ function renderResultCard(ctx, task) {
   const actions = h(
     'div',
     { class: 'row wrap' },
-    task.summaryOnly && task.state === 'ready'
-      ? h('button', { class: 'primary', onclick: () => ctx.actions.useGitSummary(task.taskId) }, 'Use in Source Control')
-      : null,
     !task.summaryOnly && taskHasAgentTurn(task) && task.state === 'ready'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.applyTask(task.taskId) }, applyActionLabel(task))
       : null,

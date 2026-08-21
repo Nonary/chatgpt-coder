@@ -37,7 +37,6 @@ class Store {
       sourceStatus: null,
       sourceHistory: [],
       sourceCommitMessage: '',
-      gitSummaryTaskId: null,
       historySearch: '',
       historyState: 'all',
       composer: {

@@ -1,7 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { inspectRepository, runGit } = require('./git');
+const { fingerprintRepository, inspectRepository, runGit } = require('./git');
 
 const STATUS_LABELS = {
   M: 'Modified',
@@ -301,19 +301,21 @@ class GitService {
       });
   }
 
-  async status(repositoryPath) {
+  async status(repositoryPath, { includeFingerprint = false } = {}) {
     const repository = await inspectRepository(repositoryPath);
     const { stdout } = await runGit(repository.path, [
       'status', '--porcelain=v1', '-z', '--untracked-files=all',
     ]);
     const changes = parsePorcelainStatus(stdout);
-    return {
+    const result = {
       repository,
       changes,
       stagedCount: changes.filter((change) => change.staged).length,
       unstagedCount: changes.filter((change) => change.unstaged).length,
       history: await this.history(repository.path, 15),
     };
+    if (includeFingerprint) result.changeFingerprint = await fingerprintRepository(repository.path);
+    return result;
   }
 
   async stage(repositoryPath, files) {

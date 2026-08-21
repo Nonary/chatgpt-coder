@@ -507,6 +507,17 @@ button.composer-send-button {
 
 /* ------------------------------------------------------------ source control */
 
+.git-summary-card { border-color: var(--accent-border, var(--border)); }
+.git-summary-card.stale { border-color: var(--warning); }
+.git-summary-preview {
+  margin: 10px 0 0; padding: 10px 12px; border-radius: var(--radius-sm);
+  background: var(--surface-elevated); color: var(--text);
+  font: 13px/1.6 var(--font-mono); white-space: pre-wrap; overflow: auto;
+}
+.git-summary-warning {
+  margin-top: 10px; padding: 9px 10px; border: 1px solid var(--warning);
+  border-radius: var(--radius-sm); color: var(--text-secondary); font-size: 12px; line-height: 18px;
+}
 .git-group { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .git-group-header {
   display: flex; align-items: center; gap: 8px; padding: 9px 12px;
