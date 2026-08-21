@@ -67,10 +67,11 @@ function installInterceptor() {
 
   window.fetch = async function patchworkFetch(input, init) {
     const path = pathOf(input);
+    const method = methodOf(input, init);
     const isConversation = path === CONVERSATION_PATH;
     const isPrepare = path === PREPARE_PATH;
     const active = activeEnforcement();
-    if (!active || methodOf(input, init) !== 'POST' || (!isConversation && !isPrepare)) {
+    if (!active || method !== 'POST' || (!isConversation && !isPrepare)) {
       return nativeFetch(input, init);
     }
 
@@ -134,6 +135,10 @@ function installInterceptor() {
         // conversation, so submission is confirmed without waiting for the SPA
         // route to catch up.
         conversationId: readConversationId(response),
+        // The cloned response stream closes when ChatGPT finishes generating.
+        // Monitoring that event avoids repeatedly polling ChatGPT's conversation
+        // endpoints while the answer is in flight.
+        responseComplete: waitForResponseCompletion(response),
       });
     }
     return response;
@@ -167,6 +172,29 @@ function readConversationId(response) {
       }
     } catch {
       return null;
+    } finally {
+      reader.cancel().catch(() => {});
+    }
+  })();
+}
+
+function waitForResponseCompletion(response) {
+  if (!response.ok || !response.body) return Promise.resolve(false);
+  let clone;
+  try {
+    clone = response.clone();
+  } catch {
+    return Promise.resolve(false);
+  }
+  return (async () => {
+    const reader = clone.body.getReader();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) return true;
+      }
+    } catch {
+      return false;
     } finally {
       reader.cancel().catch(() => {});
     }
@@ -231,4 +259,5 @@ module.exports = {
   isInstalled,
   readConversationId,
   setAmbientConfiguration,
+  waitForResponseCompletion,
 };

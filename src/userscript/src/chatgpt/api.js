@@ -75,29 +75,21 @@ async function createProject(name) {
   };
 }
 
-async function streamStatus(conversationId) {
-  const response = await authorizedFetch(
-    `/backend-api/conversation/${encodeURIComponent(conversationId)}/stream_status`,
-  );
-  const text = await response.text();
-  let data = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = {};
-  }
-  return {
-    ok: response.ok,
-    httpStatus: response.status,
-    status: typeof data?.status === 'string' ? data.status : null,
-  };
-}
-
 async function conversation(conversationId) {
   return readJson(
     await authorizedFetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`),
     'conversation',
   );
+}
+
+function conversationCompletionStatus(record) {
+  const current = record?.mapping?.[record.current_node]?.message;
+  const status = String(current?.status || '').toLowerCase();
+  if (['failed', 'error', 'cancelled'].includes(status)) return 'failed';
+  if (current?.end_turn === true || ['finished', 'finished_successfully', 'completed'].includes(status)) {
+    return 'completed';
+  }
+  return null;
 }
 
 function messageAttachments(message) {
@@ -149,10 +141,10 @@ async function downloadFileText(fileId) {
 
 module.exports = {
   conversation,
+  conversationCompletionStatus,
   createProject,
   downloadFileText,
   findGeneratedFile,
   listProjects,
   messageAttachments,
-  streamStatus,
 };

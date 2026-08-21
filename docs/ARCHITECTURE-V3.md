@@ -179,15 +179,17 @@ Everything that can be an API call is an API call:
 - **Submission confirmation** — the send request answers with an event stream whose
   opening events carry `conversation_id`, so the wrapper reads it from a clone of
   that stream instead of waiting for the SPA route to change.
-- **Progress** — `GET /backend-api/conversation/:id/stream_status`.
-- **Result** — poll `GET /backend-api/conversation/:id` for an assistant message
-  carrying `chatgpt-ide-result-<taskId>.txt`, then
+- **Progress** — the cloned Send response stream closes when ChatGPT finishes
+  generating; a DOM observer provides the fallback when the page used a transport
+  the fetch wrapper could not inspect.
+- **Result** — read `GET /backend-api/conversation/:id` once after generation for an
+  assistant message carrying `chatgpt-ide-result-<taskId>.txt`, then
   `GET /backend-api/files/:id/download` and post the text to the agent for
-  validation and apply. If that record is unavailable, the rendered transcript is
-  scanned for the same file id as a fallback — unlike v2 this never clicks the
-  download control, because a browser download would land in the filesystem instead
-  of in the page.
-
+  validation and apply. If that record is unavailable or its file metadata is late,
+  the rendered transcript is observed for the same file id as a fallback — unlike
+  v2 this never clicks the download control, because a browser download would land
+  in the filesystem instead of in the page. Reload recovery performs one
+  reconciliation read and then observes the open page without recurring API calls.
 ## Events
 
 The agent keeps an append-only event log. The page long-polls

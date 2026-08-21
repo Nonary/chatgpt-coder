@@ -509,8 +509,8 @@ class App {
       async openConversation(taskId) {
         const task = app.store.task(taskId);
         if (!task?.conversationUrl) return;
-        app.driver.adoptTask(task);
         await navigate.openConversation(task.conversationUrl);
+        app.driver.adoptTask(task);
       },
 
       async copyPrompt(taskId) {
@@ -880,7 +880,6 @@ class App {
     // Report the real layout once it has settled, so the agent log shows what
     // the page actually did rather than what Patchwork assumed.
     setTimeout(() => reportLayout(this.api, this.shell), 2500);
-    this.driver.start();
     this.pollEvents().catch(() => {});
     this.checkForUpdate({ announce: true }).catch(() => {});
     setInterval(() => this.checkForUpdate({ announce: true }).catch(() => {}), UPDATE_CHECK_INTERVAL_MILLISECONDS);

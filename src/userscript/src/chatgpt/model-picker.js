@@ -11,7 +11,6 @@ const PICKER_ID = 'patchwork-task-model-selector';
 const MENU_ID = 'patchwork-task-model-menu';
 const SLOT_ID = 'patchwork-task-model-selector-slot';
 const SUPPRESSION_ID = 'patchwork-native-model-selector-suppression';
-const GUARD_INTERVAL_MILLISECONDS = 2_000;
 const MUTATION_SETTLE_MILLISECONDS = 250;
 const MENU_HEIGHT = 374;
 const MENU_WIDTH = 260;
@@ -497,7 +496,6 @@ function install({
     hasInstalledPicker: Boolean(previous?.hasInstalledPicker),
   };
   previous?.observer?.disconnect();
-  clearInterval(previous?.guard);
   if (previous?.outsideHandler) {
     document.removeEventListener('pointerdown', previous.outsideHandler, true);
   }
@@ -526,10 +524,6 @@ function install({
       subtree: true,
     });
   }
-  const guard = setInterval(() => {
-    if (session) replaceNativePickers();
-  }, GUARD_INTERVAL_MILLISECONDS);
-
   const outsideHandler = (event) => {
     const current = document.getElementById(PICKER_ID);
     const menu = document.getElementById(MENU_ID);
@@ -537,7 +531,7 @@ function install({
   };
   document.addEventListener('pointerdown', outsideHandler, true);
 
-  Object.assign(session, { observer, guard, outsideHandler });
+  Object.assign(session, { observer, outsideHandler });
   return {
     installed: Boolean(picker),
     reason: picker ? null : 'model-picker-anchor-not-found',
@@ -562,7 +556,6 @@ function uninstall() {
     return false;
   }
   session.observer?.disconnect();
-  clearInterval(session.guard);
   if (session.outsideHandler) {
     document.removeEventListener('pointerdown', session.outsideHandler, true);
   }

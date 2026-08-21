@@ -69,6 +69,45 @@ function findResultFileInDom(expectedName) {
   return null;
 }
 
+function observeConversation({ expectedName = null, onFinished, onResult }) {
+  if (typeof MutationObserver !== 'function') return () => {};
+  let sawGenerating = isGenerating();
+  let stopped = false;
+  const observer = new MutationObserver(() => check());
+
+  function stop() {
+    if (stopped) return;
+    stopped = true;
+    observer.disconnect();
+  }
+
+  function check() {
+    if (stopped) return;
+    const generating = isGenerating();
+    if (generating) sawGenerating = true;
+    const file = expectedName ? findResultFileInDom(expectedName) : null;
+    if (file && onResult) {
+      stop();
+      onResult(file);
+      return;
+    }
+    if (sawGenerating && !generating && onFinished) {
+      stop();
+      onFinished();
+    }
+  }
+
+  observer.observe(document.documentElement || document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['aria-disabled', 'disabled', 'href', 'data-file-id'],
+  });
+  check();
+  return stop;
+}
+
 module.exports = {
   CANDIDATE_SELECTOR, FILE_ID_PATTERN, fileIdNear, findResultFileInDom, idSourceOf, isGenerating, labelOf,
+  observeConversation,
 };
