@@ -78,7 +78,9 @@ function register(router, context) {
       skillRepositoryPaths,
       repositories: taskRepositories,
       tree,
-      autoApply: true,
+      // The apply-target picker is authoritative. Keep the validated result in
+      // the ready state until the user applies it to the selected target.
+      autoApply: false,
     });
     if (tree) {
       const hasChatGPTProject = Object.prototype.hasOwnProperty.call(body, 'chatgptProject');

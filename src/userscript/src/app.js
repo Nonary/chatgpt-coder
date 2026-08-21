@@ -41,6 +41,7 @@ class App {
     this.diff = null;
     this.eventSequence = 0;
     this.notifiedUpdateKey = null;
+    this.taskTargetUpdates = new Map();
     this.actions = this.buildActions();
     this.setupViews();
   }
@@ -561,6 +562,8 @@ class App {
 
       applyTask(taskId) {
         return app.run(async () => {
+          const pendingTarget = app.taskTargetUpdates.get(taskId);
+          if (pendingTarget) await pendingTarget;
           const { task } = await app.api.applyTask(taskId);
           app.store.upsertTask(task);
           app.renderActiveView();
@@ -630,12 +633,37 @@ class App {
           app.toast('Enter a name for the new coding tree.', true);
           return null;
         }
-        return app.run(async () => {
+        const previous = app.taskTargetUpdates.get(taskId);
+        const update = (previous ? previous.catch(() => {}) : Promise.resolve()).then(() => app.run(async () => {
           const { task } = await app.api.setTaskTarget(taskId, input);
+          app.store.upsertTask(task);
+          if (input.createTree) await app.refreshTrees();
+          app.renderActiveView();
+          return task;
+        }, { success: 'Task target changed.' }));
+        app.taskTargetUpdates.set(taskId, update);
+        update.finally(() => {
+          if (app.taskTargetUpdates.get(taskId) === update) app.taskTargetUpdates.delete(taskId);
+        }).catch(() => {});
+        return update;
+      },
+
+      createTaskTargetAndApply(taskId, treeName) {
+        if (!treeName) {
+          app.toast('Enter a name for the new coding tree.', true);
+          return null;
+        }
+        return app.run(async () => {
+          const pendingTarget = app.taskTargetUpdates.get(taskId);
+          if (pendingTarget) await pendingTarget;
+          const { task: targeted } = await app.api.setTaskTarget(taskId, { createTree: true, treeName });
+          app.store.upsertTask(targeted);
+          const { task } = await app.api.applyTask(taskId);
           app.store.upsertTask(task);
           await app.refreshTrees();
           app.renderActiveView();
-        }, { success: 'Task target changed.' });
+          return task;
+        }, { success: 'Coding tree created and result applied.' });
       },
 
       /* -------------------------------------------------------- source control */

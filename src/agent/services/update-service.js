@@ -28,6 +28,7 @@ async function runPackageManager(projectRoot, args) {
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
       shell: !pnpmScript && process.platform === 'win32',
+      windowsHide: true,
     });
   } catch (error) {
     const detail = String(error.stderr || error.stdout || error.message || error).trim();
@@ -43,6 +44,7 @@ class UpdateService {
     this.runningRevision = null;
     this.updating = false;
     this.lastError = null;
+    this.statusChecks = new Map();
   }
 
   async initialize() {
@@ -55,7 +57,19 @@ class UpdateService {
     return this;
   }
 
-  async status({ fetch = true } = {}) {
+  async status(options = {}) {
+    const fetch = options.fetch !== false;
+    const key = fetch ? 'fetch' : 'local';
+    const existing = this.statusChecks.get(key);
+    if (existing) return existing;
+    const check = this.inspectStatus({ fetch }).finally(() => {
+      if (this.statusChecks.get(key) === check) this.statusChecks.delete(key);
+    });
+    this.statusChecks.set(key, check);
+    return check;
+  }
+
+  async inspectStatus({ fetch = true } = {}) {
     let revision;
     try {
       const { stdout } = await this.runGit(this.projectRoot, ['rev-parse', '--verify', 'HEAD']);

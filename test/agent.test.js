@@ -243,9 +243,13 @@ test('a task travels create, download, submit, result, and apply entirely over H
     }],
   })}\nPATCHWORK_RESULT_END`;
 
-  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
-  assert.equal(applied.status, 200);
-  assert.equal(applied.payload.task.state, 'applied', 'auto-apply runs as soon as the envelope validates');
+  const ready = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(ready.status, 200);
+  assert.equal(ready.payload.task.state, 'ready', 'validated changes wait for the selected apply target');
+  assert.equal(await fs.access(path.join(repositoryPath, 'goodbye.txt')).then(() => true, () => false), false);
+
+  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/apply`);
+  assert.equal(applied.payload.task.state, 'applied');
   assert.equal(await fs.readFile(path.join(repositoryPath, 'goodbye.txt'), 'utf8'), 'goodbye\n');
 
   const rolledBack = await agent.call('POST', `/v1/tasks/${task.taskId}/rollback`);
@@ -256,6 +260,60 @@ test('a task travels create, download, submit, result, and apply entirely over H
   const deleted = await agent.call('DELETE', `/v1/tasks/${task.taskId}`);
   assert.equal(deleted.payload.deleted, true);
   assert.equal((await agent.call('GET', '/v1/tasks')).payload.tasks.length, 0);
+});
+
+test('creating an apply target sends the ready result to that new tree', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-new-apply-tree-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Add a file in a newly selected coding tree.',
+    repositories: [{ path: repositoryPath }],
+  });
+  const task = created.payload.task;
+  const patch = [
+    'diff --git a/tree-only.txt b/tree-only.txt',
+    'new file mode 100644',
+    'index 0000000..ce01362',
+    '--- /dev/null',
+    '+++ b/tree-only.txt',
+    '@@ -0,0 +1 @@',
+    '+tree only',
+    '',
+  ].join('\n');
+  const envelope = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Added a tree-only file.',
+    commitMessage: 'feat(tree): add tree-only file',
+    repositories: [{
+      id: task.repositories[0].id,
+      baseCommit: task.repositories[0].baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patch).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+
+  const ready = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(ready.payload.task.state, 'ready');
+  const targeted = await agent.call('POST', `/v1/tasks/${task.taskId}/target`, {
+    createTree: true,
+    treeName: 'New apply target',
+  });
+  assert.equal(targeted.status, 200);
+  assert.equal(targeted.payload.task.treeName, 'New apply target');
+
+  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/apply`);
+  assert.equal(applied.payload.task.state, 'applied');
+  assert.equal(await fs.readFile(path.join(applied.payload.task.repositories[0].path, 'tree-only.txt'), 'utf8'), 'tree only\n');
+  assert.equal(await fs.access(path.join(repositoryPath, 'tree-only.txt')).then(() => true, () => false), false);
+  assert.equal(
+    (await runGit(applied.payload.task.repositories[0].path, ['log', '-1', '--pretty=%s'])).stdout.trim(),
+    'feat(tree): add tree-only file',
+  );
 });
 
 test('answer-only tasks complete with the ChatGPT response and reject result uploads', async (context) => {

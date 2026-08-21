@@ -1233,6 +1233,27 @@ test('existing Git worktrees are discovered from workspace repositories', async 
   assert.equal((await trees.list()).length, 0);
 });
 
+test('simultaneous worktree refreshes share one repository discovery pass', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-discovery-coalesce-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  let providerCalls = 0;
+  let releaseProvider;
+  const providerReady = new Promise((resolve) => { releaseProvider = resolve; });
+  const trees = new WorktreeService(path.join(root, 'data'), () => {}, async () => {
+    providerCalls += 1;
+    await providerReady;
+    return [];
+  });
+  await trees.initialize();
+
+  const first = trees.syncDiscoveredWorktrees();
+  const second = trees.syncDiscoveredWorktrees();
+  releaseProvider();
+  await Promise.all([first, second]);
+
+  assert.equal(providerCalls, 1);
+});
+
 test('creating a task tree with the same repository and name reuses the existing tree', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-reused-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

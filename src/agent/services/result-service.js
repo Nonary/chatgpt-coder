@@ -138,11 +138,12 @@ class ResultService {
         localPath: outputPath,
       });
     }
-    const commitMessage = task.summaryOnly
-      ? validateCommitMessage(manifest.commitMessage)
-      : (task.treeId
-        ? validateCommitMessage(manifest.commitMessage)
-        : (manifest.commitMessage == null ? null : String(manifest.commitMessage)));
+    // A result can be redirected to a coding tree after it is downloaded. New
+    // packages require a Conventional Commit message; retain compatibility with
+    // older no-tree tasks by giving a missing message a safe tree-ready fallback.
+    const commitMessage = manifest.commitMessage == null
+      ? 'chore(patchwork): apply task result'
+      : validateCommitMessage(manifest.commitMessage);
     return {
       summary: String(manifest.summary || '').trim(),
       commitMessage,

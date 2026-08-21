@@ -165,7 +165,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
   "taskId": "${taskId}",
   "status": "completed",
   "summary": "A concise summary of the implementation and verification performed.",
-  "commitMessage": "A Conventional Commit message for coding-tree tasks, for example feat(editor): add split diff view; null is allowed when no coding tree is used",
+  "commitMessage": "A Conventional Commit message, for example feat(editor): add split diff view",
   "repositories": [
     {
       "id": "the repository id from manifest.json",
@@ -179,7 +179,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
 
 \`PATCHWORK_RESULT_END\`
 
-When a coding tree is used, the commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. For tasks without a coding tree, the commit message may be null. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
+The commit message first line must follow Conventional Commits: \`type(optional-scope): concise description\`. Patchwork may apply the result to a coding tree chosen after this task finishes, so the commit message is required even when the original repository was packaged. Include every repository from the input manifest, even when its patch is empty (encode the empty byte sequence as an empty string). Do not abbreviate, omit, or truncate patch data. Attach \`chatgpt-ide-result-${taskId}.txt\` to your final response as a downloadable file. Briefly summarize the work in the chat. Do not print or paste the result envelope or patch contents in the chat itself. Never print the result envelope or patch contents in the chat itself.
 
 ${summaryOnly ? 'For this read-only Git summary task, set `commitMessage` to the single Conventional Commit message requested by `TASK.md`, set every repository `patch` value to an empty string, and do not include code changes in the result.' : ''}
 `;

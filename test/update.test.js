@@ -42,6 +42,37 @@ test('revision counts map Git left/right output to ahead and behind', () => {
   assert.deepEqual(parseRevisionCounts('2\t7\n'), { ahead: 2, behind: 7 });
 });
 
+test('simultaneous update checks share one Git inspection', async () => {
+  const calls = [];
+  const updater = new UpdateService({
+    projectRoot: 'C:/Patchwork',
+    runGit: async (_root, args) => {
+      calls.push(args.join(' '));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const command = args.join(' ');
+      if (command === 'rev-parse --verify HEAD') return { stdout: 'current\n' };
+      if (command === 'symbolic-ref --short -q HEAD') return { stdout: 'main\n' };
+      if (command.startsWith('status ')) return { stdout: '' };
+      if (command.includes('@{upstream}')) return { stdout: 'origin/main\n' };
+      if (command.startsWith('config ')) return { stdout: 'origin\n' };
+      if (command.startsWith('rev-list ')) return { stdout: '0 0\n' };
+      if (command === 'rev-parse --verify origin/main') return { stdout: 'current\n' };
+      throw new Error(`Unexpected Git command: ${command}`);
+    },
+  });
+  updater.runningRevision = 'current';
+
+  const statuses = await Promise.all([
+    updater.status({ fetch: false }),
+    updater.status({ fetch: false }),
+    updater.status({ fetch: false }),
+  ]);
+
+  assert.ok(statuses.every((status) => status.updateAvailable === false));
+  assert.equal(calls.filter((command) => command === 'symbolic-ref --short -q HEAD').length, 1);
+  assert.equal(calls.length, 7);
+});
+
 test('the updater detects its upstream, fast-forwards, installs changed dependencies, and builds', async (context) => {
   const { author, local } = await createUpdateRepositories(context);
   const commands = [];

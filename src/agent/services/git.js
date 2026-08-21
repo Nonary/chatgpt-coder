@@ -13,6 +13,7 @@ async function runGit(cwd, args, options = {}) {
       cwd,
       encoding: 'utf8',
       maxBuffer: 32 * 1024 * 1024,
+      windowsHide: true,
       env: {
         ...process.env,
         GIT_TERMINAL_PROMPT: '0',

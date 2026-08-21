@@ -231,7 +231,27 @@ class GitService {
     ])];
     state.knownRepositories = mergeKnownRepositories(inspected, state.knownRepositories);
     await this.writeWorkspaceState(state);
-    return this.listRepositories();
+    const addedByPath = new Map(inspected.map((repository) => [repository.path, repository]));
+    const repositories = [];
+    for (const repositoryPath of state.repositories) {
+      const added = addedByPath.get(repositoryPath);
+      if (added) {
+        repositories.push(added);
+        continue;
+      }
+      try {
+        repositories.push(await inspectRepository(repositoryPath));
+      } catch (error) {
+        repositories.push({
+          id: workspaceId(repositoryPath),
+          name: path.basename(repositoryPath),
+          path: repositoryPath,
+          unavailable: true,
+          error: error.message,
+        });
+      }
+    }
+    return repositories;
   }
 
   async removeRepository(repositoryPath) {

@@ -101,6 +101,7 @@ class WorktreeService {
     this.recordsFile = path.join(dataRoot, 'worktrees.json');
     this.onEvent = onEvent;
     this.repositoryProvider = repositoryProvider;
+    this.discoverySync = null;
   }
 
   async initialize() {
@@ -160,6 +161,15 @@ class WorktreeService {
   }
 
   async syncDiscoveredWorktrees() {
+    if (this.discoverySync) return this.discoverySync;
+    const sync = this.performDiscoverySync().finally(() => {
+      if (this.discoverySync === sync) this.discoverySync = null;
+    });
+    this.discoverySync = sync;
+    return sync;
+  }
+
+  async performDiscoverySync() {
     const records = await this.readRecords();
     let repositories;
     try {
