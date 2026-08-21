@@ -16,7 +16,9 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.match(source, /Reconcile once before attaching the DOM observer/);
   assert.match(source, /seenTaskResultFiles/);
   assert.match(source, /latestTaskResultFile/);
-  assert.match(source, /if \(generation === this\.watchGeneration && !currentTask\.answerOnly\) arm\(\)/);
+  assert.match(source, /if \(generation === this\.watchGeneration\) arm\(\)/);
+  assert.match(source, /activeFollowUp\(currentTask\)/);
+  assert.match(source, /resultFileFreshForTurn/);
   assert.match(source, /async refreshTask\(task\)/);
   assert.doesNotMatch(source, /this\.api\.taskAttachment/);
   assert.match(source, /Supporting files are already bundled under attachments\//);
@@ -82,6 +84,92 @@ test('conversation recovery recognizes terminal records without polling stream s
   assert.equal(conversationCompletionStatus({ current_node: 'answer', mapping: {
     answer: { message: { status: 'in_progress' } },
   } }), null);
+});
+
+test('follow-up result freshness is anchored to the saved turn timestamp', () => {
+  const { resultFileFreshForTurn } = require('../src/userscript/src/driver');
+  const turn = {
+    createdAt: '2026-08-21T18:00:00.000Z',
+    submittedAt: '2026-08-21T18:00:10.000Z',
+  };
+
+  assert.equal(resultFileFreshForTurn({ createTime: Date.parse('2026-08-21T18:00:20.000Z') }, turn), true);
+  assert.equal(resultFileFreshForTurn({ createTime: Date.parse('2026-08-21T18:00:04.000Z') }, turn), false);
+  assert.equal(resultFileFreshForTurn({ createTime: 0 }, turn), true, 'files without a usable timestamp defer to the existing seen-file guard');
+});
+
+test('an unsent follow-up turn does not reconcile against the previous completed conversation', async () => {
+  const { Driver } = require('../src/userscript/src/driver');
+  const task = {
+    taskId: 'created-follow-up',
+    state: 'applied',
+    answerOnly: false,
+    conversationId: '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33',
+    conversationUrl: 'https://chatgpt.com/c/4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33',
+    activeTurnId: 'turn-created',
+    turns: [{ id: 'turn-created', mode: 'ask', state: 'created' }],
+  };
+  const calls = [];
+  const driver = new Driver({
+    api: {
+      taskChatStatus: async () => { calls.push('status'); return { task: { ...task, activeTurnId: null } }; },
+      taskResult: async () => { calls.push('result'); return { task }; },
+    },
+  });
+
+  const updated = await driver.reconcileTask(task, {
+    record: {
+      current_node: 'answer',
+      mapping: { answer: { message: { status: 'finished_successfully', end_turn: true } } },
+    },
+  });
+
+  assert.equal(updated, task);
+  assert.deepEqual(calls, []);
+});
+
+test('Ask follow-up reconciliation completes without ingesting a result file', async () => {
+  const { Driver } = require('../src/userscript/src/driver');
+  const taskId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  const conversationId = '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33';
+  const task = {
+    taskId,
+    state: 'applied',
+    answerOnly: false,
+    conversationId,
+    conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+    activeTurnId: 'turn-ask',
+    turns: [{ id: 'turn-ask', mode: 'ask', state: 'submitted' }],
+  };
+  const completed = {
+    ...task,
+    activeTurnId: null,
+    chatStatus: 'completed',
+    turns: [{ ...task.turns[0], state: 'completed', completedAt: '2026-08-21T18:01:00.000Z' }],
+  };
+  const calls = [];
+  const driver = new Driver({
+    api: {
+      taskChatStatus: async () => {
+        calls.push('status');
+        return { task: completed };
+      },
+      taskResult: async () => {
+        calls.push('result');
+        throw new Error('Ask turns must not ingest result files');
+      },
+    },
+  });
+
+  const updated = await driver.reconcileTask(task, {
+    record: {
+      current_node: 'answer',
+      mapping: { answer: { message: { status: 'finished_successfully', end_turn: true } } },
+    },
+  });
+
+  assert.equal(updated.activeTurnId, null);
+  assert.deepEqual(calls, ['status']);
 });
 
 test('prepared tasks can adopt and reconcile a manually submitted conversation', async () => {

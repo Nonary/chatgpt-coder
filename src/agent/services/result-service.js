@@ -12,6 +12,7 @@ const {
   runGit,
 } = require('./git');
 const { validateCommitMessage } = require('./worktree-service');
+const { followUpTurn } = require('./task-service');
 
 const MAX_RESULT_BYTES = 128 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -114,16 +115,38 @@ class ResultService {
 
   async ingestResult(taskId, message, readResult) {
     const task = await this.taskService.getTask(taskId);
+    const activeTurn = followUpTurn(task);
     await this.onEvent({ type: 'result-processing', taskId, message });
 
     let readyTask;
     try {
       const result = await readResult(task);
+      if (activeTurn?.mode === 'agent' && result.sourceFile?.createTime != null) {
+        const turnStartedAt = Date.parse(activeTurn.submittedAt || activeTurn.createdAt || '');
+        const rawResultTime = Number(result.sourceFile.createTime);
+        const resultCreatedAt = Number.isFinite(rawResultTime)
+          ? (rawResultTime > 100000000000 ? rawResultTime : rawResultTime * 1000)
+          : NaN;
+        if (Number.isFinite(turnStartedAt) && Number.isFinite(resultCreatedAt)
+          && resultCreatedAt < turnStartedAt - 5000) {
+          throw new Error('The generated result predates the active Agent follow-up and was ignored as stale.');
+        }
+      }
       if (task.result?.contentHash && task.result.contentHash === result.contentHash) {
         if (!result.sourceFile) return task;
-        return this.taskService.updateTask(taskId, {
+        const updated = await this.taskService.updateTask(taskId, {
           result: { ...task.result, sourceFile: result.sourceFile },
         });
+        if (activeTurn?.mode === 'agent') {
+          const completed = await this.taskService.completeFollowUpResult(taskId, activeTurn.id, result.sourceFile, updated.state);
+          await this.onEvent({
+            type: 'task-follow-up-completed',
+            task: completed,
+            turn: completed.turns?.find((item) => item.id === activeTurn.id) || null,
+          });
+          return completed;
+        }
+        return updated;
       }
       const validated = await this.validate(task, result);
       if (task.state === 'applied' && task.result
@@ -143,17 +166,70 @@ class ResultService {
       readyTask = await this.taskService.updateTask(taskId, update);
       await this.onEvent({ type: 'result-ready', task: readyTask });
     } catch (error) {
-      const failedTask = await this.taskService.updateTask(taskId, task.result
-        ? { state: task.state, error: `Follow-up result ignored: ${error.message}` }
-        : { state: 'failed', error: error.message });
-      await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
+      if (activeTurn?.mode === 'agent') {
+        const failedTask = await this.taskService.failFollowUp(
+          taskId,
+          activeTurn.id,
+          `Follow-up result ignored: ${error.message}`,
+        );
+        await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
+      } else {
+        const failedTask = await this.taskService.updateTask(taskId, task.result
+          ? { state: task.state, error: `Follow-up result ignored: ${error.message}` }
+          : { state: 'failed', error: error.message });
+        await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
+      }
       throw error;
     }
 
     // Application owns its failure state. Keep it outside the validation catch
     // so a failed automatic follow-up cannot be relabeled as applied while its
     // newer cumulative result has not actually reached the target repository.
-    if (readyTask.autoApply) return this.apply(taskId);
+    if (readyTask.autoApply) {
+      let appliedTask;
+      try {
+        appliedTask = await this.apply(taskId);
+      } catch (error) {
+        if (activeTurn?.mode === 'agent') {
+          const failedTask = await this.taskService.failFollowUp(
+            taskId,
+            activeTurn.id,
+            `Follow-up result could not be applied: ${error.message}`,
+          );
+          await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
+        }
+        throw error;
+      }
+      if (activeTurn?.mode === 'agent') {
+        const completed = await this.taskService.completeFollowUpResult(
+          taskId,
+          activeTurn.id,
+          readyTask.result?.sourceFile,
+          appliedTask.state,
+        );
+        await this.onEvent({
+          type: 'task-follow-up-completed',
+          task: completed,
+          turn: completed.turns?.find((item) => item.id === activeTurn.id) || null,
+        });
+        return completed;
+      }
+      return appliedTask;
+    }
+    if (activeTurn?.mode === 'agent') {
+      const completed = await this.taskService.completeFollowUpResult(
+        taskId,
+        activeTurn.id,
+        readyTask.result?.sourceFile,
+        readyTask.state,
+      );
+      await this.onEvent({
+        type: 'task-follow-up-completed',
+        task: completed,
+        turn: completed.turns?.find((item) => item.id === activeTurn.id) || null,
+      });
+      return completed;
+    }
     return readyTask;
   }
 
@@ -413,6 +489,17 @@ class ResultService {
   }
 
   async apply(taskId) {
+    const current = await this.taskService.getTask(taskId);
+    if (current.applyInProgress) throw new Error('This task result is already being applied.');
+    await this.taskService.updateTask(taskId, { applyInProgress: true });
+    try {
+      return await this._applyTask(taskId);
+    } finally {
+      await this.taskService.updateTask(taskId, { applyInProgress: false }).catch(() => {});
+    }
+  }
+
+  async _applyTask(taskId) {
     let task = await this.taskService.getTask(taskId);
     task = await this.rebindMissingResolutionTarget(task);
     if (!task.result || !['ready', 'failed', 'conflicted'].includes(task.state)) {

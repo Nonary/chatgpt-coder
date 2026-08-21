@@ -55,6 +55,22 @@ class Store {
         mode: 'ask',
         taskText: '',
       },
+      followUp: {
+        taskId: null,
+        attachments: [],
+        skillIds: [],
+        promptIds: [],
+        model: 'default',
+        reasoningMode: 'default',
+        mode: 'ask',
+        taskText: '',
+      },
+      taskConversation: {
+        taskId: null,
+        loading: false,
+        error: null,
+        messages: [],
+      },
     };
   }
 
@@ -74,6 +90,33 @@ class Store {
 
   setComposer(patch, reason = 'composer') {
     Object.assign(this.state.composer, patch);
+    this.notify(reason);
+  }
+
+  setFollowUp(patch, reason = 'follow-up') {
+    Object.assign(this.state.followUp, patch);
+    this.notify(reason);
+  }
+
+  resetFollowUp(task, reason = 'follow-up') {
+    const turns = Array.isArray(task?.turns) ? task.turns : [];
+    const lastTurn = turns[turns.length - 1] || null;
+    const mode = lastTurn?.mode || (task?.answerOnly ? 'ask' : 'agent');
+    this.state.followUp = {
+      taskId: task?.taskId || null,
+      attachments: [],
+      skillIds: [],
+      promptIds: [],
+      model: lastTurn?.model || task?.model || 'default',
+      reasoningMode: lastTurn?.reasoningMode || task?.reasoningMode || 'default',
+      mode,
+      taskText: '',
+    };
+    this.notify(reason);
+  }
+
+  setTaskConversation(patch, reason = 'task-conversation') {
+    Object.assign(this.state.taskConversation, patch);
     this.notify(reason);
   }
 

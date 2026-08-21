@@ -4,6 +4,7 @@ const {
 const {
   taskConfigurationLabel, taskLabel, taskStateLabel, taskStatusText,
 } = require('../labels');
+const { renderTaskConversation, renderTaskFollowUpComposer } = require('./task-follow-up');
 
 const NEW_TREE_VALUE = '__new__';
 const MISSING_TREE_VALUE = '__missing__';
@@ -11,9 +12,14 @@ const MISSING_TREE_VALUE = '__missing__';
 function canChangeTaskTarget(task) {
   return Boolean(task)
     && !task.summaryOnly
-    && !task.answerOnly
+    && taskHasAgentTurn(task)
     && ['prepared', 'submitted', 'ready', 'failed', 'conflicted'].includes(task.state)
     && (task.repositories || []).filter((repository) => !repository.readOnly).length === 1;
+}
+
+function taskHasAgentTurn(task) {
+  if (!task?.answerOnly) return true;
+  return (task.turns || []).some((turn) => turn.mode === 'agent');
 }
 
 function applyActionLabel(task) {
@@ -129,7 +135,7 @@ function renderResultCard(ctx, task) {
     task.summaryOnly && task.state === 'ready'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.useGitSummary(task.taskId) }, 'Use in Source Control')
       : null,
-    !task.summaryOnly && !task.answerOnly && task.state === 'ready'
+    !task.summaryOnly && taskHasAgentTurn(task) && task.state === 'ready'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.applyTask(task.taskId) }, applyActionLabel(task))
       : null,
     task.state === 'conflicted'
@@ -153,13 +159,19 @@ function renderResultCard(ctx, task) {
   );
 }
 
-function renderTaskDetail(ctx, task) {
+function renderTaskDetail(ctx, task, { followUpComposer = null } = {}) {
   const [title, copy] = taskStatusText(task);
-  const elapsed = task.state === 'submitted' && task.submittedAt
+  const currentTurn = task.activeTurnId && Array.isArray(task.turns)
+    ? task.turns.find((turn) => turn.id === task.activeTurnId)
+    : null;
+  const startedAt = currentTurn?.submittedAt || currentTurn?.createdAt || task.submittedAt;
+  const elapsed = startedAt && (currentTurn || task.state === 'submitted')
     ? h('time', {
       class: 'elapsed',
-      dataset: { startedAt: task.submittedAt, endedAt: task.chatFinishedAt || '' },
-    }, formatElapsed(task.submittedAt, task.chatFinishedAt ? new Date(task.chatFinishedAt).getTime() : Date.now()))
+      dataset: { startedAt, endedAt: task.chatFinishedAt || currentTurn?.completedAt || '' },
+    }, formatElapsed(startedAt, task.chatFinishedAt || currentTurn?.completedAt
+      ? new Date(task.chatFinishedAt || currentTurn?.completedAt).getTime()
+      : Date.now()))
     : null;
 
   const primaryActions = h(
@@ -178,7 +190,7 @@ function renderTaskDetail(ctx, task) {
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.copyPrompt(task.taskId) }, 'Copy prompt')
       : null,
     h('button', { class: 'secondary', onclick: () => ctx.actions.revealPackage(task.taskId) }, 'Show package'),
-    !task.summaryOnly && !task.answerOnly
+    !task.summaryOnly && taskHasAgentTurn(task)
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.importResult(task.taskId) }, 'Import result')
       : null,
     h('button', { class: 'danger', onclick: () => ctx.actions.deleteTask(task.taskId) }, 'Delete task'),
@@ -199,7 +211,7 @@ function renderTaskDetail(ctx, task) {
       h('button', { class: 'secondary', onclick: () => ctx.actions.showComposer() }, '← New task'),
       h('div', { class: 'spacer' }),
       elapsed,
-      h('span', { class: `status-badge ${task.state}` }, taskStateLabel(task)),
+      h('span', { class: `status-badge ${currentTurn ? 'submitted' : task.state}` }, taskStateLabel(task)),
     ),
     h(
       'div',
@@ -210,10 +222,12 @@ function renderTaskDetail(ctx, task) {
       h('p', { class: 'field-help' }, `${taskLabel(task)} · created ${formatDateTime(task.createdAt)}`),
       primaryActions,
     ),
+    renderTaskConversation(ctx, task),
     renderTargetCard(ctx, task),
     renderResultCard(ctx, task),
     h('div', { class: 'card' }, h('h3', {}, 'Activity'), activity),
-  ];
+    renderTaskFollowUpComposer(ctx, task, followUpComposer),
+  ].filter(Boolean);
 }
 
-module.exports = { applyActionLabel, canChangeTaskTarget, renderTaskDetail, taskTargetValue };
+module.exports = { applyActionLabel, canChangeTaskTarget, renderTaskDetail, taskHasAgentTurn, taskTargetValue };

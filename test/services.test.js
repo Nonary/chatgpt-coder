@@ -62,6 +62,123 @@ test('Git Summary prompts use the saved prompt when present and the built-in pro
   assert.ok(DEFAULT_GIT_SUMMARY_PROMPT.includes('<type>(<optional-scope>): <concise summary>'));
 });
 
+test('follow-up turns persist Ask/Agent state without rewriting the legacy answerOnly flag', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-turns-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Answer a software question, then continue the task as needed.',
+    repositories: [repository],
+    answerOnly: true,
+    autoApply: true,
+  });
+  const conversationId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  await tasks.updateTask(task.taskId, { conversationId, conversationUrl, state: 'completed' });
+
+  const ask = await tasks.createFollowUp(task.taskId, {
+    mode: 'ask',
+    prompt: 'Explain the current implementation.',
+    model: 'luna',
+    reasoningMode: 'low',
+  });
+  assert.equal(ask.answerOnly, true);
+  assert.equal(ask.activeTurnId, ask.turns[0].id);
+  assert.equal(ask.turns[0].mode, 'ask');
+  assert.equal(ask.turns[0].state, 'created');
+  await tasks.updateFollowUpChatStatus(task.taskId, 'completed', conversationId);
+
+  const afterAsk = await tasks.getTask(task.taskId);
+  assert.equal(afterAsk.answerOnly, true);
+  assert.equal(afterAsk.activeTurnId, null);
+  assert.equal(afterAsk.state, 'completed');
+  assert.equal(afterAsk.turns[0].state, 'completed');
+
+  const agent = await tasks.createFollowUp(task.taskId, {
+    mode: 'agent',
+    prompt: 'Implement the requested change now.',
+    model: 'luna',
+    reasoningMode: 'high',
+  });
+  assert.equal(agent.answerOnly, true, 'legacy task identity remains answerOnly-compatible');
+  assert.equal(agent.activeTurnId, agent.turns[1].id);
+  assert.equal(agent.turns[1].mode, 'agent');
+  assert.equal(agent.turns[1].model, 'luna');
+  assert.equal(agent.turns[1].reasoningMode, 'high');
+  assert.equal(agent.conversationId, conversationId);
+  assert.equal(agent.conversationUrl, conversationUrl);
+  assert.equal(agent.repositories[0].readOnly, false, 'Agent follow-up promotes the existing task repository to writable');
+  assert.equal(agent.resultFilename, `chatgpt-ide-result-${task.taskId}.txt`);
+
+  await assert.rejects(
+    tasks.createFollowUp(task.taskId, { mode: 'ask', prompt: 'Concurrent turn should be rejected.' }),
+    /another follow-up turn is already active/i,
+  );
+
+  const fresh = await tasks.createTask({
+    taskText: 'Prepare a task for a concurrent send race.',
+    repositories: [repository],
+    answerOnly: true,
+  });
+  await tasks.updateTask(fresh.taskId, {
+    state: 'completed',
+    conversationId,
+    conversationUrl,
+  });
+  const concurrent = await Promise.allSettled([
+    tasks.createFollowUp(fresh.taskId, { mode: 'ask', prompt: 'First turn.' }),
+    tasks.createFollowUp(fresh.taskId, { mode: 'ask', prompt: 'Second turn.' }),
+  ]);
+  assert.equal(concurrent.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(concurrent.filter((result) => result.status === 'rejected').length, 1);
+});
+
+test('a stale Agent follow-up result fails only the active turn', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-stale-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({ taskText: 'Explain this repository, then continue later.', repositories: [repository], autoApply: false });
+  const conversationId = '6a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  await tasks.updateTask(task.taskId, { state: 'completed', conversationId, conversationUrl });
+  const followUp = await tasks.createFollowUp(task.taskId, {
+    mode: 'agent',
+    prompt: 'Make the requested refinement.',
+    model: 'luna',
+    reasoningMode: 'medium',
+  });
+  const submitted = await tasks.markFollowUpSubmitted(task.taskId, followUp.activeTurnId, {
+    conversationId,
+    conversationUrl,
+  });
+  const results = new ResultService(tasks);
+  const resultText = plainTextResult(submitted, '', 'feat(task): stale follow-up result');
+
+  await assert.rejects(
+    results.ingestResult(
+      task.taskId,
+      'Validating stale follow-up result…',
+      (current) => results.readPlainTextResult(current, resultText, null, {
+        id: 'stale-result',
+        name: submitted.resultFilename,
+        createTime: (Date.now() - 60_000) / 1000,
+      }),
+    ),
+    /predates the active Agent follow-up/i,
+  );
+
+  const current = await tasks.getTask(task.taskId);
+  assert.equal(current.state, 'completed');
+  assert.equal(current.activeTurnId, null);
+  assert.equal(current.turns.at(-1).state, 'failed');
+});
+
 function plainTextResult(task, patch, commitMessage = 'fix(task): apply generated changes') {
   return `PATCHWORK_RESULT_V1\n${JSON.stringify({
     schemaVersion: 2,
@@ -1003,6 +1120,60 @@ test('an applied source task accepts a newer cumulative follow-up result', async
   current = await results.rollback(task.taskId);
   assert.equal(current.state, 'rolled-back');
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'hello\n');
+});
+
+test('an invalid Agent follow-up preserves the previously applied result', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-invalid-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Apply the first result, then continue the same task safely.',
+    repositories: [repository],
+    autoApply: false,
+  });
+  const results = new ResultService(tasks);
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'first result\n');
+  const { stdout: firstPatch } = await runGit(repositoryPath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+  await runGit(repositoryPath, ['restore', 'hello.txt']);
+  let current = await ingestDownloadedText(results, tasks, task, plainTextResult(task, firstPatch, 'feat(task): apply first result'));
+  current = await results.apply(task.taskId);
+  const firstContentHash = current.result.contentHash;
+  assert.equal(current.state, 'applied');
+
+  const conversationId = '7b4d9e8a-8f3c-4c9e-8d7b-2e5a6f7c8b99';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  await tasks.updateTask(task.taskId, { conversationId, conversationUrl });
+  const followUp = await tasks.createFollowUp(task.taskId, {
+    mode: 'agent',
+    prompt: 'Refine the applied result.',
+    model: 'luna',
+    reasoningMode: 'medium',
+  });
+  const submitted = await tasks.markFollowUpSubmitted(task.taskId, followUp.activeTurnId, {
+    conversationId,
+    conversationUrl,
+  });
+
+  const invalidResult = plainTextResult(submitted, firstPatch, 'feat(task): invalid follow-up result')
+    .replace(repository.baseCommit, '0'.repeat(repository.baseCommit.length));
+  await assert.rejects(
+    ingestDownloadedText(results, tasks, submitted, invalidResult),
+    /Follow-up result ignored/i,
+  );
+
+  current = await tasks.getTask(task.taskId);
+  assert.equal(current.state, 'applied');
+  assert.equal(current.result.contentHash, firstContentHash);
+  assert.equal(current.activeTurnId, null);
+  assert.equal(current.turns.at(-1).state, 'failed');
+  assert.equal(current.appliedResult, null, 'the existing applied result remains the active result record');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'first result\n');
 });
 
 test('coding tree follow-up results accumulate commits and roll back as one task', async (context) => {

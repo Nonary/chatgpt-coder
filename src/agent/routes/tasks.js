@@ -2,7 +2,9 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { appendPromptInstructions } = require('../services/prompt-service');
-const { resolveGitSummaryPrompt, resolveTreeTaskRepositories } = require('../services/task-service');
+const {
+  buildFollowUpPrompt, followUpTurn, resolveGitSummaryPrompt, resolveTreeTaskRepositories,
+} = require('../services/task-service');
 const { validateCommitMessage } = require('../services/worktree-service');
 const { isChatGPTConversationUrl, normalizeConversationStreamStatus } = require('../../shared/chatgpt');
 
@@ -121,6 +123,56 @@ function register(router, context) {
 
   router.get('/v1/tasks/:taskId', async ({ params }) => ({ task: await taskService.getTask(params.taskId) }));
 
+  router.post('/v1/tasks/:taskId/follow-ups', async ({ params, body }) => {
+    const task = await taskService.getTask(params.taskId);
+    const prompt = String(body.prompt || '').trim();
+    if (!prompt) throw new Error('Describe the follow-up before sending it.');
+    const mode = String(body.mode || '').trim().toLowerCase();
+    const selectedPrompts = await promptService.resolveSelected(body.promptIds);
+    const expandedPrompt = appendPromptInstructions(prompt, selectedPrompts);
+    const resolvedPrompt = buildFollowUpPrompt(task, expandedPrompt, mode, body.skillIds);
+    const created = await taskService.createFollowUp(task.taskId, {
+      ...body,
+      mode,
+      prompt,
+      resolvedPrompt,
+    });
+    const turn = followUpTurn(created);
+    emit({
+      type: 'task-follow-up-created',
+      task: created,
+      turn,
+      taskId: created.taskId,
+      message: `${mode === 'ask' ? 'Ask' : 'Agent'} follow-up prepared.`,
+    });
+    return { task: created, turn };
+  });
+
+  router.post('/v1/tasks/:taskId/follow-ups/:turnId/submitted', async ({ params, body }) => {
+    const saved = await taskService.markFollowUpSubmitted(params.taskId, params.turnId, body || {});
+    emit({
+      type: 'task-follow-up-submitted',
+      task: saved,
+      turn: followUpTurn(saved),
+      taskId: saved.taskId,
+      message: 'Follow-up sent into the existing ChatGPT conversation.',
+    });
+    return { task: saved, turn: followUpTurn(saved) };
+  });
+
+  router.post('/v1/tasks/:taskId/follow-ups/:turnId/failed', async ({ params, body }) => {
+    const message = String(body.message || 'The follow-up could not be sent.');
+    const saved = await taskService.failFollowUp(params.taskId, params.turnId, message);
+    emit({
+      type: 'task-follow-up-failed',
+      task: saved,
+      turn: saved.turns?.find((item) => item.id === params.turnId) || null,
+      taskId: saved.taskId,
+      message,
+    });
+    return { task: saved };
+  });
+
   router.delete('/v1/tasks/:taskId', async ({ params }) => {
     const task = await taskService.getTask(params.taskId);
     await taskService.deleteTask(task.taskId);
@@ -171,6 +223,26 @@ function register(router, context) {
   router.post('/v1/tasks/:taskId/chat-status', async ({ params, body }) => {
     const task = await taskService.getTask(params.taskId);
     const chatStatus = normalizeConversationStreamStatus(body.status);
+    const activeTurn = followUpTurn(task);
+    if (activeTurn) {
+      const message = chatStatus === 'failed'
+        ? 'ChatGPT stopped before completing the follow-up.'
+        : null;
+      const saved = await taskService.updateFollowUpChatStatus(
+        task.taskId,
+        chatStatus,
+        body.conversationId || task.conversationId || null,
+        message,
+      );
+      emit({
+        type: 'task-chat-status',
+        task: saved,
+        taskId: saved.taskId,
+        chatStatus,
+        chatStatusRaw: saved.chatStatusRaw,
+      });
+      return { task: saved };
+    }
     if (task.chatStatus === chatStatus && task.chatStatusRaw === body.status) return { task };
     const saved = await taskService.updateTask(task.taskId, {
       state: task.answerOnly
@@ -205,7 +277,10 @@ function register(router, context) {
   // envelope validation and, when auto-apply is on, application.
   router.post('/v1/tasks/:taskId/result', async ({ params, body, rawBody }) => {
     const current = await taskService.getTask(params.taskId);
-    if (current.answerOnly) throw new Error('Ask tasks do not accept Patchwork result files.');
+    const activeTurn = followUpTurn(current);
+    if (activeTurn?.mode === 'ask' || (!activeTurn && current.answerOnly)) {
+      throw new Error('Ask tasks do not accept Patchwork result files.');
+    }
     const text = typeof body?.text === 'string' ? body.text : rawBody?.toString('utf8');
     if (!text) throw new Error('The result upload contained no text.');
     if (Buffer.byteLength(text, 'utf8') > MAX_RESULT_TEXT_BYTES) {

@@ -16,12 +16,43 @@ const { renderHistory } = require('./ui/views/history');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
 const { taskLabel } = require('./ui/labels');
+const { canFollowUp, canSendFollowUp } = require('./ui/views/task-follow-up');
+const { closeComposerPopover } = require('./ui/composer-controls');
 const { reportLayout } = require('./ui/layout-report');
 const { conversationIdFromRouteUrl, taskRequestConfiguration } = require('../../shared/chatgpt');
+const { createTaskInput } = require('./task-input');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
 const UPDATE_CHECK_INTERVAL_MILLISECONDS = 30 * 60 * 1_000;
 const UPDATE_RECONNECT_TIMEOUT_MILLISECONDS = 60_000;
+
+function conversationMessageText(message) {
+  const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+  const text = parts
+    .filter((part) => typeof part === 'string')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join('\n');
+  if (text) return text;
+  const value = message?.content?.text?.value;
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function conversationMessages(record) {
+  return Object.values(record?.mapping || {})
+    .map((node) => node?.message)
+    .filter((message) => ['user', 'assistant'].includes(message?.author?.role))
+    .map((message) => ({
+      id: message.id || null,
+      role: message.author.role,
+      text: conversationMessageText(message),
+      at: message.create_time ? new Date(Number(message.create_time) * 1000).toISOString() : null,
+      createTime: Number(message.create_time) || 0,
+    }))
+    .filter((message) => message.text)
+    .sort((left, right) => left.createTime - right.createTime)
+    .slice(-14);
+}
 
 class App {
   constructor({ api, transport, version }) {
@@ -76,6 +107,27 @@ class App {
   renderTasksView() {
     const { state } = this.store;
     const active = state.activeTaskId ? this.store.task(state.activeTaskId) : null;
+    if (active && state.followUp.taskId !== active.taskId) this.store.resetFollowUp(active, 'silent');
+    const view = this.shell.view('tasks');
+    const previousTaskId = view?.dataset.activeTaskId || '';
+    const focusedElement = this.shell.root.activeElement;
+    const focusedPopover = this.shell.root.querySelector('.composer-popover');
+    const preserveFocus = Boolean(focusedElement)
+      && (view?.contains(focusedElement) || focusedPopover?.contains(focusedElement));
+    const focusSelection = preserveFocus && typeof focusedElement.selectionStart === 'number'
+      ? { start: focusedElement.selectionStart, end: focusedElement.selectionEnd }
+      : null;
+    const sameTask = Boolean(active) && previousTaskId === active.taskId;
+    const existingFollowUpComposer = view?.querySelector('.task-follow-up-card');
+    const existingComposer = view?.querySelector('.composer-root');
+    const followUpComposer = sameTask && existingFollowUpComposer && canFollowUp(active)
+      ? existingFollowUpComposer
+      : null;
+    const composer = !active && previousTaskId === '' && existingComposer?.updateComposer
+      ? existingComposer
+      : null;
+    if ((existingFollowUpComposer && existingFollowUpComposer !== followUpComposer)
+      || (existingComposer && existingComposer !== composer)) closeComposerPopover();
     const recent = state.tasks.slice(0, 5);
     const recentList = recent.length
       ? h('div', { class: 'list' }, ...recent.map((task) => h(
@@ -96,9 +148,20 @@ class App {
     this.shell.render(
       'tasks',
       active ? null : h('button', { class: 'primary wide', onclick: () => this.actions.showComposer() }, '＋ New task'),
-      ...(active ? renderTaskDetail(this, active) : renderComposer(this)),
+      ...(active
+        ? renderTaskDetail(this, active, { followUpComposer })
+        : composer ? [composer] : renderComposer(this)),
       active ? null : recentList,
     );
+    if (view) view.dataset.activeTaskId = active?.taskId || '';
+    if (active) followUpComposer?.updateTaskFollowUp?.(active);
+    else composer?.updateComposer?.();
+    if (preserveFocus && focusedElement?.isConnected) {
+      focusedElement.focus?.({ preventScroll: true });
+      if (focusSelection && typeof focusedElement.setSelectionRange === 'function') {
+        focusedElement.setSelectionRange(focusSelection.start, focusSelection.end);
+      }
+    }
   }
 
   renderSourceView() {
@@ -157,6 +220,15 @@ class App {
     if (['task-applied', 'task-rolled-back', 'task-conflicted'].includes(event.type)) {
       this.refreshSource().catch(() => {});
     }
+    if (event.task && event.task.taskId === this.store.state.activeTaskId
+      && (event.type === 'task-submitted'
+        || event.type === 'task-follow-up-submitted'
+        || event.type === 'task-follow-up-failed'
+        || event.type === 'task-follow-up-completed'
+        || event.type === 'task-chat-status' && ['completed', 'failed'].includes(event.chatStatus)
+        || event.type === 'result-ready')) {
+      this.refreshTaskConversation(event.task.taskId).catch(() => {});
+    }
     this.renderActiveView();
   }
 
@@ -190,8 +262,12 @@ class App {
         task.conversationId || conversationIdFromRouteUrl(task.conversationUrl)
       ) === conversationId)
       : null;
-    const running = tasks.find((task) => task.state === 'submitted');
-    if (current && (!current.answerOnly || current.state === 'submitted')) {
+    const running = tasks.find((task) => task.activeTurnId || task.state === 'submitted');
+    if (current) {
+      this.store.set({ activeTaskId: current.taskId }, 'silent');
+      this.store.resetFollowUp(current, 'silent');
+      this.store.setTaskConversation({ taskId: current.taskId, loading: true, error: null, messages: [] }, 'silent');
+      this.refreshTaskConversation(current.taskId).catch(() => {});
       this.driver.adoptTask(current);
     } else if (running) {
       this.driver.adoptTask(running);
@@ -319,6 +395,29 @@ class App {
     throw new Error('Patchwork rebuilt, but the restarted agent did not come back on this port.');
   }
 
+  async refreshTaskConversation(taskId) {
+    const task = this.store.task(taskId) || (await this.api.task(taskId)).task;
+    const conversationId = task?.conversationId || conversationIdFromRouteUrl(task?.conversationUrl);
+    if (!conversationId) {
+      this.store.setTaskConversation({ taskId, loading: false, error: 'This task has no saved ChatGPT conversation yet.', messages: [] }, 'task-conversation');
+      return [];
+    }
+    this.store.setTaskConversation({ taskId, loading: true, error: null }, 'task-conversation');
+    try {
+      const record = await chatgpt.conversation(conversationId);
+      const messages = conversationMessages(record);
+      if (this.store.state.activeTaskId === taskId) {
+        this.store.setTaskConversation({ taskId, loading: false, error: null, messages }, 'task-conversation');
+      }
+      return messages;
+    } catch (error) {
+      if (this.store.state.activeTaskId === taskId) {
+        this.store.setTaskConversation({ taskId, loading: false, error: error.message, messages: [] }, 'task-conversation');
+      }
+      return [];
+    }
+  }
+
   async refreshProjects(showErrors = false) {
     try {
       const projects = await chatgpt.listProjects();
@@ -342,8 +441,12 @@ class App {
       },
 
       showTask(taskId) {
+        const task = app.store.task(taskId);
+        if (task) app.store.resetFollowUp(task, 'silent');
+        app.store.setTaskConversation({ taskId, loading: true, error: null, messages: [] }, 'silent');
         app.store.set({ activeTaskId: taskId, activity: [] }, 'tasks');
         app.shell.show('tasks');
+        app.refreshTaskConversation(taskId).catch(() => {});
       },
 
       checkForUpdates() {
@@ -378,7 +481,7 @@ class App {
         }
       },
 
-      async chooseRepositories({ forSource = false } = {}) {
+      async chooseRepositories({ forSource = false, onDone = null } = {}) {
         openRepositoryPicker({
           shell: app.shell,
           api: app.api,
@@ -391,6 +494,7 @@ class App {
               const added = repositories.filter((repository) => paths.includes(repository.path));
               if (forSource) {
                 app.actions.selectSourceRepository(added[0]?.path || paths[0]);
+                onDone?.();
                 return;
               }
               const existing = app.store.state.composer.repositories;
@@ -400,16 +504,18 @@ class App {
               }
               app.store.setComposer({ repositories: merged });
               app.renderActiveView();
+              onDone?.();
             }, { success: 'Repository added.' });
           },
         });
       },
 
-      removeComposerRepository(path) {
+      removeComposerRepository(path, { onDone = null } = {}) {
         app.store.setComposer({
           repositories: app.store.state.composer.repositories.filter((item) => item.path !== path),
         });
         app.renderActiveView();
+        onDone?.();
       },
 
       async addAttachments(files) {
@@ -425,6 +531,43 @@ class App {
           });
           app.renderActiveView();
         }, { success: `${files.length} attachment${files.length === 1 ? '' : 's'} staged.` });
+      },
+
+      addFollowUpAttachments(files) {
+        if (!files?.length) return;
+        const current = app.store.state.followUp.attachments || [];
+        app.store.setFollowUp({ attachments: [...current, ...files] });
+        app.renderActiveView();
+      },
+
+      async sendFollowUp(taskId) {
+        const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
+        const followUp = app.store.state.followUp;
+        if (!task || followUp.taskId !== taskId) return null;
+        if (!canSendFollowUp(task, followUp)) {
+          app.toast('Finish the current follow-up before sending another message.', true);
+          return null;
+        }
+        const attachments = [...followUp.attachments];
+        return app.run(async () => {
+          const { task: prepared, turn } = await app.api.createFollowUp(taskId, {
+            prompt: followUp.taskText,
+            mode: followUp.mode,
+            model: followUp.model,
+            reasoningMode: followUp.reasoningMode,
+            skillIds: followUp.skillIds,
+            promptIds: followUp.promptIds,
+            attachments: attachments.map((file) => ({ name: file.name, size: file.size })),
+          });
+          app.store.upsertTask(prepared);
+          app.renderActiveView();
+          const submitted = await app.driver.submitFollowUp(prepared, turn, attachments);
+          app.store.upsertTask(submitted);
+          app.store.setFollowUp({ taskId, taskText: '', attachments: [], skillIds: [], promptIds: [] }, 'silent');
+          await app.refreshTaskConversation(taskId);
+          app.renderActiveView();
+          return submitted;
+        }, { failure: 'The follow-up could not be sent.' });
       },
 
       openSkillDrawer() {
@@ -480,24 +623,7 @@ class App {
               .find((project) => project.id === composer.projectSelection) || null;
           }
 
-          const input = {
-            taskText: composer.taskText,
-            repositories: composer.repositories.map((repository) => ({ path: repository.path })),
-            attachments: composer.attachments.map((attachment) => ({ path: attachment.path })),
-            skillIds: composer.skillIds,
-            promptIds: composer.promptIds,
-            model: composer.model,
-            reasoningMode: composer.reasoningMode,
-            includeIac: composer.includeIac,
-            answerOnly: composer.mode === 'ask',
-            chatgptProject,
-          };
-          if (composer.treeSelection === NEW_TREE_VALUE) {
-            input.createTree = true;
-            input.treeName = composer.treeName;
-          } else if (composer.treeSelection) {
-            input.treeId = composer.treeSelection;
-          }
+          const input = createTaskInput(composer, chatgptProject);
 
           const { task } = await app.api.createTask(input);
           app.store.upsertTask(task);
@@ -575,7 +701,7 @@ class App {
         const task = app.store.task(taskId);
         const confirmed = await app.shell.confirm({
           title: 'Delete task history?',
-          message: task?.state === 'submitted'
+          message: task?.state === 'submitted' || task?.activeTurnId
             ? 'This removes the saved task history. The running task stops being tracked, but the chat keeps going.'
             : 'This removes the saved task history and task package. It does not change the coding tree.',
           confirmLabel: 'Delete task',
@@ -860,9 +986,10 @@ class App {
     // Keep ChatGPT's composer in step when the choice is made in the dock instead.
     this.store.subscribe((state, reason) => {
       if (reason === 'composer' || reason === 'silent') {
+        const selection = state.activeTaskId ? state.followUp : state.composer;
         modelPicker.setSelection({
-          model: state.composer.model,
-          reasoningMode: state.composer.reasoningMode,
+          model: selection.model,
+          reasoningMode: selection.reasoningMode,
         });
       }
     });

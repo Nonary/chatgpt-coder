@@ -12,10 +12,13 @@ const {
 } = require('./git');
 const { IacService } = require('./iac-service');
 const { SkillService } = require('./skill-service');
+const { conversationIdFromRouteUrl, isChatGPTConversationUrl } = require('../../shared/chatgpt');
 
 const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
 const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high']);
+const FOLLOW_UP_MODES = new Set(['ask', 'agent']);
+const FOLLOW_UP_ACTIVE_STATES = new Set(['created', 'submitted', 'awaiting-result']);
 
 const DEFAULT_GIT_SUMMARY_PROMPT = `# Git Changes Review + Conventional Commit Prompt
 
@@ -63,6 +66,34 @@ function normalizeReasoningMode(value) {
   const mode = String(value || 'default').trim().toLowerCase();
   if (!REASONING_MODES.has(mode)) throw new Error(`Unsupported ChatGPT reasoning mode: ${value}`);
   return mode;
+}
+
+function normalizeFollowUpMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  if (!FOLLOW_UP_MODES.has(mode)) throw new Error(`Unsupported follow-up mode: ${value}`);
+  return mode;
+}
+
+function followUpTurn(task) {
+  const turns = Array.isArray(task?.turns) ? task.turns : [];
+  if (!task?.activeTurnId) return null;
+  return turns.find((turn) => turn.id === task.activeTurnId) || null;
+}
+
+function buildFollowUpPrompt(task, prompt, mode, skillIds = []) {
+  const text = String(prompt || '').trim();
+  if (!text) throw new Error('Describe the follow-up before sending it.');
+  const selectedSkills = new Set((Array.isArray(skillIds) ? skillIds : []).map((id) => String(id)));
+  const skills = (Array.isArray(task.skills) ? task.skills : [])
+    .filter((skill) => selectedSkills.has(String(skill.id)))
+    .map((skill) => skill.name || skill.id)
+    .filter(Boolean);
+  const skillNote = skills.length
+    ? `\n\nFor this turn, use these task-bound skills from the existing package when relevant: ${skills.map((name) => `\`/${name}\``).join(', ')}. Read each selected skill's \`SKILL.md\` before relying on it.`
+    : '';
+  if (mode === 'ask') return `${text}${skillNote}`;
+  const filename = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
+  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task. If that original package was created for Ask mode, this Agent follow-up supersedes that read-only instruction for this turn only. Do not create a second task identity.${skillNote}`;
 }
 
 function buildAgentInstructions(taskId, skills = [], options = {}) {
@@ -274,6 +305,7 @@ class TaskService {
     this.tasksRoot = path.join(dataRoot, 'tasks');
     this.skillService = skillService;
     this.iacService = iacService;
+    this.followUpCreationLocks = new Set();
   }
 
   async initialize() {
@@ -675,6 +707,8 @@ class TaskService {
       repositories: taskRepositories,
       state: 'prepared',
       result: null,
+      turns: [],
+      activeTurnId: null,
     };
     await this.saveTask(record);
     return record;
@@ -696,6 +730,214 @@ class TaskService {
     const next = { ...task, ...update, updatedAt: new Date().toISOString() };
     await this.saveTask(next);
     return next;
+  }
+
+  async createFollowUp(taskId, input = {}) {
+    if (this.followUpCreationLocks.has(taskId)) {
+      throw new Error('Another follow-up turn is already being created for this task.');
+    }
+    this.followUpCreationLocks.add(taskId);
+    try {
+      const task = await this.getTask(taskId);
+      if (task.summaryOnly) throw new Error('Git Summary tasks do not accept follow-up conversation turns.');
+      if (task.mergeResolution) throw new Error('Conflict-resolution tasks must use the existing resolution workflow.');
+      if (task.state === 'conflicted') throw new Error('Resolve the task conflict before starting a normal follow-up.');
+      if (task.state === 'failed') throw new Error('This task is in a failed state and cannot accept another follow-up.');
+      if (task.state === 'submitted') throw new Error('The task is still generating its current response. Wait for it to finish before starting a follow-up.');
+      if (task.applyInProgress) throw new Error('The task result is being applied. Wait for the apply operation to finish.');
+      if (followUpTurn(task)) throw new Error('Another follow-up turn is already active for this task.');
+      if (!isChatGPTConversationUrl(task.conversationUrl)) {
+        throw new Error('This task has no valid ChatGPT conversation for follow-up.');
+      }
+      const routeConversationId = conversationIdFromRouteUrl(task.conversationUrl);
+      if (task.conversationId && routeConversationId && task.conversationId !== routeConversationId) {
+        throw new Error('The saved ChatGPT conversation ID does not match the task conversation URL.');
+      }
+      const conversationId = task.conversationId || routeConversationId;
+      if (!conversationId) throw new Error('This task has no usable ChatGPT conversation ID for follow-up.');
+
+      const mode = normalizeFollowUpMode(input.mode);
+      const prompt = String(input.prompt || '').trim();
+      if (!prompt) throw new Error('Describe the follow-up before sending it.');
+      const resolvedPrompt = String(input.resolvedPrompt || prompt).trim();
+      const model = normalizeTaskModel(input.model ?? task.model);
+      const reasoningMode = normalizeReasoningMode(input.reasoningMode ?? task.reasoningMode);
+      const promptIds = Array.isArray(input.promptIds) ? input.promptIds.map((id) => String(id)).filter(Boolean) : [];
+      const taskSkillIds = new Set((Array.isArray(task.skills) ? task.skills : []).map((skill) => String(skill.id)));
+      const skillIds = Array.isArray(input.skillIds) ? input.skillIds.map((id) => String(id)).filter(Boolean) : [];
+      if (skillIds.some((id) => !taskSkillIds.has(id))) {
+        throw new Error('A follow-up can only reuse skills that were already included in the task package.');
+      }
+      const attachments = (Array.isArray(input.attachments) ? input.attachments : [])
+        .map((attachment) => ({
+          name: String(attachment?.name || '').trim().slice(0, 180),
+          size: Number.isFinite(Number(attachment?.size)) ? Number(attachment.size) : null,
+        }))
+        .filter((attachment) => attachment.name);
+      const createdAt = new Date().toISOString();
+      const turn = {
+        id: crypto.randomUUID(),
+        mode,
+        prompt,
+        resolvedPrompt,
+        model,
+        reasoningMode,
+        promptIds,
+        skillIds,
+        attachments,
+        state: 'created',
+        createdAt,
+        submittedAt: null,
+        completedAt: null,
+        failedAt: null,
+        error: null,
+        resultSourceFile: null,
+        conversationId,
+        conversationUrl: task.conversationUrl,
+        resumeState: task.state,
+        resumeChatStatus: task.chatStatus || null,
+      };
+
+      let repositories = task.repositories;
+      let resultFilename = task.resultFilename;
+      let resultTransport = task.resultTransport;
+      if (mode === 'agent' && task.answerOnly) {
+        repositories = (Array.isArray(task.repositories) ? task.repositories : []).map((repository) => ({
+          ...repository,
+          readOnly: false,
+        }));
+        resultFilename = resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
+        resultTransport = 'downloaded-text-file';
+      }
+
+      return this.updateTask(taskId, {
+        repositories,
+        resultFilename,
+        resultTransport,
+        conversationId,
+        turns: [...(Array.isArray(task.turns) ? task.turns : []), turn],
+        activeTurnId: turn.id,
+        chatStatus: 'streaming',
+        chatStatusRaw: 'IS_STREAMING',
+        chatFinishedAt: null,
+        error: null,
+      });
+    } finally {
+      this.followUpCreationLocks.delete(taskId);
+    }
+  }
+
+  async markFollowUpSubmitted(taskId, turnId, input = {}) {
+    const task = await this.getTask(taskId);
+    const turn = followUpTurn(task);
+    if (!turn || turn.id !== turnId) throw new Error('The follow-up turn is no longer active.');
+    if (!['created', 'submitted'].includes(turn.state)) throw new Error('The follow-up turn is no longer waiting to be submitted.');
+    const submittedAt = turn.submittedAt || new Date().toISOString();
+    const turns = (task.turns || []).map((item) => (item.id === turnId
+      ? {
+        ...item,
+        state: 'submitted',
+        submittedAt,
+        conversationId: input.conversationId || item.conversationId || task.conversationId || null,
+        model: input.model || item.model,
+        reasoningMode: input.reasoningMode || item.reasoningMode,
+        error: null,
+      }
+      : item));
+    return this.updateTask(taskId, {
+      turns,
+      conversationId: input.conversationId || task.conversationId || turn.conversationId || null,
+      chatStatus: 'streaming',
+      chatStatusRaw: 'IS_STREAMING',
+      chatFinishedAt: null,
+      error: null,
+    });
+  }
+
+  async updateFollowUpChatStatus(taskId, status, conversationId = null, message = null) {
+    const task = await this.getTask(taskId);
+    const turn = followUpTurn(task);
+    if (!turn) {
+      return this.updateTask(taskId, {
+        conversationId: conversationId || task.conversationId || null,
+        chatStatus: status,
+        chatStatusRaw: status === 'streaming' ? 'IS_STREAMING' : status === 'failed' ? 'FAILURE' : 'COMPLETED',
+        chatFinishedAt: status === 'streaming' ? null : task.chatFinishedAt || new Date().toISOString(),
+      });
+    }
+    const now = new Date().toISOString();
+    const turns = (task.turns || []).map((item) => {
+      if (item.id !== turn.id) return item;
+      if (status === 'streaming') return { ...item, state: 'submitted', error: null };
+      if (status === 'failed') return {
+        ...item,
+        state: 'failed',
+        failedAt: now,
+        completedAt: null,
+        error: message || 'ChatGPT stopped before completing the follow-up.',
+      };
+      if (turn.mode === 'agent') return {
+        ...item,
+        state: 'awaiting-result',
+        completedAt: null,
+        error: null,
+      };
+      return {
+        ...item,
+        state: 'completed',
+        completedAt: now,
+        error: null,
+      };
+    });
+    const completed = status === 'completed' && turn.mode === 'ask';
+    const failed = status === 'failed';
+    const nextState = completed && !task.result && ['prepared', 'submitted'].includes(task.state)
+      ? 'completed'
+      : task.state;
+    return this.updateTask(taskId, {
+      state: failed ? task.state : nextState,
+      conversationId: conversationId || task.conversationId || turn.conversationId || null,
+      chatStatus: status,
+      chatStatusRaw: status === 'streaming' ? 'IS_STREAMING' : status === 'failed' ? 'FAILURE' : 'COMPLETED',
+      chatFinishedAt: status === 'streaming' ? null : now,
+      turns,
+      activeTurnId: completed || failed ? null : turn.id,
+      error: failed ? (message || 'ChatGPT stopped before completing the follow-up.') : null,
+    });
+  }
+
+  async failFollowUp(taskId, turnId, message) {
+    const task = await this.getTask(taskId);
+    const turn = followUpTurn(task);
+    if (!turn || turn.id !== turnId) throw new Error('The follow-up turn is no longer active.');
+    return this.updateFollowUpChatStatus(taskId, 'failed', null, message);
+  }
+
+  async completeFollowUpResult(taskId, turnId, resultSourceFile, taskState = null) {
+    const task = await this.getTask(taskId);
+    const turn = followUpTurn(task);
+    if (!turn || turn.id !== turnId) return task;
+    const now = new Date().toISOString();
+    const turns = (task.turns || []).map((item) => (item.id === turnId
+      ? {
+        ...item,
+        state: ['failed', 'conflicted'].includes(taskState || task.state) ? 'failed' : 'completed',
+        completedAt: ['failed', 'conflicted'].includes(taskState || task.state) ? null : now,
+        failedAt: ['failed', 'conflicted'].includes(taskState || task.state) ? now : null,
+        error: ['failed', 'conflicted'].includes(taskState || task.state)
+          ? (task.error || 'The follow-up result could not be applied.')
+          : null,
+        resultSourceFile: resultSourceFile || item.resultSourceFile || null,
+      }
+      : item));
+    return this.updateTask(taskId, {
+      turns,
+      activeTurnId: null,
+      chatStatus: ['failed', 'conflicted'].includes(taskState || task.state) ? 'failed' : 'completed',
+      chatStatusRaw: ['failed', 'conflicted'].includes(taskState || task.state) ? 'FAILURE' : 'COMPLETED',
+      chatFinishedAt: task.chatFinishedAt || now,
+      error: ['failed', 'conflicted'].includes(taskState || task.state) ? task.error : null,
+    });
   }
 
   async setTarget(taskId, target = {}) {
@@ -753,6 +995,7 @@ class TaskService {
 }
 
 module.exports = {
+  FOLLOW_UP_ACTIVE_STATES,
   SCHEMA_VERSION,
   TaskService,
   buildAgentInstructions,
@@ -760,4 +1003,7 @@ module.exports = {
   DEFAULT_GIT_SUMMARY_PROMPT,
   resolveGitSummaryPrompt,
   resolveTreeTaskRepositories,
+  buildFollowUpPrompt,
+  followUpTurn,
+  normalizeFollowUpMode,
 };

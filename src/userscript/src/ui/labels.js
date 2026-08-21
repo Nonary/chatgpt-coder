@@ -41,6 +41,19 @@ const STATUS_TEXT = {
   failed: ['Task needs attention', 'Stopped before making unsafe or conflicting changes.'],
 };
 
+function latestTaskTurn(task) {
+  const turns = Array.isArray(task?.turns) ? task.turns : [];
+  if (task?.activeTurnId) {
+    const active = turns.find((turn) => turn.id === task.activeTurnId);
+    if (active) return active;
+  }
+  return turns[turns.length - 1] || null;
+}
+
+function taskMode(task) {
+  return latestTaskTurn(task)?.mode || (task?.answerOnly ? 'ask' : 'agent');
+}
+
 function taskLabel(task) {
   if (task.summaryOnly) {
     const repositoryName = task.repositories?.[0]?.name;
@@ -50,6 +63,12 @@ function taskLabel(task) {
 }
 
 function taskStateLabel(task) {
+  const activeTurn = task?.activeTurnId ? latestTaskTurn(task) : null;
+  if (activeTurn) {
+    if (activeTurn.state === 'failed') return 'Needs attention';
+    return 'Running';
+  }
+  if (latestTaskTurn(task)?.state === 'failed') return 'Needs attention';
   if (task.summaryOnly) {
     if (task.state === 'completed') return 'Summary applied';
     if (task.state === 'ready') return 'Summary ready';
@@ -64,7 +83,27 @@ function taskStateLabel(task) {
 }
 
 function taskStatusText(task) {
-  if (task.answerOnly) {
+  const activeTurn = task?.activeTurnId ? latestTaskTurn(task) : null;
+  if (activeTurn) {
+    if (activeTurn.state === 'failed') {
+      return ['Follow-up needs attention', activeTurn.error || 'The follow-up failed without changing the prior task result.'];
+    }
+    if (activeTurn.mode === 'agent' && activeTurn.state === 'awaiting-result') {
+      return ['Agent response complete', 'ChatGPT finished the follow-up. Checking the conversation for its cumulative Patchwork result.'];
+    }
+    if (activeTurn.mode === 'agent') {
+      return ['Agent follow-up is running', 'The response is still generating in the existing task conversation.'];
+    }
+    if (activeTurn.state === 'created') {
+      return ['Ask follow-up queued', 'The saved follow-up is ready to send into the existing task conversation.'];
+    }
+    return ['Ask follow-up is running', 'The response is still generating in the existing task conversation. No result file is expected.'];
+  }
+  const latestTurn = latestTaskTurn(task);
+  if (latestTurn?.state === 'failed') {
+    return ['Follow-up needs attention', latestTurn.error || 'The follow-up failed without changing the prior task result.'];
+  }
+  if (task.answerOnly && taskMode(task) === 'ask') {
     if (task.state === 'completed') {
       return ['Ask complete', 'The detailed response is finished in the conversation.'];
     }
@@ -123,7 +162,7 @@ function taskConfigurationLabel(task) {
   const iac = iacCount ? ` · ${iacCount} IaC` : '';
   const model = MODEL_LABELS[task.model || 'default'] || task.model;
   const reasoning = REASONING_LABELS[task.reasoningMode || 'default'] || task.reasoningMode;
-  const mode = task.summaryOnly ? '' : ` · ${TASK_MODE_LABELS[task.answerOnly ? 'ask' : 'agent']}`;
+  const mode = task.summaryOnly ? '' : ` · ${TASK_MODE_LABELS[taskMode(task)]}`;
   return `${model} · ${reasoning}${mode}${skills}${iac}`;
 }
 
@@ -139,6 +178,8 @@ module.exports = {
   MODEL_LABELS,
   REASONING_LABELS,
   TASK_MODE_LABELS,
+  latestTaskTurn,
+  taskMode,
   STATE_LABELS,
   STATUS_TEXT,
   bundledIacCount,

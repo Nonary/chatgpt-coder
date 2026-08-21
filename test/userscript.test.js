@@ -471,9 +471,180 @@ test('task labels and states match the states the agent can report', () => {
   );
 });
 
+test('composer mode maps Ask and Agent to the existing answer-only task contract', () => {
+  const { createTaskInput } = require('../src/userscript/src/task-input');
+  const composer = {
+    taskText: 'Explain the parser.',
+    repositories: [{ path: 'C:/repo' }],
+    attachments: [],
+    skillIds: [],
+    promptIds: [],
+    model: 'default',
+    reasoningMode: 'default',
+    includeIac: false,
+    treeSelection: '',
+    treeName: '',
+    mode: 'ask',
+  };
+
+  assert.equal(createTaskInput(composer).answerOnly, true);
+  assert.equal(createTaskInput({ ...composer, mode: 'agent' }).answerOnly, false);
+});
+
+test('composer command state stays ID-backed for skills and saved prompts', () => {
+  const {
+    appendPromptId,
+    appendSkillId,
+    filterComposerCommands,
+    findSlashCommand,
+    promptCommandName,
+    removePromptId,
+    removeSlashCommandToken,
+    removeSkillId,
+  } = require('../src/userscript/src/ui/composer-controls');
+
+  assert.deepEqual(appendSkillId([], 'skill-123'), ['skill-123']);
+  assert.deepEqual(appendSkillId(['skill-123'], 'skill-123'), ['skill-123']);
+  assert.deepEqual(removeSkillId(['skill-123', 'skill-456'], 'skill-123'), ['skill-456']);
+  assert.deepEqual(appendPromptId([], 'prompt-123'), ['prompt-123']);
+  assert.deepEqual(appendPromptId(['prompt-123'], 'prompt-123'), ['prompt-123']);
+  assert.deepEqual(removePromptId(['prompt-123', 'prompt-456'], 'prompt-123'), ['prompt-456']);
+  assert.equal(promptCommandName({ name: 'Architecture Review' }), 'architecture-review');
+
+  const commands = [
+    { type: 'skill', id: 'skill-1', name: 'code-review', search: 'Code Review', description: 'Review changes for maintainability.' },
+    { type: 'prompt', id: 'prompt-1', name: 'git-summary', search: 'Git Summary', description: 'Summarize current changes.' },
+  ];
+  assert.deepEqual(filterComposerCommands(commands, 'maintainability'), [commands[0]]);
+  assert.deepEqual(filterComposerCommands(commands, 'Git Summary'), [commands[1]]);
+
+  assert.equal(findSlashCommand('/code-review').query, 'code-review');
+  assert.equal(findSlashCommand('Please /code-review here').query, 'code-review');
+  assert.equal(findSlashCommand('https://example.com/code'), null);
+  assert.equal(findSlashCommand('C:/repo/src'), null);
+  assert.equal(findSlashCommand('/repo/src'), null);
+
+  const token = findSlashCommand('Please /code-review here');
+  assert.deepEqual(removeSlashCommandToken('Please /code-review here', token), {
+    text: 'Please here',
+    cursor: 7,
+  });
+});
+
+test('composer target summary reflects the real selected tree, repository, and project state', () => {
+  const { composerTargetSummary } = require('../src/userscript/src/ui/views/composer');
+  const state = {
+    trees: [],
+    projects: [{ id: 'project-1', name: 'Coding tasks' }],
+    composer: {
+      repositories: [{ name: 'sunshine', path: 'C:/sunshine', branch: 'v3' }],
+      treeSelection: '',
+      treeName: '',
+      projectSelection: 'project-1',
+      newProjectName: '',
+    },
+  };
+
+  assert.equal(composerTargetSummary(state), 'sunshine · v3 · Coding tasks');
+  state.trees = [{ id: 'tree-1', name: 'Modern source control', repositoryName: 'sunshine' }];
+  state.composer.treeSelection = 'tree-1';
+  assert.equal(composerTargetSummary(state), 'Modern source control · Coding tasks');
+  state.composer.treeSelection = '__new__';
+  state.composer.treeName = 'Parser repair';
+  assert.equal(composerTargetSummary(state), 'New tree · Parser repair · Coding tasks');
+});
+
 test('new task composers default to Ask mode', () => {
   const { Store } = require('../src/userscript/src/store');
   assert.equal(new Store().state.composer.mode, 'ask');
+});
+
+test('task-detail send path persists and sends a follow-up without creating a new task', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'), 'utf8');
+  assert.match(source, /async sendFollowUp\(taskId\)/);
+  assert.match(source, /app\.api\.createFollowUp\(taskId/);
+  assert.match(source, /app\.driver\.submitFollowUp\(prepared, turn, attachments\)/);
+  const start = source.indexOf('async sendFollowUp(taskId)');
+  const end = source.indexOf('\n      openSkillDrawer()', start);
+  const sendFollowUpSource = source.slice(start, end);
+  assert.doesNotMatch(sendFollowUpSource, /app\.api\.createTask\(/);
+  assert.match(source, /setFollowUp\(\{ taskId, taskText: '', attachments: \[\], skillIds: \[\], promptIds: \[\] \}, 'silent'\)/);
+});
+
+test('follow-up composer state stays separate from the new-task composer', () => {
+  const { Store } = require('../src/userscript/src/store');
+  const store = new Store();
+  store.setComposer({ taskText: 'new task draft' });
+  store.resetFollowUp({
+    taskId: 'task-1',
+    answerOnly: true,
+    model: 'sol',
+    reasoningMode: 'medium',
+  }, 'test');
+
+  store.setFollowUp({ taskText: 'follow-up draft', mode: 'agent' }, 'test');
+  assert.equal(store.state.composer.taskText, 'new task draft');
+  assert.equal(store.state.followUp.taskText, 'follow-up draft');
+  assert.equal(store.state.followUp.mode, 'agent');
+  assert.equal(store.state.followUp.model, 'sol');
+  assert.equal(store.state.followUp.reasoningMode, 'medium');
+});
+
+test('follow-up composer is unavailable while the original task is still generating', () => {
+  const { canFollowUp } = require('../src/userscript/src/ui/views/task-follow-up');
+  assert.equal(canFollowUp({ taskId: 'running', state: 'submitted', conversationId: 'conversation-1' }), false);
+  assert.equal(canFollowUp({ taskId: 'ready', state: 'ready', conversationId: 'conversation-1' }), true);
+});
+
+test('task mode follows the active or last durable turn before legacy answerOnly', () => {
+  const { taskMode } = require('../src/userscript/src/ui/labels');
+  assert.equal(taskMode({ taskId: 'ask', answerOnly: true }), 'ask');
+  assert.equal(taskMode({ taskId: 'agent', answerOnly: false }), 'agent');
+  assert.equal(taskMode({ taskId: 'mixed', answerOnly: true, turns: [
+    { id: '1', mode: 'ask', state: 'completed' },
+    { id: '2', mode: 'agent', state: 'completed' },
+  ] }), 'agent');
+  assert.equal(taskMode({
+    taskId: 'active-ask',
+    answerOnly: false,
+    activeTurnId: '2',
+    turns: [
+      { id: '1', mode: 'agent', state: 'completed' },
+      { id: '2', mode: 'ask', state: 'submitted' },
+    ],
+  }), 'ask');
+});
+
+test('failed follow-up turns remain visible without poisoning the overall task state', () => {
+  const { taskStateLabel, taskStatusText } = require('../src/userscript/src/ui/labels');
+  const task = {
+    taskId: 'failed-follow-up',
+    answerOnly: false,
+    state: 'applied',
+    error: 'prior task error should not replace the turn error',
+    turns: [{
+      id: 'turn-1',
+      mode: 'agent',
+      state: 'failed',
+      error: 'The follow-up result was stale.',
+    }],
+  };
+
+  assert.equal(taskStateLabel(task), 'Needs attention');
+  assert.deepEqual(taskStatusText(task), [
+    'Follow-up needs attention',
+    'The follow-up result was stale.',
+  ]);
+});
+
+test('mixed Ask follow-ups keep Agent result actions available', () => {
+  const { taskHasAgentTurn } = require('../src/userscript/src/ui/views/task-detail');
+  assert.equal(taskHasAgentTurn({ answerOnly: false, turns: [{ mode: 'ask', state: 'completed' }] }), true);
+  assert.equal(taskHasAgentTurn({ answerOnly: true, turns: [{ mode: 'ask', state: 'completed' }] }), false);
+  assert.equal(taskHasAgentTurn({ answerOnly: true, turns: [
+    { mode: 'agent', state: 'completed' },
+    { mode: 'ask', state: 'completed' },
+  ] }), true);
 });
 
 test('ready task results name the repository or coding tree they will apply to', () => {

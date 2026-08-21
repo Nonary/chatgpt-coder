@@ -114,6 +114,24 @@ class Api {
 
   createTask(input) { return this.post('/v1/tasks', input, { timeout: 300_000 }); }
 
+  createFollowUp(taskId, input) {
+    return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/follow-ups`, input, { timeout: 300_000 });
+  }
+
+  followUpSubmitted(taskId, turnId, input = {}) {
+    return this.post(
+      `/v1/tasks/${encodeURIComponent(taskId)}/follow-ups/${encodeURIComponent(turnId)}/submitted`,
+      input,
+    );
+  }
+
+  followUpFailed(taskId, turnId, message) {
+    return this.post(
+      `/v1/tasks/${encodeURIComponent(taskId)}/follow-ups/${encodeURIComponent(turnId)}/failed`,
+      { message },
+    );
+  }
+
   deleteTask(taskId) { return this.remove(`/v1/tasks/${encodeURIComponent(taskId)}`); }
 
   taskPackage(taskId) {
