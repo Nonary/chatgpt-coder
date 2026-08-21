@@ -209,25 +209,34 @@ class Driver {
       || conversationIdFromRouteUrl(location.href);
   }
 
-  async reconcileTask(task) {
+  async reconcileTask(task, { knownStatus = null } = {}) {
     const conversationId = this.conversationIdFor(task);
     if (!conversationId) return;
-    if (task.answerOnly) {
-      await this.api.taskChatStatus(task.taskId, { status: 'completed', conversationId }).catch(() => {});
-      this.activeTaskId = null;
-      return null;
+    const record = await chatgpt.conversation(conversationId).catch(() => null);
+    const status = chatgpt.conversationCompletionStatus(record) || knownStatus;
+    let statusTask = null;
+    if (status) {
+      const result = await this.api.taskChatStatus(task.taskId, { status, conversationId }).catch(() => null);
+      statusTask = result?.task || null;
     }
-    return this.ingestTaskResult(task, conversationId).catch((error) => {
+    if (task.answerOnly) {
+      if (!status) return null;
+      this.activeTaskId = null;
+      return statusTask || task;
+    }
+    return this.ingestTaskResult(statusTask || task, conversationId, record).catch((error) => {
       this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
       return null;
     });
   }
 
-  async ingestTaskResult(task, conversationId) {
+  async ingestTaskResult(task, conversationId, record = undefined) {
     const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
     const expected = expectedName.toLowerCase();
-    const record = await chatgpt.conversation(conversationId).catch(() => null);
-    const file = (record && chatgpt.findGeneratedFile(record, (candidate) => {
+    const conversationRecord = record === undefined
+      ? await chatgpt.conversation(conversationId).catch(() => null)
+      : record;
+    const file = (conversationRecord && chatgpt.findGeneratedFile(conversationRecord, (candidate) => {
       const name = candidate.name.toLowerCase();
       return name === expected || resultTaskId(name) === String(task.taskId).toLowerCase();
     }))
@@ -240,14 +249,14 @@ class Driver {
       taskId: task.taskId,
       message: `Downloading ${file.name}…`,
     });
-    const text = await chatgpt.downloadFileText(file.id);
+    const text = await chatgpt.downloadFileText(file, conversationId);
     const { task: updated } = await this.api.taskResult(task.taskId, text);
     this.activeTaskId = updated.state === 'submitted' ? updated.taskId : null;
     return updated;
   }
 
   async ingestDomResult(task, file) {
-    const text = await chatgpt.downloadFileText(file.id);
+    const text = await chatgpt.downloadFileText(file);
     const { task: updated } = await this.api.taskResult(task.taskId, text);
     this.activeTaskId = updated.state === 'submitted' ? updated.taskId : null;
     return updated;
@@ -267,7 +276,7 @@ class Driver {
       settled = true;
       this.stopDomWatch?.();
       this.stopDomWatch = null;
-      const updated = await this.reconcileTask(task);
+      const updated = await this.reconcileTask(task, { knownStatus: 'completed' });
       if (!updated && !task.answerOnly && generation === this.watchGeneration) {
         settled = false;
         this.stopDomWatch = resultScan.observeConversation({
@@ -301,19 +310,9 @@ class Driver {
     if (recovery) {
       // Recovery is a single reconciliation read. If the conversation is still
       // open, the DOM observer above will finish the task without API polling.
-      if (task.answerOnly) {
-        chatgpt.conversation(conversationId).then((record) => {
-          const status = chatgpt.conversationCompletionStatus(record);
-          if (!status) return;
-          return this.api.taskChatStatus(task.taskId, { status, conversationId });
-        }).then((result) => {
-          if (result) this.stop();
-        }).catch(() => {});
-      } else {
-        this.ingestTaskResult(task, conversationId).then((updated) => {
-          if (updated) this.stop();
-        }).catch(() => {});
-      }
+      this.reconcileTask(task).then((updated) => {
+        if (updated) this.stop();
+      }).catch(() => {});
     }
   }
 
@@ -342,7 +341,7 @@ class Driver {
     if (!file) return null;
     const treeId = this.activeMerge.treeId;
     this.activeMerge = null;
-    const text = await chatgpt.downloadFileText(file.id);
+    const text = await chatgpt.downloadFileText(file, conversationId);
     await this.api.treeMergeResult(treeId, text);
     return true;
   }
@@ -359,7 +358,7 @@ class Driver {
         if (generation !== this.watchGeneration || !this.activeMerge) return;
         const treeId = this.activeMerge.treeId;
         this.activeMerge = null;
-        chatgpt.downloadFileText(file.id)
+        chatgpt.downloadFileText(file)
           .then((text) => this.api.treeMergeResult(treeId, text))
           .catch(() => {});
       },

@@ -1,6 +1,9 @@
 const { authorizedFetch } = require('./session');
 const { CHATGPT_PROJECT_ID_PATTERN, chatGPTProjectUrl } = require('../../../shared/chatgpt');
 
+const SANDBOX_LINK_PATTERN = /\]\(sandbox:([^)]+)\)/gi;
+const SANDBOX_DOWNLOAD_ATTEMPTS = 6;
+
 async function readJson(response, what) {
   const text = await response.text();
   let data = {};
@@ -100,6 +103,19 @@ function messageAttachments(message) {
     }
   }
   for (const part of message?.content?.parts || []) {
+    if (typeof part === 'string') {
+      for (const match of part.matchAll(SANDBOX_LINK_PATTERN)) {
+        let sandboxPath = String(match[1] || '').trim();
+        try {
+          sandboxPath = decodeURI(sandboxPath);
+        } catch {
+          // Keep the literal path when ChatGPT emitted invalid percent encoding.
+        }
+        const name = sandboxPath.split(/[\/\\]/).pop();
+        if (name) files.push({ name, sandboxPath, size: null });
+      }
+      continue;
+    }
     if (!part || typeof part !== 'object') continue;
     const pointer = String(part.asset_pointer || '');
     const id = pointer.startsWith('file-service://') ? pointer.slice('file-service://'.length) : part.file_id;
@@ -127,16 +143,52 @@ function findGeneratedFile(conversationRecord, predicate) {
   return matches[0] || null;
 }
 
-async function downloadFileText(fileId) {
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function downloadText(downloadUrl) {
+  const response = await fetch(downloadUrl, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`The generated result file could not be downloaded (${response.status}).`);
+  return response.text();
+}
+
+async function downloadSandboxFileText(file, conversationId) {
+  if (!conversationId || !file?.messageId || !file?.sandboxPath) {
+    throw new Error('The generated sandbox file is missing its conversation download context.');
+  }
+  const query = new URLSearchParams({
+    message_id: String(file.messageId),
+    sandbox_path: String(file.sandboxPath),
+  });
+  const endpoint = `/backend-api/conversation/${encodeURIComponent(conversationId)}/interpreter/download?${query}`;
+
+  for (let attempt = 0; attempt < SANDBOX_DOWNLOAD_ATTEMPTS; attempt += 1) {
+    const data = await readJson(await authorizedFetch(endpoint), 'sandbox file download');
+    const downloadUrl = data?.download_url || data?.url;
+    if (downloadUrl) return downloadText(downloadUrl);
+    const status = String(data?.status || '').toLowerCase();
+    if (!['retry', 'pending'].some((value) => status.includes(value))) break;
+    if (attempt + 1 < SANDBOX_DOWNLOAD_ATTEMPTS) {
+      await wait(Math.min(250 * (2 ** attempt), 2_000));
+    }
+  }
+  throw new Error('No download URL came back for the generated sandbox result file.');
+}
+
+async function downloadFileText(fileOrId, conversationId = null) {
+  if (fileOrId && typeof fileOrId === 'object' && fileOrId.sandboxPath) {
+    return downloadSandboxFileText(fileOrId, conversationId);
+  }
+  const fileId = typeof fileOrId === 'object' ? fileOrId?.id : fileOrId;
+  if (!fileId) throw new Error('The generated result file has no downloadable identifier.');
   const data = await readJson(
     await authorizedFetch(`/backend-api/files/${encodeURIComponent(fileId)}/download`),
     'file download',
   );
   const downloadUrl = data?.download_url || data?.url;
   if (!downloadUrl) throw new Error('No download URL came back for the result file.');
-  const response = await fetch(downloadUrl, { cache: 'no-store' });
-  if (!response.ok) throw new Error(`The generated result file could not be downloaded (${response.status}).`);
-  return response.text();
+  return downloadText(downloadUrl);
 }
 
 module.exports = {

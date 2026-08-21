@@ -11,6 +11,8 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.doesNotMatch(source, /CONVERSATION_SWEEP_MILLISECONDS/);
   assert.match(source, /responseComplete/);
   assert.match(source, /observeConversation/);
+  assert.match(source, /knownStatus: 'completed'/);
+  assert.match(source, /taskChatStatus/);
   assert.match(source, /Recovery is a single reconciliation read/);
 
   const apiSource = fs.readFileSync(
@@ -18,6 +20,8 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
     'utf8',
   );
   assert.doesNotMatch(apiSource, /stream_status/);
+  assert.match(apiSource, /interpreter\/download/);
+  assert.match(apiSource, /sandbox_path/);
 });
 
 test('the model picker reacts to real DOM changes without a periodic remount guard', () => {

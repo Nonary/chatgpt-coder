@@ -240,6 +240,28 @@ test('generated result files are found in the conversation record, newest first'
   assert.equal(findGeneratedFile(record, () => false), null);
 });
 
+test('generated sandbox result links retain message context for direct download', () => {
+  const { findGeneratedFile } = require('../src/userscript/src/chatgpt/api');
+  const record = {
+    mapping: {
+      answer: {
+        message: {
+          id: 'answer-message',
+          create_time: 20,
+          author: { role: 'assistant' },
+          content: {
+            parts: ['Done. [Download result](sandbox:/mnt/data/chatgpt-ide-result-2.txt)'],
+          },
+        },
+      },
+    },
+  };
+
+  const found = findGeneratedFile(record, (file) => file.name === 'chatgpt-ide-result-2.txt');
+  assert.equal(found.sandboxPath, '/mnt/data/chatgpt-ide-result-2.txt');
+  assert.equal(found.messageId, 'answer-message');
+});
+
 test('request-limit notices are dismissed but ordinary ChatGPT dialogs are not', () => {
   const notices = require('../src/userscript/src/chatgpt/notices');
   assert.equal(notices.isDismissibleLimitNotice('You have reached your daily message limit'), true);
@@ -415,13 +437,16 @@ test('task labels and states match the states the agent can report', () => {
 });
 
 test('ready task results name the repository or coding tree they will apply to', () => {
-  const { applyActionLabel } = require('../src/userscript/src/ui/views/task-detail');
+  const { applyActionLabel, taskTargetValue } = require('../src/userscript/src/ui/views/task-detail');
 
   assert.equal(applyActionLabel({ treeId: null }), 'Apply to original repository');
   assert.equal(
     applyActionLabel({ treeId: 'tree-123', treeName: 'Parser repair' }),
     'Apply to coding tree: Parser repair',
   );
+  assert.equal(taskTargetValue({ treeId: null }, []), '');
+  assert.equal(taskTargetValue({ treeId: 'tree-123' }, [{ id: 'tree-123', available: true }]), 'tree-123');
+  assert.equal(taskTargetValue({ treeId: 'tree-123' }, []), '__missing__');
 });
 
 test('repository search remembers unique paths and ranks names before path-only matches', () => {

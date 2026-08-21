@@ -6,6 +6,7 @@ const {
 } = require('../labels');
 
 const NEW_TREE_VALUE = '__new__';
+const MISSING_TREE_VALUE = '__missing__';
 
 function canChangeTaskTarget(task) {
   return Boolean(task)
@@ -20,6 +21,13 @@ function applyActionLabel(task) {
   return 'Apply to original repository';
 }
 
+function taskTargetValue(task, trees) {
+  if (!task?.treeId) return '';
+  return trees.some((tree) => tree.id === task.treeId && tree.available)
+    ? task.treeId
+    : MISSING_TREE_VALUE;
+}
+
 function renderTargetCard(ctx, task) {
   if (!canChangeTaskTarget(task)) return null;
   const { trees } = ctx.store.state;
@@ -30,7 +38,7 @@ function renderTargetCard(ctx, task) {
     .filter((tree) => tree.available && tree.mergeState !== 'submitted')
     .filter((tree) => !sourcePath || tree.repositoryPath === sourcePath);
   const currentTree = task.treeId ? trees.find((tree) => tree.id === task.treeId) : null;
-  const currentValue = currentTree?.available ? task.treeId : '';
+  const currentValue = taskTargetValue(task, trees);
 
   const treeNameInput = h('input', {
     type: 'text', class: 'field-control', maxlength: 80, placeholder: 'For example: Fix task target',
@@ -63,7 +71,7 @@ function renderTargetCard(ctx, task) {
     },
     option('', 'Use original repository', currentValue === ''),
     task.treeId && !currentTree?.available
-      ? h('option', { value: '', disabled: true }, `Missing worktree: ${task.treeName || task.treeId}`)
+      ? h('option', { value: MISSING_TREE_VALUE, disabled: true, selected: true }, `Missing worktree: ${task.treeName || task.treeId}`)
       : null,
     option(NEW_TREE_VALUE, 'Create a new coding tree'),
     ...availableTrees.map((tree) => option(
@@ -205,4 +213,4 @@ function renderTaskDetail(ctx, task) {
   ];
 }
 
-module.exports = { applyActionLabel, canChangeTaskTarget, renderTaskDetail };
+module.exports = { applyActionLabel, canChangeTaskTarget, renderTaskDetail, taskTargetValue };
