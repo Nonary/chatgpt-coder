@@ -397,7 +397,7 @@ test('answer-only tasks complete with the ChatGPT response and reject result upl
     text: 'PATCHWORK_RESULT_V1',
   });
   assert.equal(result.status, 400);
-  assert.match(result.payload.error, /answer-only tasks do not accept/i);
+  assert.match(result.payload.error, /ask tasks do not accept/i);
 });
 
 test('a result envelope for a different task is refused before anything is applied', async (context) => {

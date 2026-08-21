@@ -34,12 +34,21 @@ class Driver {
     this.activeMerge = null;
     this.watchGeneration = 0;
     this.stopDomWatch = null;
+    this.seenTaskResultFiles = new Map();
   }
 
   stop() {
     this.watchGeneration += 1;
     this.stopDomWatch?.();
     this.stopDomWatch = null;
+  }
+
+  forgetTask(taskId) {
+    if (this.activeTaskId === taskId) {
+      this.stop();
+      this.activeTaskId = null;
+    }
+    this.seenTaskResultFiles.delete(taskId);
   }
 
   async submitTask(task, { project = undefined } = {}) {
@@ -205,6 +214,57 @@ class Driver {
       || conversationIdFromRouteUrl(location.href);
   }
 
+  canWatchTask(task) {
+    const conversationId = task?.conversationId || conversationIdFromRouteUrl(task?.conversationUrl);
+    if (!task || !conversationId) return false;
+    return task.answerOnly ? task.state === 'submitted' : true;
+  }
+
+  resultFileSet(taskId) {
+    let files = this.seenTaskResultFiles.get(taskId);
+    if (!files) {
+      files = new Set();
+      this.seenTaskResultFiles.set(taskId, files);
+    }
+    return files;
+  }
+
+  rememberResultFile(taskId, file) {
+    const key = chatgpt.resultFileKey(file);
+    if (key) this.resultFileSet(taskId).add(key);
+  }
+
+  hasSeenResultFile(taskId, file) {
+    const key = chatgpt.resultFileKey(file);
+    return Boolean(key && this.resultFileSet(taskId).has(key));
+  }
+
+  resultFileMatches(task, candidate) {
+    const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
+    const expected = expectedName.toLowerCase();
+    const name = String(candidate?.name || '').toLowerCase();
+    return name === expected || resultTaskId(name) === String(task.taskId).toLowerCase();
+  }
+
+  latestTaskResultFile(task, conversationRecord, { includeSeen = false } = {}) {
+    const files = chatgpt.findGeneratedFiles(
+      conversationRecord,
+      (candidate) => this.resultFileMatches(task, candidate),
+    );
+    if (files.length === 0) return null;
+
+    const newest = files[0];
+    // Follow-up results are cumulative, so when several accumulated while the
+    // page was closed only the newest one should be ingested. Mark the older
+    // generated files as consumed so a DOM fallback cannot regress the task.
+    for (const older of files.slice(1)) this.rememberResultFile(task.taskId, older);
+    const currentSourceKey = chatgpt.resultFileKey(task.result?.sourceFile);
+    const newestKey = chatgpt.resultFileKey(newest);
+    if (currentSourceKey && newestKey === currentSourceKey) this.rememberResultFile(task.taskId, newest);
+    if (!includeSeen && this.hasSeenResultFile(task.taskId, newest)) return null;
+    return newest;
+  }
+
   async reconcileTask(task, { knownStatus = null, record = undefined } = {}) {
     const conversationId = this.conversationIdFor(task);
     if (!conversationId) return;
@@ -235,7 +295,7 @@ class Driver {
     }
     const record = await chatgpt.conversation(conversationId);
     let tracked = task;
-    if (task.state !== 'submitted') {
+    if (!task.conversationId && !conversationIdFromRouteUrl(task.conversationUrl)) {
       const expectedPackage = packageFilename(task);
       if (!chatgpt.conversationHasAttachment(record, expectedPackage)) {
         throw new Error(`The open conversation does not contain this task package (${expectedPackage}).`);
@@ -256,93 +316,118 @@ class Driver {
 
     const updated = await this.reconcileTask(tracked, { record });
     const latest = updated || (await this.api.task(tracked.taskId)).task;
-    if (latest.state === 'submitted') this.watchTask(latest);
+    if (this.canWatchTask(latest)) this.watchTask(latest);
     return latest;
   }
 
-  async ingestTaskResult(task, conversationId, record = undefined) {
+  async ingestTaskResult(task, conversationId, record = undefined, { includeSeen = false } = {}) {
     const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
-    const expected = expectedName.toLowerCase();
     const conversationRecord = record === undefined
       ? await chatgpt.conversation(conversationId).catch(() => null)
       : record;
-    const file = (conversationRecord && chatgpt.findGeneratedFile(conversationRecord, (candidate) => {
-      const name = candidate.name.toLowerCase();
-      return name === expected || resultTaskId(name) === String(task.taskId).toLowerCase();
-    }))
+    const file = (conversationRecord && this.latestTaskResultFile(task, conversationRecord, { includeSeen }))
       // The rendered transcript carries the same file id, so a changed or
       // unavailable conversation endpoint does not strand a finished task.
-      || (!resultScan.isGenerating() ? resultScan.findResultFileInDom(expectedName) : null);
+      || (!resultScan.isGenerating() ? resultScan.findResultFileInDom(
+        expectedName,
+        includeSeen ? null : (candidate) => !this.hasSeenResultFile(task.taskId, candidate),
+      ) : null);
     if (!file) return null;
     this.report({
       type: 'result-downloading',
       taskId: task.taskId,
       message: `Downloading ${file.name}…`,
     });
+    this.rememberResultFile(task.taskId, file);
     const text = await chatgpt.downloadFileText(file, conversationId);
-    const { task: updated } = await this.api.taskResult(task.taskId, text);
-    this.activeTaskId = updated.state === 'submitted' ? updated.taskId : null;
+    const { task: updated } = await this.api.taskResult(task.taskId, text, file);
+    this.activeTaskId = task.answerOnly ? null : task.taskId;
     return updated;
   }
 
   async ingestDomResult(task, file) {
-    const text = await chatgpt.downloadFileText(file);
-    const { task: updated } = await this.api.taskResult(task.taskId, text);
-    this.activeTaskId = updated.state === 'submitted' ? updated.taskId : null;
+    this.rememberResultFile(task.taskId, file);
+    const text = await chatgpt.downloadFileText(file, this.conversationIdFor(task));
+    const { task: updated } = await this.api.taskResult(task.taskId, text, file);
+    this.activeTaskId = task.answerOnly ? null : task.taskId;
     return updated;
   }
 
   watchTask(task, { responseComplete = null, recovery = false } = {}) {
-    if (!task || task.state !== 'submitted') return;
+    if (!this.canWatchTask(task)) return;
     this.stop();
     this.activeTaskId = task.taskId;
     const generation = this.watchGeneration;
-    const conversationId = this.conversationIdFor(task);
     const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
-    let settled = false;
+    let currentTask = task;
+    let reconciling = false;
+    this.rememberResultFile(task.taskId, task.result?.sourceFile);
 
-    const finish = async () => {
-      if (settled || generation !== this.watchGeneration) return;
-      settled = true;
+    const arm = () => {
+      if (generation !== this.watchGeneration || !this.canWatchTask(currentTask)) return;
       this.stopDomWatch?.();
-      this.stopDomWatch = null;
-      const updated = await this.reconcileTask(task, { knownStatus: 'completed' });
-      if (!updated && !task.answerOnly && generation === this.watchGeneration) {
-        settled = false;
-        this.stopDomWatch = resultScan.observeConversation({
-          expectedName,
-          onResult: (file) => {
-            if (generation !== this.watchGeneration) return;
-            settled = true;
-            this.ingestDomResult(task, file).catch((error) => {
-              this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
-            });
-          },
-        });
-      }
+      this.stopDomWatch = resultScan.observeConversation({
+        expectedName: currentTask.answerOnly ? null : expectedName,
+        acceptResult: currentTask.answerOnly
+          ? null
+          : (file) => !this.hasSeenResultFile(currentTask.taskId, file),
+        onFinished: () => finish(),
+        onResult: currentTask.answerOnly ? null : (file) => handleResult(file),
+      });
     };
 
-    this.stopDomWatch = resultScan.observeConversation({
-      expectedName: task.answerOnly ? null : expectedName,
-      onFinished: finish,
-      onResult: task.answerOnly ? null : (file) => {
-        if (settled || generation !== this.watchGeneration) return;
-        settled = true;
-        this.ingestDomResult(task, file).catch((error) => {
-          this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
-        });
-      },
-    });
+    const finish = async () => {
+      if (reconciling || generation !== this.watchGeneration) return;
+      reconciling = true;
+      this.stopDomWatch?.();
+      this.stopDomWatch = null;
+      try {
+        const updated = await this.reconcileTask(currentTask, { knownStatus: 'completed' });
+        if (updated) currentTask = updated;
+        if (currentTask.answerOnly) {
+          this.activeTaskId = null;
+          return;
+        }
+      } catch (error) {
+        this.report({ type: 'task-result-error', taskId: currentTask.taskId, message: error.message });
+      } finally {
+        reconciling = false;
+      }
+      if (generation === this.watchGeneration) arm();
+    };
+
+    const handleResult = async (file) => {
+      if (generation !== this.watchGeneration) return;
+      this.stopDomWatch = null;
+      try {
+        const updated = await this.ingestDomResult(currentTask, file);
+        if (updated) currentTask = updated;
+      } catch (error) {
+        this.report({ type: 'task-result-error', taskId: currentTask.taskId, message: error.message });
+      }
+      if (generation === this.watchGeneration && !currentTask.answerOnly) arm();
+    };
 
     if (responseComplete) Promise.resolve(responseComplete).then((complete) => {
       if (complete) finish();
     });
     if (recovery) {
-      // Recovery is a single reconciliation read. If the conversation is still
-      // open, the DOM observer above will finish the task without API polling.
-      this.reconcileTask(task).then((updated) => {
-        if (updated) this.stop();
-      }).catch(() => {});
+      // Reconcile once before attaching the DOM observer. This establishes the
+      // newest result as the baseline and avoids re-ingesting older transcript
+      // files when a completed task is reopened.
+      this.reconcileTask(currentTask).then((updated) => {
+        if (updated) currentTask = updated;
+        if (!this.canWatchTask(currentTask)) {
+          this.activeTaskId = null;
+          return;
+        }
+        if (generation === this.watchGeneration) arm();
+      }).catch((error) => {
+        this.report({ type: 'task-result-error', taskId: currentTask.taskId, message: error.message });
+        if (generation === this.watchGeneration) arm();
+      });
+    } else {
+      arm();
     }
   }
 
@@ -350,7 +435,7 @@ class Driver {
   async refreshTaskResult(task) {
     const conversationId = this.conversationIdFor(task);
     if (!conversationId) throw new Error('This task has no conversation to re-read.');
-    const updated = await this.ingestTaskResult(task, conversationId);
+    const updated = await this.ingestTaskResult(task, conversationId, undefined, { includeSeen: true });
     if (!updated) throw new Error('That conversation does not contain a result file yet.');
     return updated;
   }
@@ -397,7 +482,7 @@ class Driver {
   }
 
   adoptTask(task) {
-    if (task?.state === 'submitted') this.watchTask(task, { recovery: true });
+    if (this.canWatchTask(task)) this.watchTask(task, { recovery: true });
   }
 
   adoptMerge(tree) {

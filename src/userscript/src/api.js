@@ -140,8 +140,10 @@ class Api {
 
   taskFailed(taskId, message) { return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/failed`, { message }); }
 
-  taskResult(taskId, text) {
-    return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/result`, { text }, { timeout: 600_000 });
+  taskResult(taskId, text, sourceFile = null) {
+    const body = { text };
+    if (sourceFile) body.sourceFile = sourceFile;
+    return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/result`, body, { timeout: 600_000 });
   }
 
   applyTask(taskId) { return this.post(`/v1/tasks/${encodeURIComponent(taskId)}/apply`, {}, { timeout: 300_000 }); }

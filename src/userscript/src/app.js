@@ -17,7 +17,7 @@ const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
 const { taskLabel } = require('./ui/labels');
 const { reportLayout } = require('./ui/layout-report');
-const { taskRequestConfiguration } = require('../../shared/chatgpt');
+const { conversationIdFromRouteUrl, taskRequestConfiguration } = require('../../shared/chatgpt');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
 const UPDATE_CHECK_INTERVAL_MILLISECONDS = 30 * 60 * 1_000;
@@ -136,7 +136,10 @@ class App {
   handleEvent(event) {
     if (!event || typeof event !== 'object') return;
     if (event.task) this.store.upsertTask(event.task);
-    if (event.taskId && !event.task && event.type === 'task-deleted') this.store.removeTask(event.taskId);
+    if (event.taskId && !event.task && event.type === 'task-deleted') {
+      this.driver.forgetTask(event.taskId);
+      this.store.removeTask(event.taskId);
+    }
     if (event.message) this.store.addActivity(event.message);
 
     if (event.type === 'merge-submit-requested' && event.request) {
@@ -181,8 +184,18 @@ class App {
   async refreshTasks() {
     const { tasks } = await this.api.tasks();
     this.store.set({ tasks }, 'tasks');
+    const conversationId = conversationIdFromRouteUrl(location.href);
+    const current = conversationId
+      ? tasks.find((task) => (
+        task.conversationId || conversationIdFromRouteUrl(task.conversationUrl)
+      ) === conversationId)
+      : null;
     const running = tasks.find((task) => task.state === 'submitted');
-    if (running) this.driver.adoptTask(running);
+    if (current && (!current.answerOnly || current.state === 'submitted')) {
+      this.driver.adoptTask(current);
+    } else if (running) {
+      this.driver.adoptTask(running);
+    }
     return tasks;
   }
 
@@ -323,7 +336,7 @@ class App {
     const app = this;
     return {
       showComposer() {
-        app.store.setComposer({ answerOnly: true }, 'silent');
+        app.store.setComposer({ mode: 'ask' }, 'silent');
         app.store.set({ activeTaskId: null }, 'tasks');
         app.shell.show('tasks');
       },
@@ -476,7 +489,7 @@ class App {
             model: composer.model,
             reasoningMode: composer.reasoningMode,
             includeIac: composer.includeIac,
-            answerOnly: composer.answerOnly,
+            answerOnly: composer.mode === 'ask',
             chatgptProject,
           };
           if (composer.treeSelection === NEW_TREE_VALUE) {
@@ -571,6 +584,7 @@ class App {
         if (!confirmed) return;
         await app.run(async () => {
           await app.api.deleteTask(taskId);
+          app.driver.forgetTask(taskId);
           app.store.removeTask(taskId);
           app.renderActiveView();
         }, { success: 'Task deleted.' });
@@ -759,7 +773,7 @@ class App {
       /* ---------------------------------------------------------- coding trees */
 
       startTreeTask(treeId = NEW_TREE_VALUE) {
-        app.store.setComposer({ answerOnly: true, treeSelection: treeId });
+        app.store.setComposer({ mode: 'ask', treeSelection: treeId });
         app.persist('task-tree', treeId);
         app.store.set({ activeTaskId: null }, 'tasks');
         app.shell.show('tasks');

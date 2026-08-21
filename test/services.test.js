@@ -953,6 +953,106 @@ test('a matching ChatGPT result validates, applies, and rolls back', async (cont
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'hello\n');
 });
 
+test('an applied source task accepts a newer cumulative follow-up result', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-result-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting, then refine it in follow-up messages.',
+    repositories: [repository],
+    autoApply: false,
+  });
+  const results = new ResultService(tasks);
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'first result\n');
+  const { stdout: firstPatch } = await runGit(repositoryPath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+  await runGit(repositoryPath, ['restore', 'hello.txt']);
+  const firstText = plainTextResult(task, firstPatch, 'feat(greeting): add first result');
+
+  let current = await ingestDownloadedText(results, tasks, task, firstText);
+  current = await results.apply(task.taskId);
+  assert.equal(current.state, 'applied');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'first result\n');
+  assert.match(current.result.contentHash, /^[0-9a-f]{64}$/);
+  const firstContentHash = current.result.contentHash;
+  assert.match(current.result.appliedRepositories[0].fingerprintAfter, /^[0-9a-f]{64}$/);
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'refined follow-up result\n');
+  const { stdout: secondPatch } = await runGit(repositoryPath, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'first result\n');
+  const secondText = plainTextResult(task, secondPatch, 'feat(greeting): refine result');
+
+  current = await ingestDownloadedText(results, tasks, task, secondText);
+  assert.equal(current.state, 'ready');
+  assert.equal(current.appliedResult.contentHash, firstContentHash);
+  current = await results.apply(task.taskId);
+  assert.equal(current.state, 'applied');
+  assert.equal(current.appliedResult, null);
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'refined follow-up result\n');
+
+  const duplicate = await ingestDownloadedText(results, tasks, task, secondText);
+  assert.equal(duplicate.state, 'applied', 're-reading the same generated result must not reopen the task');
+
+  current = await results.rollback(task.taskId);
+  assert.equal(current.state, 'rolled-back');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'hello\n');
+});
+
+test('coding tree follow-up results accumulate commits and roll back as one task', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-follow-up-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const dataRoot = path.join(root, 'data');
+  const trees = new WorktreeService(dataRoot);
+  const tasks = new TaskService(dataRoot);
+  await Promise.all([trees.initialize(), tasks.initialize()]);
+  const tree = await trees.create(repositoryPath, 'Follow-up result tree');
+  const task = await tasks.createTask({
+    taskText: 'Change the tree greeting and accept later refinements.',
+    repositories: [{ path: tree.path }],
+    tree,
+    autoApply: false,
+  });
+  const results = new ResultService(tasks);
+
+  await fs.writeFile(path.join(tree.path, 'hello.txt'), 'tree first result\n');
+  const { stdout: firstPatch } = await runGit(tree.path, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+  await runGit(tree.path, ['restore', 'hello.txt']);
+  await ingestDownloadedText(
+    results, tasks, task, plainTextResult(task, firstPatch, 'feat(tree): add first result'),
+  );
+  let current = await results.apply(task.taskId);
+  assert.equal(current.result.commits.length, 1);
+  const firstCommit = current.result.commits[0].commit;
+
+  await fs.writeFile(path.join(tree.path, 'hello.txt'), 'tree refined result\n');
+  const { stdout: secondPatch } = await runGit(tree.path, [
+    'diff', '--binary', task.repositories[0].baseCommit, '--', '.',
+  ]);
+  await runGit(tree.path, ['restore', 'hello.txt']);
+  await ingestDownloadedText(
+    results, tasks, task, plainTextResult(task, secondPatch, 'feat(tree): refine result'),
+  );
+  current = await results.apply(task.taskId);
+  assert.equal(current.result.commits.length, 2);
+  assert.equal(current.result.commits[0].commit, firstCommit);
+  assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'tree refined result\n');
+
+  current = await results.rollback(task.taskId);
+  assert.equal(current.state, 'rolled-back');
+  assert.equal(current.result.reverts.length, 2);
+  assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'hello\n');
+});
+
 test('a downloaded text result file validates and applies automatically', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

@@ -51,7 +51,7 @@ const CANDIDATE_SELECTOR = [
   '[data-testid]',
 ].join(', ');
 
-function findResultFileInDom(expectedName) {
+function findResultFileInDom(expectedName, acceptResult = null) {
   const expected = String(expectedName || '').toLowerCase();
   if (!expected) return null;
   const matches = deepQueryAll(CANDIDATE_SELECTOR)
@@ -62,14 +62,22 @@ function findResultFileInDom(expectedName) {
   matches.sort((left, right) => (
     (left.querySelectorAll?.('*').length || 0) - (right.querySelectorAll?.('*').length || 0)
   ));
+  const seenIds = new Set();
+  let accepted = null;
   for (const match of matches) {
     const id = fileIdNear(match);
-    if (id) return { id, name: expectedName, source: 'dom' };
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+    const file = { id, name: expectedName, source: 'dom' };
+    if (!acceptResult || acceptResult(file)) accepted = file;
   }
-  return null;
+  // Transcript cards are rendered in conversation order. When several results
+  // use the same required filename, prefer the latest accepted card so a DOM
+  // fallback cannot replace a newer cumulative follow-up with an older one.
+  return accepted;
 }
 
-function observeConversation({ expectedName = null, onFinished, onResult }) {
+function observeConversation({ expectedName = null, acceptResult = null, onFinished, onResult }) {
   if (typeof MutationObserver !== 'function') return () => {};
   let sawGenerating = isGenerating();
   let stopped = false;
@@ -85,7 +93,7 @@ function observeConversation({ expectedName = null, onFinished, onResult }) {
     if (stopped) return;
     const generating = isGenerating();
     if (generating) sawGenerating = true;
-    const file = expectedName ? findResultFileInDom(expectedName) : null;
+    const file = expectedName ? findResultFileInDom(expectedName, acceptResult) : null;
     if (file && onResult) {
       stop();
       onResult(file);

@@ -86,9 +86,10 @@ what the request is sent with.
    sticky between tasks.
 2. Describe the task. Optionally add saved prompts, local skills, reference file
    attachments, or configured IaC context, and choose whether ChatGPT runs it in a
-   plain new chat, an existing project, or a project Patchwork creates. Enable
-   **Answer only** for questions and analysis: ChatGPT responds in the conversation
-   without modifying the bundled repositories or generating a Patchwork result file.
+   plain new chat, an existing project, or a project Patchwork creates. Before
+   sending, choose **Ask** to answer the request in the conversation without
+   repository changes, or **Agent** to implement the task and return changes for
+   Patchwork to apply.
 3. The agent builds a ZIP containing `AGENTS.md`, `TASK.md`, `manifest.json`, one
    Git bundle per repository under `repositories/`, plus any `skills/`,
    `attachments/`, `iac/`, and `conflicts/` content. Already-compressed bundles are

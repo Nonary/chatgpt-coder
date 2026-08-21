@@ -1,4 +1,6 @@
+const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const {
   applyPatch,
@@ -60,6 +62,22 @@ function decodePatch(value, repositoryId) {
   return patch;
 }
 
+function normalizeResultSource(source) {
+  if (!source || typeof source !== 'object') return null;
+  const normalized = {};
+  for (const key of ['id', 'name', 'messageId', 'sandboxPath', 'source']) {
+    if (source[key] != null) normalized[key] = String(source[key]).slice(0, 4096);
+  }
+  const createTime = Number(source.createTime);
+  if (Number.isFinite(createTime)) normalized.createTime = createTime;
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+async function fingerprintIndex(repositoryPath) {
+  const { stdout } = await runGit(repositoryPath, ['ls-files', '-s', '-z']);
+  return crypto.createHash('sha256').update(stdout).digest('hex');
+}
+
 function requireTaskRepository(task, repositoryId) {
   if (typeof repositoryId !== 'string' || !/^[a-z0-9._-]+$/i.test(repositoryId)) {
     throw new Error('Result contains an invalid repository id.');
@@ -98,32 +116,54 @@ class ResultService {
     const task = await this.taskService.getTask(taskId);
     await this.onEvent({ type: 'result-processing', taskId, message });
 
+    let readyTask;
     try {
       const result = await readResult(task);
+      if (task.result?.contentHash && task.result.contentHash === result.contentHash) {
+        if (!result.sourceFile) return task;
+        return this.taskService.updateTask(taskId, {
+          result: { ...task.result, sourceFile: result.sourceFile },
+        });
+      }
       const validated = await this.validate(task, result);
-      const readyTask = await this.taskService.updateTask(taskId, {
+      if (task.state === 'applied' && task.result
+        && !Array.isArray(task.result.appliedRepositories)) {
+        throw new Error(
+          'This task was applied before follow-up replacement tracking was available. Roll it back, then refresh this follow-up result.',
+        );
+      }
+      const update = {
         state: 'ready',
         result: validated,
-      });
+        error: null,
+      };
+      if (!task.appliedResult && task.state === 'applied' && task.result) {
+        update.appliedResult = task.result;
+      }
+      readyTask = await this.taskService.updateTask(taskId, update);
       await this.onEvent({ type: 'result-ready', task: readyTask });
-      if (readyTask.autoApply) return this.apply(taskId);
-      return readyTask;
     } catch (error) {
-      const failedTask = await this.taskService.updateTask(taskId, {
-        state: 'failed',
-        error: error.message,
-      });
+      const failedTask = await this.taskService.updateTask(taskId, task.result
+        ? { state: task.state, error: `Follow-up result ignored: ${error.message}` }
+        : { state: 'failed', error: error.message });
       await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
       throw error;
     }
+
+    // Application owns its failure state. Keep it outside the validation catch
+    // so a failed automatic follow-up cannot be relabeled as applied while its
+    // newer cumulative result has not actually reached the target repository.
+    if (readyTask.autoApply) return this.apply(taskId);
+    return readyTask;
   }
 
-  async readPlainTextResult(task, text, downloadedPath = null) {
+  async readPlainTextResult(task, text, downloadedPath = null, sourceFile = null) {
+    const contentHash = crypto.createHash('sha256').update(text).digest('hex');
     const manifest = parsePlainTextResult(text);
     if (manifest.taskId !== task.taskId) throw new Error('This result belongs to a different Patchwork task.');
     if (manifest.status !== 'completed') throw new Error(`ChatGPT returned task status: ${manifest.status}`);
 
-    const resultDir = path.join(this.taskService.taskDirectory(task.taskId), 'result');
+    const resultDir = path.join(this.taskService.taskDirectory(task.taskId), 'result', contentHash);
     await fs.mkdir(resultDir, { recursive: true });
     const patches = [];
     for (const item of manifest.repositories) {
@@ -149,6 +189,8 @@ class ResultService {
       commitMessage,
       transport: 'plain-text-base64',
       downloadedPath,
+      contentHash,
+      sourceFile: normalizeResultSource(sourceFile),
       patches,
     };
   }
@@ -214,6 +256,110 @@ class ResultService {
     };
   }
 
+  async materializeResultTree(repositoryPath, startCommit, patchPath) {
+    await runGit(repositoryPath, ['reset', '--hard', startCommit]);
+    await runGit(repositoryPath, ['clean', '-fd']);
+    const body = await fs.readFile(patchPath);
+    if (body.length > 0) {
+      try {
+        await checkPatch(repositoryPath, patchPath);
+        await applyPatch(repositoryPath, patchPath);
+      } catch {
+        await runGit(repositoryPath, ['reset', '--hard', startCommit]);
+        await runGit(repositoryPath, ['clean', '-fd']);
+        await applyPatch(repositoryPath, patchPath, { threeWay: true, index: true });
+      }
+    }
+    await runGit(repositoryPath, ['add', '-A', '--', '.']);
+    const { stdout } = await runGit(repositoryPath, ['write-tree']);
+    return stdout.trim();
+  }
+
+  async createReplacementPatch(task, repository, previousPatch, nextPatch, appliedState) {
+    if (!appliedState?.fingerprintAfter) {
+      throw new Error(`${repository.name} was applied before follow-up replacement tracking was available. Roll back that result before applying this follow-up.`);
+    }
+    const current = await inspectRepository(repository.path);
+    const fingerprint = await fingerprintRepository(repository.path);
+    const indexFingerprint = appliedState.indexFingerprintAfter
+      ? await fingerprintIndex(repository.path)
+      : null;
+    if ((appliedState.headAfter && current.baseCommit !== appliedState.headAfter)
+      || fingerprint !== appliedState.fingerprintAfter
+      || (appliedState.indexFingerprintAfter && indexFingerprint !== appliedState.indexFingerprintAfter)) {
+      throw new Error(`${repository.name} changed after the previous result was applied. Preserve those changes in a new Patchwork task before applying this follow-up.`);
+    }
+
+    const scratchRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-'));
+    const scratchPath = path.join(scratchRoot, 'repository');
+    try {
+      let startCommit;
+      if (appliedState.contextWasClean && appliedState.contextHead) {
+        await runGit(scratchRoot, ['clone', '--no-checkout', repository.path, scratchPath]);
+        startCommit = appliedState.contextHead;
+      } else {
+        const bundlePath = path.join(
+          this.taskService.taskDirectory(task.taskId),
+          'repositories',
+          `${repository.id}.bundle`,
+        );
+        await runGit(scratchRoot, ['clone', '--no-checkout', bundlePath, scratchPath]);
+        startCommit = repository.baseCommit;
+      }
+      await runGit(scratchPath, ['checkout', '--detach', startCommit]);
+
+      const previousTree = await this.materializeResultTree(scratchPath, startCommit, previousPatch.localPath);
+      const nextTree = await this.materializeResultTree(scratchPath, startCommit, nextPatch.localPath);
+      const { stdout: delta } = await runGit(
+        scratchPath,
+        ['diff', '--binary', previousTree, nextTree, '--', '.'],
+        { maxBuffer: MAX_PATCH_BYTES * 2 },
+      );
+      const replacementDir = path.join(path.dirname(nextPatch.localPath), 'replacement');
+      await fs.mkdir(replacementDir, { recursive: true });
+      const replacementPath = path.join(replacementDir, `${repository.id}.patch`);
+      await fs.writeFile(replacementPath, delta);
+      if (delta.length > 0) {
+        if (appliedState.indexApplied) {
+          await runGit(repository.path, ['apply', '--check', '--index', '--binary', replacementPath]);
+        } else {
+          await checkPatch(repository.path, replacementPath);
+        }
+      }
+      return replacementPath;
+    } finally {
+      await fs.rm(scratchRoot, { recursive: true, force: true });
+    }
+  }
+
+  async prepareReplacementPatches(task) {
+    if (!task.appliedResult) return new Map();
+    const previousStates = new Map((task.appliedResult.appliedRepositories || [])
+      .map((item) => [item.repositoryId, item]));
+    const previousPatches = new Map((task.appliedResult.patches || [])
+      .map((item) => [item.id, item]));
+    const replacements = new Map();
+
+    for (const nextPatch of task.result.patches || []) {
+      const repository = task.repositories.find((item) => item.id === nextPatch.id);
+      if (!repository || repository.readOnly) continue;
+      const previousPatch = previousPatches.get(nextPatch.id);
+      const appliedState = previousStates.get(nextPatch.id);
+      if (!previousPatch || !appliedState) {
+        throw new Error(`${repository.name} is missing the previously applied result needed for this follow-up.`);
+      }
+      const localPath = await this.createReplacementPatch(
+        task,
+        repository,
+        previousPatch,
+        nextPatch,
+        appliedState,
+      );
+      replacements.set(nextPatch.id, { localPath, appliedState });
+    }
+    return replacements;
+  }
+
   async prepareConflictResolution(taskId) {
     let task = await this.taskService.getTask(taskId);
     if (task.state !== 'conflicted' || !task.result?.patches?.length) {
@@ -276,12 +422,46 @@ class ResultService {
 
     const applied = [];
     const committed = [];
+    const applicationContexts = new Map();
+    const appliedRepositories = [];
     try {
+      const replacementPatches = await this.prepareReplacementPatches(task);
       for (const patch of task.result.patches) {
         const repository = task.repositories.find((item) => item.id === patch.id);
-        const body = await fs.readFile(patch.localPath);
-        if (body.length === 0) continue;
+        if (!repository || repository.readOnly) continue;
+        const replacement = replacementPatches.get(patch.id) || null;
+        const effectivePatch = replacement ? { ...patch, localPath: replacement.localPath } : patch;
         const current = await inspectRepository(repository.path);
+        applicationContexts.set(repository.id, replacement ? {
+          contextHead: replacement.appliedState.contextHead || null,
+          contextWasClean: Boolean(replacement.appliedState.contextWasClean),
+        } : {
+          contextHead: current.baseCommit || null,
+          contextWasClean: current.isClean,
+        });
+
+        const body = await fs.readFile(effectivePatch.localPath);
+        if (body.length === 0) continue;
+        if (replacement) {
+          try {
+            await applyPatch(repository.path, effectivePatch.localPath, {
+              index: Boolean(replacement.appliedState.indexApplied),
+            });
+          } catch (error) {
+            return this.markConflicted(task, repository, error, true);
+          }
+          applied.push({
+            repository,
+            patch: effectivePatch,
+            applyMode: 'direct',
+            replacement: true,
+            indexApplied: Boolean(replacement.appliedState.indexApplied),
+            wasClean: current.isClean,
+            headBefore: current.baseCommit,
+          });
+          continue;
+        }
+
         const exactState = await matchesPackagedState(repository, current);
         if (!exactState && !current.isClean) {
           const previousConflict = task.result.conflicts?.find((item) => item.repositoryId === repository.id);
@@ -292,21 +472,27 @@ class ResultService {
         let applyMode = 'direct';
         if (!exactState) {
           try {
-            await checkPatch(repository.path, patch.localPath);
+            await checkPatch(repository.path, effectivePatch.localPath);
           } catch {
             applyMode = 'three-way';
           }
         } else {
-          await checkPatch(repository.path, patch.localPath);
+          await checkPatch(repository.path, effectivePatch.localPath);
         }
         try {
-          await applyPatch(repository.path, patch.localPath, applyMode === 'three-way'
+          await applyPatch(repository.path, effectivePatch.localPath, applyMode === 'three-way'
             ? { threeWay: true, index: true }
             : {});
         } catch (error) {
           return this.markConflicted(task, repository, error, true);
         }
-        applied.push({ repository, patch, applyMode, wasClean: current.isClean, headBefore: current.baseCommit });
+        applied.push({
+          repository,
+          patch: effectivePatch,
+          applyMode,
+          wasClean: current.isClean,
+          headBefore: current.baseCommit,
+        });
       }
       if (task.treeId) {
         const commitMessage = validateCommitMessage(task.result.commitMessage);
@@ -316,6 +502,24 @@ class ResultService {
           const { stdout } = await runGit(item.repository.path, ['rev-parse', 'HEAD']);
           committed.push({ ...item, commit: stdout.trim(), message: commitMessage });
         }
+      }
+
+      for (const [repositoryId, context] of applicationContexts) {
+        const repository = task.repositories.find((item) => item.id === repositoryId);
+        const appliedItem = applied.find((item) => item.repository.id === repositoryId);
+        const previousState = task.appliedResult?.appliedRepositories
+          ?.find((item) => item.repositoryId === repositoryId);
+        const current = await inspectRepository(repository.path);
+        appliedRepositories.push({
+          repositoryId,
+          ...context,
+          headAfter: current.baseCommit || null,
+          indexApplied: previousState
+            ? Boolean(previousState.indexApplied)
+            : appliedItem?.applyMode === 'three-way',
+          fingerprintAfter: await fingerprintRepository(repository.path),
+          indexFingerprintAfter: await fingerprintIndex(repository.path),
+        });
       }
     } catch (error) {
       for (const item of committed.reverse()) {
@@ -330,6 +534,11 @@ class ResultService {
         try {
           if (item.wasClean && item.headBefore) {
             await runGit(item.repository.path, ['reset', '--hard', item.headBefore]);
+          } else if (item.replacement) {
+            await applyPatch(item.repository.path, item.patch.localPath, {
+              reverse: true,
+              index: item.indexApplied,
+            });
           } else {
             await runGit(item.repository.path, ['reset', '--mixed', '--quiet', 'HEAD']).catch(() => {});
             await applyPatch(item.repository.path, item.patch.localPath, { reverse: true });
@@ -342,17 +551,23 @@ class ResultService {
       await this.onEvent({ type: 'task-failed', task, message: error.message });
       throw error;
     }
-
+    const previousCommits = Array.isArray(task.appliedResult?.commits) ? task.appliedResult.commits : [];
+    const newCommits = committed.map(({ repository, commit, message }) => ({
+      repositoryId: repository.id,
+      commit,
+      message,
+    }));
     const appliedAt = new Date().toISOString();
     task = await this.taskService.updateTask(taskId, {
       state: 'applied',
       appliedAt,
       error: null,
-      result: { ...task.result, commits: committed.map(({ repository, commit, message }) => ({
-        repositoryId: repository.id,
-        commit,
-        message,
-      })) },
+      appliedResult: null,
+      result: {
+        ...task.result,
+        commits: [...previousCommits, ...newCommits],
+        appliedRepositories,
+      },
     });
     await this.onEvent({ type: 'task-applied', task });
 
@@ -428,22 +643,37 @@ class ResultService {
 
     const reverts = [];
     if (task.result.commits?.length) {
-      for (const item of [...task.result.commits].reverse()) {
-        const repository = task.repositories.find((entry) => entry.id === item.repositoryId);
+      const latestCommits = new Map();
+      for (const item of task.result.commits) latestCommits.set(item.repositoryId, item.commit);
+      const appliedStates = new Map((task.result.appliedRepositories || [])
+        .map((item) => [item.repositoryId, item]));
+      for (const [repositoryId, latestCommit] of latestCommits) {
+        const repository = task.repositories.find((entry) => entry.id === repositoryId);
         const current = await inspectRepository(repository.path);
-        if (!current.isClean || current.baseCommit !== item.commit) {
+        const appliedState = appliedStates.get(repositoryId);
+        const fingerprintMatches = !appliedState?.fingerprintAfter
+          || await fingerprintRepository(repository.path) === appliedState.fingerprintAfter;
+        if (!current.isClean || current.baseCommit !== latestCommit || !fingerprintMatches) {
           throw new Error('The task target changed after this task was applied; revert it from Source Control instead.');
         }
+      }
+      for (const item of [...task.result.commits].reverse()) {
+        const repository = task.repositories.find((entry) => entry.id === item.repositoryId);
         await runGit(repository.path, ['revert', '--no-edit', item.commit]);
         const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);
         reverts.push({ repositoryId: repository.id, commit: stdout.trim() });
       }
     } else {
+      const appliedStates = new Map((task.result.appliedRepositories || [])
+        .map((item) => [item.repositoryId, item]));
       for (const patch of [...task.result.patches].reverse()) {
         const repository = task.repositories.find((item) => item.id === patch.id);
         const body = await fs.readFile(patch.localPath);
         if (body.length === 0) continue;
-        await applyPatch(repository.path, patch.localPath, true);
+        await applyPatch(repository.path, patch.localPath, {
+          reverse: true,
+          index: Boolean(appliedStates.get(repository.id)?.indexApplied),
+        });
       }
     }
     task = await this.taskService.updateTask(taskId, {

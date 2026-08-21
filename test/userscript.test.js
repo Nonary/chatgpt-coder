@@ -411,6 +411,12 @@ test('the agent client builds authenticated request paths for every workspace ca
   assert.equal(calls.at(-1).path, '/v1/tasks/task-1/result');
   assert.deepEqual(calls.at(-1).body, { text: 'PATCHWORK_RESULT_V1' });
 
+  await api.taskResult('task-1', 'PATCHWORK_RESULT_V1', { id: 'file-result123456' });
+  assert.deepEqual(calls.at(-1).body, {
+    text: 'PATCHWORK_RESULT_V1',
+    sourceFile: { id: 'file-result123456' },
+  });
+
   await api.uploadAttachment('notes v2.txt', new ArrayBuffer(4));
   assert.equal(calls.at(-1).path, '/v1/uploads?name=notes+v2.txt');
 
@@ -432,7 +438,9 @@ test('agent errors surface their message instead of a generic failure', async ()
 });
 
 test('task labels and states match the states the agent can report', () => {
-  const { taskLabel, taskStateLabel, taskStatusText } = require('../src/userscript/src/ui/labels');
+  const {
+    taskConfigurationLabel, taskLabel, taskStateLabel, taskStatusText,
+  } = require('../src/userscript/src/ui/labels');
   assert.equal(taskLabel({ taskText: 'Fix the parser\nmore detail' }), 'Fix the parser');
   assert.equal(taskLabel({ conversationTitle: 'Parser work', taskText: 'Fix' }), 'Parser work');
   assert.equal(taskLabel({ summaryOnly: true, repositories: [{ name: 'sunshine' }] }), 'Git Summary · sunshine');
@@ -440,14 +448,32 @@ test('task labels and states match the states the agent can report', () => {
   assert.equal(taskStateLabel({ state: 'submitted' }), 'Running');
   assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'completed' }), 'Response complete');
   assert.equal(taskStateLabel({ state: 'submitted', chatStatus: 'failed' }), 'Generation stopped');
-  assert.equal(taskStateLabel({ answerOnly: true, state: 'completed' }), 'Answered');
+  assert.equal(taskStateLabel({ answerOnly: true, state: 'completed' }), 'Completed');
   assert.equal(taskStateLabel({ state: 'conflicted' }), 'Needs conflict resolution');
   assert.equal(taskStateLabel({ summaryOnly: true, state: 'ready' }), 'Summary ready');
 
   assert.equal(taskStatusText({ state: 'conflicted' })[0], 'Conflict needs resolution');
   assert.equal(taskStatusText({ summaryOnly: true, state: 'completed' })[0], 'Git Summary applied');
-  assert.equal(taskStatusText({ answerOnly: true, state: 'submitted' })[0], 'Answer is running');
-  assert.equal(taskStatusText({ answerOnly: true, state: 'completed' })[0], 'Answer complete');
+  assert.equal(taskStatusText({ answerOnly: true, state: 'submitted' })[0], 'Ask is running');
+  assert.equal(taskStatusText({ answerOnly: true, state: 'completed' })[0], 'Ask complete');
+  assert.equal(taskStatusText({ state: 'completed' })[0], 'Task complete');
+  assert.equal(
+    taskConfigurationLabel({ answerOnly: true, model: 'sol', reasoningMode: 'high' }),
+    'GPT-5.6 Sol · High · Ask',
+  );
+  assert.equal(
+    taskConfigurationLabel({ answerOnly: false, model: 'sol', reasoningMode: 'high' }),
+    'GPT-5.6 Sol · High · Agent',
+  );
+  assert.equal(
+    taskConfigurationLabel({ summaryOnly: true, model: 'sol', reasoningMode: 'high' }),
+    'GPT-5.6 Sol · High',
+  );
+});
+
+test('new task composers default to Ask mode', () => {
+  const { Store } = require('../src/userscript/src/store');
+  assert.equal(new Store().state.composer.mode, 'ask');
 });
 
 test('ready task results name the repository or coding tree they will apply to', () => {
@@ -571,11 +597,16 @@ test('the transcript fallback finds the generated file id without triggering a d
 
   const link = element('a', { href: '/backend-api/files/file-AbCd1234EfGh/download' });
   const card = element('div', { 'data-testid': 'file-attachment' }, [text('span', name), link]);
-  let restore = installDocument(element('body', {}, [card]));
+  const followUpLink = element('a', { href: '/backend-api/files/file-ZyXw5678VuTs/download' });
+  const followUpCard = element('div', { 'data-testid': 'file-attachment' }, [text('span', name), followUpLink]);
+  let restore = installDocument(element('body', {}, [card, followUpCard]));
   try {
     const found = scan.findResultFileInDom(name);
-    assert.deepEqual(found, { id: 'file-AbCd1234EfGh', name, source: 'dom' });
+    assert.deepEqual(found, { id: 'file-ZyXw5678VuTs', name, source: 'dom' });
+    const followUp = scan.findResultFileInDom(name, (file) => file.id !== found.id);
+    assert.deepEqual(followUp, { id: 'file-AbCd1234EfGh', name, source: 'dom' });
     assert.equal(link.clicks, 0, 'a browser download would land on disk, not in the page');
+    assert.equal(followUpLink.clicks, 0, 'follow-up detection must not click the generated file either');
     assert.equal(scan.findResultFileInDom('chatgpt-ide-result-other.txt'), null);
     assert.equal(scan.isGenerating(), false);
   } finally {

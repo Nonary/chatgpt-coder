@@ -13,6 +13,11 @@ const REASONING_LABELS = {
   'extra-high': 'Extra High',
 };
 
+const TASK_MODE_LABELS = {
+  ask: 'Ask',
+  agent: 'Agent',
+};
+
 const STATE_LABELS = {
   prepared: 'Prepared',
   submitted: 'Running',
@@ -45,7 +50,6 @@ function taskLabel(task) {
 }
 
 function taskStateLabel(task) {
-  if (task.answerOnly && task.state === 'completed') return 'Answered';
   if (task.summaryOnly) {
     if (task.state === 'completed') return 'Summary applied';
     if (task.state === 'ready') return 'Summary ready';
@@ -62,16 +66,16 @@ function taskStateLabel(task) {
 function taskStatusText(task) {
   if (task.answerOnly) {
     if (task.state === 'completed') {
-      return ['Answer complete', 'The detailed response is finished in the conversation.'];
+      return ['Ask complete', 'The detailed response is finished in the conversation.'];
     }
     if (task.state === 'submitted' && task.chatStatus === 'failed') {
-      return ['Generation stopped', 'Generation failed before the answer was complete.'];
+      return ['Generation stopped', 'Generation failed before the Ask response was complete.'];
     }
     if (task.state === 'submitted') {
-      return ['Answer is running', 'The response is still generating. No result file is expected.'];
+      return ['Ask is running', 'The response is still generating in the conversation. No result file is expected.'];
     }
     if (task.state === 'prepared') {
-      return ['Answer task prepared', 'Send this read-only question when you are ready.'];
+      return ['Ask task prepared', 'Send this read-only question when you are ready.'];
     }
   }
   if (task.summaryOnly) {
@@ -100,6 +104,9 @@ function taskStatusText(task) {
   if (task.state === 'submitted' && task.chatStatus === 'failed') {
     return ['Generation stopped', 'Generation failed for this task.'];
   }
+  if (task.state === 'completed') {
+    return ['Task complete', 'The task finished successfully.'];
+  }
   return STATUS_TEXT[task.state] || STATUS_TEXT.prepared;
 }
 
@@ -116,7 +123,7 @@ function taskConfigurationLabel(task) {
   const iac = iacCount ? ` · ${iacCount} IaC` : '';
   const model = MODEL_LABELS[task.model || 'default'] || task.model;
   const reasoning = REASONING_LABELS[task.reasoningMode || 'default'] || task.reasoningMode;
-  const mode = task.answerOnly ? ' · answer only' : '';
+  const mode = task.summaryOnly ? '' : ` · ${TASK_MODE_LABELS[task.answerOnly ? 'ask' : 'agent']}`;
   return `${model} · ${reasoning}${mode}${skills}${iac}`;
 }
 
@@ -131,6 +138,7 @@ function treeStateLabel(tree) {
 module.exports = {
   MODEL_LABELS,
   REASONING_LABELS,
+  TASK_MODE_LABELS,
   STATE_LABELS,
   STATUS_TEXT,
   bundledIacCount,

@@ -205,7 +205,7 @@ function register(router, context) {
   // envelope validation and, when auto-apply is on, application.
   router.post('/v1/tasks/:taskId/result', async ({ params, body, rawBody }) => {
     const current = await taskService.getTask(params.taskId);
-    if (current.answerOnly) throw new Error('Answer-only tasks do not accept Patchwork result files.');
+    if (current.answerOnly) throw new Error('Ask tasks do not accept Patchwork result files.');
     const text = typeof body?.text === 'string' ? body.text : rawBody?.toString('utf8');
     if (!text) throw new Error('The result upload contained no text.');
     if (Buffer.byteLength(text, 'utf8') > MAX_RESULT_TEXT_BYTES) {
@@ -214,7 +214,7 @@ function register(router, context) {
     const task = await resultService.ingestResult(
       params.taskId,
       'Validating the downloaded text result…',
-      (current) => resultService.readPlainTextResult(current, text),
+      (current) => resultService.readPlainTextResult(current, text, null, body?.sourceFile),
     );
     if (task.summaryOnly && task.result?.commitMessage) {
       emit({

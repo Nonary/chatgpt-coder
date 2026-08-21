@@ -13,7 +13,10 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.match(source, /observeConversation/);
   assert.match(source, /knownStatus: 'completed'/);
   assert.match(source, /taskChatStatus/);
-  assert.match(source, /Recovery is a single reconciliation read/);
+  assert.match(source, /Reconcile once before attaching the DOM observer/);
+  assert.match(source, /seenTaskResultFiles/);
+  assert.match(source, /latestTaskResultFile/);
+  assert.match(source, /if \(generation === this\.watchGeneration && !currentTask\.answerOnly\) arm\(\)/);
   assert.match(source, /async refreshTask\(task\)/);
   assert.doesNotMatch(source, /this\.api\.taskAttachment/);
   assert.match(source, /Supporting files are already bundled under attachments\//);
@@ -36,6 +39,36 @@ test('the model picker reacts to real DOM changes without a periodic remount gua
   assert.doesNotMatch(source, /setInterval\s*\(/);
   assert.doesNotMatch(source, /GUARD_INTERVAL_MILLISECONDS/);
   assert.match(source, /new MutationObserver/);
+});
+
+test('generated result discovery keeps follow-up files newest first', () => {
+  const { findGeneratedFiles, resultFileKey } = require('../src/userscript/src/chatgpt/api');
+  const filename = 'chatgpt-ide-result-3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22.txt';
+  const record = {
+    mapping: {
+      first: { message: {
+        id: 'message-first',
+        author: { role: 'assistant' },
+        create_time: 10,
+        metadata: { attachments: [{ id: 'file-first123456', name: filename }] },
+      } },
+      second: { message: {
+        id: 'message-second',
+        author: { role: 'assistant' },
+        create_time: 20,
+        metadata: { attachments: [
+          { id: 'file-second123456', name: filename },
+          { id: 'file-second123456', name: filename },
+        ] },
+      } },
+    },
+  };
+
+  const files = findGeneratedFiles(record, (file) => file.name === filename);
+  assert.deepEqual(files.map((file) => file.id), ['file-second123456', 'file-first123456']);
+  assert.equal(resultFileKey(files[0]), 'id:file-second123456');
+  assert.equal(resultFileKey({ messageId: 'message-3', sandboxPath: '/mnt/data/result.txt' }),
+    'sandbox:message-3:/mnt/data/result.txt');
 });
 
 test('conversation recovery recognizes terminal records without polling stream status', () => {

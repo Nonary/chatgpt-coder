@@ -135,22 +135,39 @@ function conversationHasAttachment(conversationRecord, filename) {
   });
 }
 
+function resultFileKey(file) {
+  if (!file || typeof file !== 'object') return null;
+  if (file.id) return `id:${String(file.id)}`;
+  if (file.messageId && file.sandboxPath) {
+    return `sandbox:${String(file.messageId)}:${String(file.sandboxPath)}`;
+  }
+  return null;
+}
+
 // Generated result files are read straight out of the conversation record instead
 // of scraped from rendered markup.
-function findGeneratedFile(conversationRecord, predicate) {
+function findGeneratedFiles(conversationRecord, predicate) {
   const nodes = Object.values(conversationRecord?.mapping || {});
   const matches = [];
+  const seen = new Set();
   for (const node of nodes) {
     const message = node?.message;
     if (!message || message.author?.role !== 'assistant') continue;
     for (const file of messageAttachments(message)) {
-      if (predicate(file)) {
-        matches.push({ ...file, createTime: message.create_time || 0, messageId: message.id });
-      }
+      if (!predicate(file)) continue;
+      const match = { ...file, createTime: message.create_time || 0, messageId: message.id };
+      const key = resultFileKey(match);
+      if (key && seen.has(key)) continue;
+      if (key) seen.add(key);
+      matches.push(match);
     }
   }
   matches.sort((left, right) => (right.createTime || 0) - (left.createTime || 0));
-  return matches[0] || null;
+  return matches;
+}
+
+function findGeneratedFile(conversationRecord, predicate) {
+  return findGeneratedFiles(conversationRecord, predicate)[0] || null;
 }
 
 function wait(milliseconds) {
@@ -208,6 +225,8 @@ module.exports = {
   createProject,
   downloadFileText,
   findGeneratedFile,
+  findGeneratedFiles,
   listProjects,
   messageAttachments,
+  resultFileKey,
 };

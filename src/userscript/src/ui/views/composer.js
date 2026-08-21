@@ -1,7 +1,7 @@
 const {
   formatBytes, h, option, replace,
 } = require('../dom');
-const { MODEL_LABELS, REASONING_LABELS } = require('../labels');
+const { MODEL_LABELS, REASONING_LABELS, TASK_MODE_LABELS } = require('../labels');
 
 const NEW_TREE_VALUE = '__new__';
 const NEW_PROJECT_VALUE = '__new__';
@@ -146,13 +146,21 @@ function renderComposer(ctx) {
     },
   });
 
-  const answerOnlyCheckbox = h('input', {
-    type: 'checkbox',
-    checked: composer.answerOnly,
-    onchange: () => {
-      ctx.store.setComposer({ answerOnly: answerOnlyCheckbox.checked }, 'silent');
+  const modeSelect = h(
+    'select',
+    {
+      class: 'field-control',
+      onchange: () => {
+        ctx.store.setComposer({ mode: modeSelect.value }, 'silent');
+        ctx.renderActiveView();
+      },
     },
-  });
+    ...Object.entries(TASK_MODE_LABELS).map(([value, label]) => option(value, label, value === composer.mode)),
+  );
+
+  const modeDescription = composer.mode === 'agent'
+    ? 'Implement the task and return changes for Patchwork to apply.'
+    : 'Answer the request in chat without making repository changes.';
 
   const attachmentInput = h('input', {
     type: 'file',
@@ -206,7 +214,7 @@ function renderComposer(ctx) {
   });
 
   const createButton = h('button', {
-    class: 'primary wide',
+    class: 'primary',
     onclick: () => ctx.actions.createTask({ submit: true }),
   }, 'Package and send');
 
@@ -251,12 +259,6 @@ function renderComposer(ctx) {
       selectedPrompts.length ? promptChips : null,
       h('label', { class: 'field' }, h('span', {}, 'Instructions'), taskText),
       h(
-        'label',
-        { class: 'row', style: { gap: '8px' } },
-        answerOnlyCheckbox,
-        h('span', { class: 'field-help' }, 'Answer only — respond in the chat without generating a result file or making changes'),
-      ),
-      h(
         'div',
         { class: 'row' },
         h('button', { class: 'secondary', onclick: () => ctx.actions.openSkillDrawer() }, 'Choose skills'),
@@ -298,7 +300,18 @@ function renderComposer(ctx) {
         : null,
       h('p', { class: 'field-help' }, 'Results are validated against the task base before anything is applied.'),
     ),
-    createButton,
+    h(
+      'div',
+      { class: 'row', style: { alignItems: 'flex-end' } },
+      h(
+        'label',
+        { class: 'field', style: { width: '120px' } },
+        h('span', {}, 'Mode'),
+        modeSelect,
+      ),
+      h('span', { class: 'field-help', style: { flex: '1', paddingBottom: '8px' } }, modeDescription),
+      createButton,
+    ),
   ];
 }
 
