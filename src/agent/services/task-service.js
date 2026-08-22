@@ -70,6 +70,8 @@ Pay particular attention to:
 
 Then output **only the Conventional Commit message** in this format:
 
+Do not append a verification report or test-status section. Mention tests only when they materially affect the change.
+
 \`\`\`text
 <type>(<optional-scope>): <concise summary>
 
@@ -134,6 +136,9 @@ function buildAgentInstructions(taskId, skills = [], options = {}) {
   const summaryOnly = Boolean(options.summaryOnly);
   const answerOnly = Boolean(options.answerOnly);
   const includeIac = Boolean(options.includeIac);
+  const resultSummaryExample = summaryOnly
+    ? 'A concise summary of the change.'
+    : 'A concise summary of the implementation and verification performed.';
   const skillInstructions = skills.length
     ? `## Optional task skills
 
@@ -234,7 +239,7 @@ Base64-encode each patch file. Create a UTF-8 text file named \`chatgpt-ide-resu
   "transport": "plain-text-base64",
   "taskId": "${taskId}",
   "status": "completed",
-  "summary": "A concise summary of the implementation and verification performed.",
+  "summary": "${resultSummaryExample}",
   "commitMessage": "feat(editor): improve result metadata\\n\\nExplain the meaningful behavioral changes, how the affected pieces work together, and any material test, configuration, dependency, API, or breaking-change details.",
   "repositories": [
     {

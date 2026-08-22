@@ -39,6 +39,10 @@ function sourceSuggestionTime(task) {
   return Date.parse(task?.createdAt || '') || 0;
 }
 
+function sourceSuggestionOriginTime(task) {
+  return Date.parse(task?.createdAt || '') || 0;
+}
+
 function sourceSuggestionCandidate(task, repositoryPath) {
   if (task?.summaryOnly) return sourceSuggestionRepositoryPaths(task).includes(repositoryPath);
   return Boolean(task?.result?.commitMessage)
@@ -48,9 +52,18 @@ function sourceSuggestionCandidate(task, repositoryPath) {
 
 function latestSourceSuggestionTask(tasks, repositoryPath) {
   if (!repositoryPath) return null;
-  return (Array.isArray(tasks) ? tasks : [])
+  const candidates = (Array.isArray(tasks) ? tasks : [])
     .filter((task) => sourceSuggestionCandidate(task, repositoryPath))
-    .sort((left, right) => sourceSuggestionTime(right) - sourceSuggestionTime(left))[0] || null;
+    .sort((left, right) => sourceSuggestionTime(right) - sourceSuggestionTime(left));
+
+  const latestAppliedTask = candidates.find((task) => !task.summaryOnly) || null;
+  if (!latestAppliedTask) return candidates[0] || null;
+
+  const latestSummaryTask = candidates
+    .filter((task) => task.summaryOnly)
+    .filter((task) => sourceSuggestionOriginTime(task) > sourceSuggestionTime(latestAppliedTask))[0] || null;
+
+  return latestSummaryTask || latestAppliedTask;
 }
 
 function gitSummaryPhase(task) {

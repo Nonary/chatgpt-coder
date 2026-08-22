@@ -20,6 +20,7 @@ const { ResultService, parsePlainTextResult } = require('../src/agent/services/r
 const { SkillService } = require('../src/agent/services/skill-service');
 const {
   DEFAULT_GIT_SUMMARY_PROMPT,
+  buildAgentInstructions,
   resolveGitSummaryPrompt,
   resolveTreeTaskRepositories,
   TaskService,
@@ -60,6 +61,13 @@ test('Git Summary prompts use the saved prompt when present and the built-in pro
   assert.equal(resolveGitSummaryPrompt('\r\n'), DEFAULT_GIT_SUMMARY_PROMPT);
   assert.match(DEFAULT_GIT_SUMMARY_PROMPT, /Review all \*\*uncommitted Git changes\*\*/);
   assert.ok(DEFAULT_GIT_SUMMARY_PROMPT.includes('<type>(<optional-scope>): <concise summary>'));
+  assert.match(DEFAULT_GIT_SUMMARY_PROMPT, /Do not append a verification report or test-status section/i);
+});
+
+test('Git Summary result instructions do not ask for verification in the generated summary', () => {
+  const instructions = buildAgentInstructions('summary-task', [], { summaryOnly: true });
+  assert.match(instructions, /"summary": "A concise summary of the change\."/);
+  assert.doesNotMatch(instructions, /A concise summary of the implementation and verification performed/);
 });
 
 test('follow-up turns persist Ask/Agent state without rewriting the legacy answerOnly flag', async (context) => {

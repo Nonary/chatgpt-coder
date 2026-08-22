@@ -598,6 +598,39 @@ test('an applied task result becomes the newest Source Control AI suggestion for
   assert.equal(latestSourceSuggestionTask([summaryTask], '/repo/missing'), null);
 });
 
+test('an applied task permanently supersedes an older Git Summary, even when that summary was used later', () => {
+  const { latestSourceSuggestionTask } = require('../src/userscript/src/ui/views/source');
+  const summaryTask = {
+    taskId: 'summary-old',
+    summaryOnly: true,
+    sourceRepositoryPath: '/repo/a',
+    createdAt: '2026-08-21T18:00:00.000Z',
+    completedAt: '2026-08-21T18:12:00.000Z',
+    state: 'completed',
+    repositories: [{ path: '/repo/a', name: 'alpha', readOnly: true }],
+    result: { commitMessage: 'chore(alpha): summarize the old changes' },
+  };
+  const appliedTask = {
+    taskId: 'task-applied',
+    summaryOnly: false,
+    createdAt: '2026-08-21T18:05:00.000Z',
+    appliedAt: '2026-08-21T18:10:00.000Z',
+    state: 'applied',
+    repositories: [{ path: '/repo/a', name: 'alpha', readOnly: false }],
+    result: { commitMessage: 'fix(alpha): apply the generated changes' },
+  };
+  const regeneratedSummary = {
+    ...summaryTask,
+    taskId: 'summary-new',
+    createdAt: '2026-08-21T18:11:00.000Z',
+    completedAt: '2026-08-21T18:13:00.000Z',
+    result: { commitMessage: 'fix(alpha): summarize the post-apply changes' },
+  };
+
+  assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask], '/repo/a')?.taskId, 'task-applied');
+  assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask, regeneratedSummary], '/repo/a')?.taskId, 'summary-new');
+});
+
 test('Git Summary source-control state stays tied to its originating repository and snapshot', () => {
   const {
     gitSummaryIsStale, gitSummaryPhase, latestGitSummaryTask,
