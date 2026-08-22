@@ -11,7 +11,7 @@ const { openPromptManager } = require('./ui/dialogs/prompts');
 const { openRepositoryPicker } = require('./ui/dialogs/repository-picker');
 const { openSkillDrawer } = require('./ui/dialogs/skills');
 const { renderComposer, NEW_PROJECT_VALUE, NEW_TREE_VALUE } = require('./ui/views/composer');
-const { latestGitSummaryTask, renderDiffOverlay, renderSource } = require('./ui/views/source');
+const { latestGitSummaryTask, latestSourceSuggestionTask, renderDiffOverlay, renderSource } = require('./ui/views/source');
 const { renderHistory } = require('./ui/views/history');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
@@ -46,6 +46,7 @@ class App {
     this.eventSequence = 0;
     this.notifiedUpdateKey = null;
     this.taskTargetUpdates = new Map();
+    this.sourceSuggestionRequests = new Map();
     this.actions = this.buildActions();
     this.setupViews();
   }
@@ -197,7 +198,19 @@ class App {
     if (['merge-completed', 'merge-failed', 'merge-submitted', 'tree-created', 'tree-removed'].includes(event.type)) {
       this.refreshTrees().catch(() => {});
     }
-    if (['task-applied', 'task-rolled-back', 'task-conflicted'].includes(event.type)) {
+    if (event.type === 'task-applied') {
+      const repositoryPath = this.store.state.sourceRepositoryPath;
+      const appliesToSource = repositoryPath
+        && (event.task?.repositories || []).some((repository) => (
+          !repository.readOnly && repository.path === repositoryPath
+        ));
+      if (appliesToSource) {
+        this.ensureSourceControlSuggestion(repositoryPath)
+          .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`));
+      } else {
+        this.refreshSource().catch(() => {});
+      }
+    } else if (['task-rolled-back', 'task-conflicted'].includes(event.type)) {
       this.refreshSource().catch(() => {});
     }
     this.renderActiveView();
@@ -374,6 +387,39 @@ class App {
       if (showErrors) this.toast(error.message, true);
       return [];
     }
+  }
+
+  async startGitSummaryTask(repositoryPath) {
+    const { task } = await this.api.gitSummary({ path: repositoryPath });
+    this.store.upsertTask(task);
+    const submitted = await this.driver.submitTask(task);
+    this.store.upsertTask(submitted);
+    await this.refreshSource();
+    this.renderActiveView();
+    return submitted;
+  }
+
+  async ensureSourceControlSuggestion(repositoryPath, status = null) {
+    if (!repositoryPath || this.store.state.sourceRepositoryPath !== repositoryPath) return null;
+    const pending = this.sourceSuggestionRequests.get(repositoryPath);
+    if (pending) return pending;
+
+    const request = (async () => {
+      const currentStatus = status || await this.refreshSource();
+      if (!currentStatus?.changes?.length) return null;
+
+      const suggestionTask = latestSourceSuggestionTask(this.store.state.tasks, repositoryPath);
+      if (!suggestionTask || suggestionTask.summaryOnly) return null;
+
+      return this.startGitSummaryTask(repositoryPath);
+    })();
+    this.sourceSuggestionRequests.set(repositoryPath, request);
+    request.finally(() => {
+      if (this.sourceSuggestionRequests.get(repositoryPath) === request) {
+        this.sourceSuggestionRequests.delete(repositoryPath);
+      }
+    }).catch(() => {});
+    return request;
   }
 
   /* ------------------------------------------------------------------ actions */
@@ -781,11 +827,17 @@ class App {
       selectSourceRepository(path) {
         app.store.set({ sourceRepositoryPath: path, sourceStatus: null });
         app.persist('source-repository', path);
-        app.refreshSource().then(() => app.renderActiveView());
+        app.refreshSource()
+          .then((status) => app.ensureSourceControlSuggestion(path, status))
+          .then(() => app.renderActiveView())
+          .catch(() => app.renderActiveView());
       },
 
       refreshSource() {
-        return app.refreshSource().then(() => app.renderActiveView());
+        const repositoryPath = app.store.state.sourceRepositoryPath;
+        return app.refreshSource()
+          .then((status) => app.ensureSourceControlSuggestion(repositoryPath, status))
+          .then(() => app.renderActiveView());
       },
 
       async removeSourceRepository() {
@@ -847,14 +899,10 @@ class App {
       },
 
       generateGitSummary() {
-        return app.run(async () => {
-          const { task } = await app.api.gitSummary({ path: app.store.state.sourceRepositoryPath });
-          app.store.upsertTask(task);
-          const submitted = await app.driver.submitTask(task);
-          app.store.upsertTask(submitted);
-          await app.refreshSource();
-          app.renderActiveView();
-        }, { failure: 'The Git summary could not be generated.' });
+        return app.run(
+          () => app.startGitSummaryTask(app.store.state.sourceRepositoryPath),
+          { failure: 'The Git summary could not be generated.' },
+        );
       },
 
       async openDiff(path, staged) {
@@ -989,6 +1037,8 @@ class App {
       this.refreshIac(),
       this.refreshSource(),
     ]);
+    this.ensureSourceControlSuggestion(this.store.state.sourceRepositoryPath, this.store.state.sourceStatus)
+      .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`));
     this.refreshProjects().catch(() => {});
 
     const composerRepositories = this.store.state.repositories.filter((repository) => !repository.unavailable);

@@ -1,9 +1,9 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { appendPromptInstructions } = require('../services/prompt-service');
+const { appendPromptInstructions, resolveGitSummaryPrompt } = require('../services/prompt-service');
 const {
-  buildFollowUpPrompt, followUpTurn, resolveGitSummaryPrompt, resolveTreeTaskRepositories,
+  buildFollowUpPrompt, followUpTurn, resolveTreeTaskRepositories,
 } = require('../services/task-service');
 const { validateCommitMessage } = require('../services/worktree-service');
 const {

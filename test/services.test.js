@@ -20,8 +20,11 @@ const { ResultService, parsePlainTextResult } = require('../src/agent/services/r
 const { SkillService } = require('../src/agent/services/skill-service');
 const {
   DEFAULT_GIT_SUMMARY_PROMPT,
-  buildAgentInstructions,
+  PromptService,
   resolveGitSummaryPrompt,
+} = require('../src/agent/services/prompt-service');
+const {
+  buildAgentInstructions,
   resolveTreeTaskRepositories,
   TaskService,
 } = require('../src/agent/services/task-service');
@@ -62,6 +65,28 @@ test('Git Summary prompts use the saved prompt when present and the built-in pro
   assert.match(DEFAULT_GIT_SUMMARY_PROMPT, /Review all \*\*uncommitted Git changes\*\*/);
   assert.ok(DEFAULT_GIT_SUMMARY_PROMPT.includes('<type>(<optional-scope>): <concise summary>'));
   assert.match(DEFAULT_GIT_SUMMARY_PROMPT, /Do not append a verification report or test-status section/i);
+});
+
+test('Git Summary prompt service uses the saved prompt as the replaceable Source Control instruction', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-prompts-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const prompts = new PromptService(root);
+  assert.equal(await prompts.gitSummaryPrompt(), null);
+
+  await prompts.save({
+    name: 'Git Summary',
+    description: 'Source Control commit message prompt',
+    content: 'Write a concise Conventional Commit message for these changes.',
+  });
+
+  assert.equal(
+    await prompts.gitSummaryPrompt(),
+    'Write a concise Conventional Commit message for these changes.',
+  );
+  assert.equal(
+    resolveGitSummaryPrompt(await prompts.gitSummaryPrompt()),
+    'Write a concise Conventional Commit message for these changes.',
+  );
 });
 
 test('Git Summary result instructions do not ask for verification in the generated summary', () => {
