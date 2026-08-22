@@ -11,6 +11,7 @@ const REASONING_LABELS = {
   medium: 'Medium',
   high: 'High',
   'extra-high': 'Extra High',
+  pro: 'Pro',
 };
 
 const TASK_MODE_LABELS = {

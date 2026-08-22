@@ -13,12 +13,15 @@ const TASK_MODEL_PICKER_OPTIONS = {
     defaultSlug: 'gpt-5-6',
     instantSlug: 'gpt-5-6-instant',
     thinkingSlug: 'gpt-5-6-thinking',
+    proSlug: 'gpt-5-6-pro',
+    reasoningModes: ['default', 'instant', 'low', 'medium', 'high', 'extra-high', 'pro'],
   },
   luna: {
     label: 'GPT-5.6 Luna',
     defaultSlug: 'gpt-5-6-t-mini',
     instantSlug: 'gpt-5-6-mini',
     thinkingSlug: 'gpt-5-6-t-mini',
+    reasoningModes: ['default', 'instant', 'low', 'medium', 'high', 'extra-high'],
   },
 };
 
@@ -28,7 +31,13 @@ const TASK_REASONING_PICKER_OPTIONS = {
   medium: { label: 'Medium', thinkingEffort: 'standard' },
   high: { label: 'High', thinkingEffort: 'extended' },
   'extra-high': { label: 'Extra High', thinkingEffort: 'max' },
+  pro: { label: 'Pro', thinkingEffort: null },
 };
+
+function taskModelSupportsReasoning(model, reasoningMode) {
+  const modelKey = String(model || 'default').toLowerCase() === 'default' ? 'sol' : String(model || '').toLowerCase();
+  return Boolean(TASK_MODEL_PICKER_OPTIONS[modelKey]?.reasoningModes.includes(reasoningMode));
+}
 
 function basename(value) {
   return String(value || '').split(/[\\/]/).pop() || '';
@@ -102,7 +111,12 @@ function taskRequestConfiguration(model, reasoningMode) {
   if (requestedReasoning !== 'default' && !reasoningOption) {
     throw new Error(`Unsupported ChatGPT reasoning mode: ${reasoningMode}`);
   }
-  const modelSlug = requestedReasoning === 'instant'
+  if (!taskModelSupportsReasoning(requestedModel, requestedReasoning)) {
+    throw new Error(`Unsupported ChatGPT reasoning mode for ${model}: ${reasoningMode}`);
+  }
+  const modelSlug = requestedReasoning === 'pro'
+    ? modelOption.proSlug
+    : requestedReasoning === 'instant'
     ? modelOption.instantSlug
     : requestedReasoning === 'default'
       ? modelOption.defaultSlug
@@ -165,6 +179,7 @@ module.exports = {
   RESULT_NAME_PATTERN,
   TASK_MODEL_PICKER_OPTIONS,
   TASK_REASONING_PICKER_OPTIONS,
+  taskModelSupportsReasoning,
   chatGPTProjectUrl,
   conversationIdFromRouteUrl,
   conversationRequestIncludesAttachment,

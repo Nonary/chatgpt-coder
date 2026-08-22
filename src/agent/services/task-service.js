@@ -16,11 +16,12 @@ const {
   conversationIdFromRouteUrl,
   isChatGPTConversationUrl,
   normalizeConversationTitle,
+  taskModelSupportsReasoning,
 } = require('../../shared/chatgpt');
 
 const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', 'sol', 'luna']);
-const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high']);
+const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high', 'pro']);
 const FOLLOW_UP_MODES = new Set(['ask', 'agent']);
 const FOLLOW_UP_ACTIVE_STATES = new Set(['created', 'submitted', 'awaiting-result']);
 
@@ -63,6 +64,12 @@ function normalizeReasoningMode(value) {
   const mode = String(value || 'default').trim().toLowerCase();
   if (!REASONING_MODES.has(mode)) throw new Error(`Unsupported ChatGPT reasoning mode: ${value}`);
   return mode;
+}
+
+function validateTaskConfiguration(model, reasoningMode) {
+  if (!taskModelSupportsReasoning(model, reasoningMode)) {
+    throw new Error(`Unsupported ChatGPT reasoning mode for ${model}: ${reasoningMode}`);
+  }
 }
 
 function normalizeFollowUpMode(value) {
@@ -523,6 +530,7 @@ class TaskService {
     }
     const model = normalizeTaskModel(input.model);
     const reasoningMode = normalizeReasoningMode(input.reasoningMode);
+    validateTaskConfiguration(model, reasoningMode);
     const summaryOnly = Boolean(input.summaryOnly);
     const answerOnly = Boolean(input.answerOnly);
 
@@ -867,6 +875,7 @@ class TaskService {
       const resolvedPrompt = String(input.resolvedPrompt || prompt).trim();
       const model = normalizeTaskModel(input.model ?? task.model);
       const reasoningMode = normalizeReasoningMode(input.reasoningMode ?? task.reasoningMode);
+      validateTaskConfiguration(model, reasoningMode);
       const promptIds = Array.isArray(input.promptIds) ? input.promptIds.map((id) => String(id)).filter(Boolean) : [];
       const taskSkillIds = new Set((Array.isArray(task.skills) ? task.skills : []).map((skill) => String(skill.id)));
       const skillIds = Array.isArray(input.skillIds) ? input.skillIds.map((id) => String(id)).filter(Boolean) : [];

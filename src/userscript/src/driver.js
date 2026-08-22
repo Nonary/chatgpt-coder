@@ -96,6 +96,8 @@ class Driver {
       }
     }
     await this.api.taskFailed(task.taskId, lastError.message).catch(() => {});
+    this.stop();
+    if (this.activeTaskId === task.taskId) this.activeTaskId = null;
     throw lastError;
   }
 
@@ -724,8 +726,26 @@ class Driver {
     if (recovery) this.reconcileMerge().catch(() => {});
   }
 
-  adoptTask(task) {
-    if (this.canWatchTask(task)) this.watchTask(task, { recovery: true });
+  async adoptTask(task) {
+    if (!this.canWatchTask(task)) return false;
+
+    if (task.summaryOnly) {
+      // Git Summary result monitoring depends on the ChatGPT conversation DOM.
+      // Never attach a historical summary to an unrelated conversation just
+      // because its persisted task state still says "submitted".
+      const currentConversationId = conversationIdFromRouteUrl(location.href);
+      const taskConversationId = this.conversationIdFor(task);
+      if (!taskConversationId) return false;
+      if (currentConversationId !== taskConversationId) {
+        const record = await chatgpt.conversation(taskConversationId).catch(() => null);
+        if (!record) return false;
+        await this.reconcileTask(task, { record });
+        return false;
+      }
+    }
+
+    this.watchTask(task, { recovery: true });
+    return true;
   }
 
   adoptMerge(tree) {

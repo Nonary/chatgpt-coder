@@ -25,6 +25,18 @@ function latestGitSummaryTask(tasks, repositoryPath) {
     })[0] || null;
 }
 
+function activeGitSummaryTask(tasks, repositoryPath, activeTaskId) {
+  if (!repositoryPath || !activeTaskId) return null;
+  // Source Control history is persisted, but the Generate button must only
+  // reflect a summary generation the page is actively watching.
+  return (Array.isArray(tasks) ? tasks : []).find((task) => (
+    task?.taskId === activeTaskId
+    && task.summaryOnly
+    && taskRepositoryPath(task) === repositoryPath
+    && ['preparing', 'running', 'finalizing'].includes(gitSummaryPhase(task))
+  )) || null;
+}
+
 function sourceSuggestionRepositoryPaths(task) {
   if (!task) return [];
   if (task.summaryOnly) return taskRepositoryPath(task) ? [taskRepositoryPath(task)] : [];
@@ -44,7 +56,10 @@ function sourceSuggestionOriginTime(task) {
 }
 
 function sourceSuggestionCandidate(task, repositoryPath) {
-  if (task?.summaryOnly) return sourceSuggestionRepositoryPaths(task).includes(repositoryPath);
+  if (task?.summaryOnly) {
+    return ['ready', 'completed', 'failed'].includes(gitSummaryPhase(task))
+      && sourceSuggestionRepositoryPaths(task).includes(repositoryPath);
+  }
   return Boolean(task?.result?.commitMessage)
     && task.state === 'applied'
     && sourceSuggestionRepositoryPaths(task).includes(repositoryPath);
@@ -241,10 +256,11 @@ function renderRepositoryPanel(ctx, repository) {
   const repositoryPath = repository.path;
   const status = state.sourceStatuses[repositoryPath] || null;
   const expanded = state.sourceExpandedPaths.includes(repositoryPath);
-  const summaryTask = latestGitSummaryTask(state.tasks, repositoryPath);
+  const activeSummaryTask = activeGitSummaryTask(state.tasks, repositoryPath, ctx.driver.activeTaskId);
   const suggestionTask = latestSourceSuggestionTask(state.tasks, repositoryPath);
-  const summaryPhase = gitSummaryPhase(summaryTask);
+  const summaryPhase = gitSummaryPhase(activeSummaryTask);
   const summaryBusy = ['preparing', 'running', 'finalizing'].includes(summaryPhase);
+  const suggestionDisplayTask = activeSummaryTask || suggestionTask;
   const changeCount = status?.changes?.length || 0;
   const branch = status?.repository?.branch || repository.branch || 'no branch';
   const revision = status?.repository?.baseCommit ? shortCommit(status.repository.baseCommit) : 'no commit';
@@ -287,7 +303,7 @@ function renderRepositoryPanel(ctx, repository) {
       h(
         'div',
         { class: 'source-repository-body' },
-        suggestionTask ? renderSourceSuggestionCard(ctx, suggestionTask, repositoryPath, status) : null,
+        suggestionDisplayTask ? renderSourceSuggestionCard(ctx, suggestionDisplayTask, repositoryPath, status) : null,
         h('div', { class: 'empty-state' }, 'Patchwork could not load Git status for this repository.'),
         h('div', { class: 'row' },
           h('button', { class: 'secondary', onclick: () => ctx.actions.refreshSource(repositoryPath) }, 'Retry'),
@@ -360,7 +376,7 @@ function renderRepositoryPanel(ctx, repository) {
       'div',
       { class: 'source-repository-body' },
       commitCard,
-      suggestionTask ? renderSourceSuggestionCard(ctx, suggestionTask, repositoryPath, status) : null,
+      suggestionDisplayTask ? renderSourceSuggestionCard(ctx, suggestionDisplayTask, repositoryPath, status) : null,
       group(ctx, repositoryPath, 'Staged changes', staged, true, () => ctx.actions.gitUnstageAll(repositoryPath)),
       group(ctx, repositoryPath, 'Changes', unstaged, false, () => ctx.actions.gitStageAll(repositoryPath)),
       history,
@@ -457,6 +473,7 @@ function renderDiffOverlay(ctx, diff) {
 }
 
 module.exports = {
+  activeGitSummaryTask,
   gitSummaryIsStale,
   gitSummaryPhase,
   latestGitSummaryTask,

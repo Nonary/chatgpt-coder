@@ -1,5 +1,6 @@
 const { h, option } = require('../dom');
 const { MODEL_LABELS, REASONING_LABELS, taskLabel } = require('../labels');
+const { taskModelSupportsReasoning } = require('../../../../shared/chatgpt');
 
 function openConflictResolution({ shell, task, onSubmit }) {
   const modelSelect = h(
@@ -10,11 +11,13 @@ function openConflictResolution({ shell, task, onSubmit }) {
   const reasoningSelect = h(
     'select',
     { class: 'field-control' },
-    ...Object.entries(REASONING_LABELS).map(([value, label]) => option(
-      value,
-      value === 'default' ? 'Default reasoning' : label,
-      value === (task.reasoningMode || 'default'),
-    )),
+    ...Object.entries(REASONING_LABELS)
+      .filter(([value]) => taskModelSupportsReasoning(task.model || 'default', value))
+      .map(([value, label]) => option(
+        value,
+        value === 'default' ? 'Default reasoning' : label,
+        value === (task.reasoningMode || 'default'),
+      )),
   );
   const instructions = h('textarea', {
     class: 'field-control',

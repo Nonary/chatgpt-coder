@@ -238,6 +238,62 @@ test('prepared tasks can adopt and reconcile a manually submitted conversation',
   }
 });
 
+test('stale Git Summary tasks from another conversation are reconciled without becoming the active Source Control generation', async () => {
+  const chatgpt = require('../src/userscript/src/chatgpt/api');
+  const { Driver } = require('../src/userscript/src/driver');
+  const previous = {
+    conversation: chatgpt.conversation,
+    document: global.document,
+    location: global.location,
+  };
+  const summaryConversationId = '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33';
+  const task = {
+    taskId: 'stale-summary',
+    summaryOnly: true,
+    state: 'submitted',
+    chatStatus: 'streaming',
+    conversationId: summaryConversationId,
+    conversationUrl: `https://chatgpt.com/c/${summaryConversationId}`,
+  };
+  global.location = { href: 'https://chatgpt.com/c/another-conversation' };
+  global.document = { title: 'Source Control' };
+  chatgpt.conversation = async () => ({ mapping: {} });
+  const driver = new Driver({
+    api: {
+      taskChatStatus: async () => ({ task }),
+    },
+  });
+
+  try {
+    await driver.adoptTask(task);
+    assert.equal(driver.activeTaskId, null);
+  } finally {
+    chatgpt.conversation = previous.conversation;
+    global.document = previous.document;
+    global.location = previous.location;
+  }
+});
+
+test('a failed submission clears the driver active task so Source Control cannot remain stuck generating', async () => {
+  const { Driver } = require('../src/userscript/src/driver');
+  const failed = new Error('Send failed.');
+  const calls = [];
+  const task = { taskId: 'failed-summary', summaryOnly: true };
+  const driver = new Driver({
+    api: {
+      taskFailed: async (taskId, message) => calls.push([taskId, message]),
+    },
+  });
+  driver.submitTaskOnce = async () => {
+    driver.activeTaskId = task.taskId;
+    throw failed;
+  };
+
+  await assert.rejects(() => driver.submitTask(task), failed);
+  assert.deepEqual(calls, [['failed-summary', 'Send failed.']]);
+  assert.equal(driver.activeTaskId, null);
+});
+
 test('the cloned send stream signals generation completion', async () => {
   const { waitForResponseCompletion } = require('../src/userscript/src/chatgpt/intercept');
   const response = new Response(new ReadableStream({

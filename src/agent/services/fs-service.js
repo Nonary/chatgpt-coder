@@ -40,10 +40,14 @@ class FsService {
       args = [
         '-NoLogo', '-NoProfile', '-STA', '-NonInteractive', '-Command',
         [
+          '$ErrorActionPreference = \'Stop\'',
           'Add-Type -AssemblyName System.Windows.Forms',
+          '[System.Windows.Forms.Application]::EnableVisualStyles()',
           '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
           '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
           "$dialog.Description = 'Select a Git repository folder'",
+          '$dialog.ShowNewFolderButton = $true',
+          '$dialog.TopMost = $true',
           '$dialog.SelectedPath = $env:PATCHWORK_PICKER_INITIAL_DIRECTORY',
           'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {',
           '  [Console]::Out.Write($dialog.SelectedPath)',
@@ -63,13 +67,17 @@ class FsService {
     }
 
     let stdout;
+    let stderr;
     try {
-      ({ stdout } = await this.execute(command, args, options));
+      ({ stdout, stderr } = await this.execute(command, args, options));
     } catch (error) {
       const canceled = (this.platform === 'darwin' && error.code === 1)
         || (this.platform !== 'win32' && this.platform !== 'darwin' && error.code === 1);
       if (canceled) return null;
       throw new Error(`The operating system folder picker could not be opened: ${error.message}`);
+    }
+    if (String(stderr || '').trim()) {
+      throw new Error(`The operating system folder picker could not be opened: ${String(stderr).trim()}`);
     }
     const selectedPath = String(stdout || '').trim();
     if (!selectedPath) return null;

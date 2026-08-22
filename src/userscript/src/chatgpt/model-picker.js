@@ -1,6 +1,7 @@
 const {
   TASK_MODEL_PICKER_OPTIONS,
   TASK_REASONING_PICKER_OPTIONS,
+  taskModelSupportsReasoning,
 } = require('../../../shared/chatgpt');
 const { isDarkTheme, observeTheme } = require('../ui/theme');
 
@@ -42,6 +43,7 @@ const MENU_ITEMS = [
   { choice: 'reasoning:medium', label: 'Medium' },
   { choice: 'reasoning:high', label: 'High' },
   { choice: 'reasoning:extra-high', label: 'Extra High' },
+  { choice: 'reasoning:pro', label: 'Pro' },
 ];
 
 // Both shadow roots carry the same tokens the dock uses, taken from ChatGPT's
@@ -127,6 +129,10 @@ function displayLabel(current = selection) {
 
 function selectedSlug(current = selection) {
   const option = TASK_MODEL_PICKER_OPTIONS[displayModel(current)];
+  if (!taskModelSupportsReasoning(displayModel(current), current.reasoningMode)) {
+    return option.defaultSlug;
+  }
+  if (current.reasoningMode === 'pro') return option.proSlug;
   if (current.reasoningMode === 'instant') return option.instantSlug;
   if (current.reasoningMode === 'default') return option.defaultSlug;
   return option.thinkingSlug;
@@ -139,9 +145,17 @@ function isChecked(choice, current = selection) {
 
 function applyChoice(choice, current = selection) {
   const [kind, value] = choice.split(':');
-  if (kind === 'model') current.model = value;
-  else current.reasoningMode = value;
+  if (kind === 'model') {
+    current.model = value;
+    if (!taskModelSupportsReasoning(displayModel(current), current.reasoningMode)) current.reasoningMode = 'default';
+  }
+  else if (taskModelSupportsReasoning(displayModel(current), value)) current.reasoningMode = value;
   return current;
+}
+
+function menuItems(current = selection) {
+  return MENU_ITEMS.filter((item) => !item.choice || item.choice.startsWith('model:')
+    || taskModelSupportsReasoning(displayModel(current), item.choice.slice('reasoning:'.length)));
 }
 
 // What the request interceptor should enforce right now, including any change the
@@ -160,6 +174,7 @@ function setSelection({ model, reasoningMode } = {}) {
   if (!changed) return currentSelection();
   if (model) selection.model = model;
   if (reasoningMode) selection.reasoningMode = reasoningMode;
+  if (!taskModelSupportsReasoning(displayModel(), selection.reasoningMode)) selection.reasoningMode = 'default';
   const picker = document.getElementById(PICKER_ID);
   picker?.__patchworkRender?.();
   session?.menu?.renderMenu?.();
@@ -257,15 +272,18 @@ function buildMenu(picker, renderPicker) {
         persistSelection();
         session?.onChange?.(currentSelection());
       });
-      options.push(option);
+      options.push({ element: option, choice: item.choice });
       menu.append(option);
     }
   }
   shadow.append(menu);
 
   const renderMenu = () => {
-    for (const option of options) {
-      option.setAttribute('aria-checked', String(isChecked(option.getAttribute('data-choice'))));
+    for (const { element, choice } of options) {
+      const available = !choice.startsWith('reasoning:')
+        || taskModelSupportsReasoning(displayModel(), choice.slice('reasoning:'.length));
+      element.hidden = !available;
+      element.setAttribute('aria-checked', String(available && isChecked(choice)));
     }
   };
   const close = () => {
@@ -598,6 +616,7 @@ module.exports = {
   install,
   installWhenReady,
   isChecked,
+  menuItems,
   isInstalled,
   reasoningLabel,
   selectedSlug,

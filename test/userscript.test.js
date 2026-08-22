@@ -313,10 +313,14 @@ test('task request configuration maps models and reasoning to ChatGPT slugs', ()
   assert.deepEqual(taskRequestConfiguration('sol', 'instant'), {
     model: 'sol', reasoningMode: 'instant', modelSlug: 'gpt-5-6-instant', thinkingEffort: null,
   });
+  assert.deepEqual(taskRequestConfiguration('sol', 'pro'), {
+    model: 'sol', reasoningMode: 'pro', modelSlug: 'gpt-5-6-pro', thinkingEffort: null,
+  });
   assert.deepEqual(taskRequestConfiguration('luna', 'medium'), {
     model: 'luna', reasoningMode: 'medium', modelSlug: 'gpt-5-6-t-mini', thinkingEffort: 'standard',
   });
   assert.equal(taskRequestConfiguration('default', 'default').modelSlug, 'gpt-5-6');
+  assert.throws(() => taskRequestConfiguration('luna', 'pro'), /Unsupported ChatGPT reasoning mode for luna/);
   assert.throws(() => taskRequestConfiguration('gemini', 'high'), /Unsupported ChatGPT model/);
   assert.throws(() => taskRequestConfiguration('sol', 'ludicrous'), /Unsupported ChatGPT reasoning mode/);
 });
@@ -728,7 +732,7 @@ test('applying a task does not automatically launch a redundant Git Summary task
 
 test('Git Summary source-control state stays tied to its originating repository and snapshot', () => {
   const {
-    gitSummaryIsStale, gitSummaryPhase, latestGitSummaryTask,
+    activeGitSummaryTask, gitSummaryIsStale, gitSummaryPhase, latestGitSummaryTask, latestSourceSuggestionTask,
   } = require('../src/userscript/src/ui/views/source');
   const repositoryTask = {
     taskId: 'summary-a',
@@ -762,6 +766,18 @@ test('Git Summary source-control state stays tied to its originating repository 
   assert.equal(gitSummaryPhase({ summaryOnly: true, state: 'submitted' }), 'running');
   assert.equal(gitSummaryPhase({ summaryOnly: true, state: 'submitted', chatStatus: 'failed' }), 'failed');
   assert.equal(gitSummaryPhase({ summaryOnly: true, state: 'completed' }), 'completed');
+  assert.equal(activeGitSummaryTask([{
+    ...repositoryTask,
+    state: 'submitted',
+    chatStatus: 'streaming',
+  }], '/repo/a', 'summary-a')?.taskId, 'summary-a');
+  assert.equal(activeGitSummaryTask([repositoryTask], '/repo/a', 'summary-missing'), null);
+  assert.equal(latestSourceSuggestionTask([{
+    ...repositoryTask,
+    taskId: 'summary-running',
+    state: 'submitted',
+    chatStatus: 'streaming',
+  }], '/repo/a')?.taskId, null);
   assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-a' }, changeFingerprint: 'snapshot-a' }), false);
   assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-a' }, changeFingerprint: 'snapshot-b' }), true);
   assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-b' }, changeFingerprint: 'snapshot-a' }), true);
@@ -1566,10 +1582,12 @@ test('the composer picker maps every menu choice to the slug ChatGPT expects', (
   assert.equal(picker.displayLabel({ model: 'default', reasoningMode: 'default' }), 'Sol · Auto');
   assert.equal(picker.displayLabel({ model: 'luna', reasoningMode: 'high' }), 'Luna · High');
   assert.equal(picker.displayLabel({ model: 'sol', reasoningMode: 'extra-high' }), 'Sol · Extra High');
+  assert.equal(picker.displayLabel({ model: 'sol', reasoningMode: 'pro' }), 'Sol · Pro');
 
   assert.equal(picker.selectedSlug({ model: 'default', reasoningMode: 'default' }), 'gpt-5-6');
   assert.equal(picker.selectedSlug({ model: 'sol', reasoningMode: 'instant' }), 'gpt-5-6-instant');
   assert.equal(picker.selectedSlug({ model: 'sol', reasoningMode: 'high' }), 'gpt-5-6-thinking');
+  assert.equal(picker.selectedSlug({ model: 'sol', reasoningMode: 'pro' }), 'gpt-5-6-pro');
   assert.equal(picker.selectedSlug({ model: 'luna', reasoningMode: 'instant' }), 'gpt-5-6-mini');
   assert.equal(picker.selectedSlug({ model: 'luna', reasoningMode: 'medium' }), 'gpt-5-6-t-mini');
 
@@ -1587,7 +1605,9 @@ test('the composer picker maps every menu choice to the slug ChatGPT expects', (
     'model:sol', 'model:luna',
     'reasoning:default', 'reasoning:instant', 'reasoning:low',
     'reasoning:medium', 'reasoning:high', 'reasoning:extra-high',
+    'reasoning:pro',
   ]);
+  assert.equal(picker.menuItems({ model: 'luna', reasoningMode: 'default' }).some((item) => item.choice === 'reasoning:pro'), false);
 });
 
 test('the picker recognizes ChatGPT model controls without matching ordinary buttons', () => {

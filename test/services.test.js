@@ -613,6 +613,23 @@ test('task model and reasoning selections are persisted with the task', async (c
   assert.equal(lowTask.reasoningMode, 'low');
   const storedLowTask = await tasks.getTask(lowTask.taskId);
   assert.equal(storedLowTask.reasoningMode, 'low');
+
+  const proTask = await tasks.createTask({
+    taskText: 'Use Sol Pro.',
+    repositories: [repository],
+    model: 'sol',
+    reasoningMode: 'pro',
+  });
+  assert.equal(proTask.reasoningMode, 'pro');
+  await assert.rejects(
+    tasks.createTask({
+      taskText: 'Luna cannot use Pro.',
+      repositories: [repository],
+      model: 'luna',
+      reasoningMode: 'pro',
+    }),
+    /Unsupported ChatGPT reasoning mode for luna: pro/,
+  );
 });
 
 test('submitted tasks can change their apply target without rebuilding the task package', async (context) => {
@@ -1678,7 +1695,7 @@ test('a resolved tree can immediately prepare the resumed final merge', async (c
   assert.equal((await trees.list()).length, 1);
 });
 
-test('existing Git worktrees are discovered from workspace repositories', async (context) => {
+test('unmanaged Git worktrees are not added to the coding-tree catalog', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-discovered-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
@@ -1688,60 +1705,20 @@ test('existing Git worktrees are discovered from workspace repositories', async 
   await runGit(existingPath, ['add', 'existing.txt']);
   await runGit(existingPath, ['commit', '-m', 'feat: add existing worktree change']);
 
-  const trees = new WorktreeService(
-    path.join(root, 'data'),
-    () => {},
-    async () => [{ path: repositoryPath }],
-  );
+  const trees = new WorktreeService(path.join(root, 'data'));
   await trees.initialize();
-  let [tree] = await trees.list();
-  assert.equal(tree.path, await fs.realpath(existingPath));
-  assert.equal(tree.repositoryPath, await fs.realpath(repositoryPath));
-  assert.equal(tree.branch, 'feature/existing-tree');
-  assert.equal(tree.sourceBranch, 'main');
-  assert.equal(tree.managed, false);
-  assert.equal(tree.discovered, true);
-  assert.equal(tree.available, true);
-  assert.equal(tree.clean, true);
-  assert.equal(tree.commitCount, 1);
-
-  tree = await trees.attachTask(tree.id, 'existing-tree-task');
-  assert.deepEqual(tree.taskIds, ['existing-tree-task']);
-
-  const reloaded = await new WorktreeService(
-    path.join(root, 'data'),
-    () => {},
-    async () => [{ path: repositoryPath }],
-  ).list();
-  assert.equal(reloaded.length, 1);
-  assert.deepEqual(reloaded[0].taskIds, ['existing-tree-task']);
-
-  const mergeRequest = await trees.buildMergeRequest(tree.id);
-  assert.equal(mergeRequest.treeId, tree.id);
-  await trees.remove(tree.id, true);
-  await assert.rejects(fs.stat(existingPath), { code: 'ENOENT' });
-  assert.equal((await trees.list()).length, 0);
+  assert.deepEqual(await trees.list(), []);
+  assert.deepEqual(await trees.readRecords(), []);
+  await assert.rejects(() => trees.get('git-external-tree'), /selected coding tree no longer exists/);
+  assert.equal((await fs.stat(existingPath)).isDirectory(), true);
 });
 
-test('simultaneous worktree refreshes share one repository discovery pass', async (context) => {
+test('tree listing reads explicit records without invoking repository discovery', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-discovery-coalesce-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
-  let providerCalls = 0;
-  let releaseProvider;
-  const providerReady = new Promise((resolve) => { releaseProvider = resolve; });
-  const trees = new WorktreeService(path.join(root, 'data'), () => {}, async () => {
-    providerCalls += 1;
-    await providerReady;
-    return [];
-  });
+  const trees = new WorktreeService(path.join(root, 'data'), () => {});
   await trees.initialize();
-
-  const first = trees.syncDiscoveredWorktrees();
-  const second = trees.syncDiscoveredWorktrees();
-  releaseProvider();
-  await Promise.all([first, second]);
-
-  assert.equal(providerCalls, 1);
+  assert.deepEqual(await trees.list(), []);
 });
 
 test('creating a task tree with the same repository and name reuses the existing tree', async (context) => {

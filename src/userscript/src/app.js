@@ -276,9 +276,9 @@ class App {
     if (current) {
       this.store.set({ activeTaskId: current.taskId }, 'silent');
       this.store.resetFollowUp(current, 'silent');
-      this.driver.adoptTask(current);
+      this.driver.adoptTask(current).catch(() => {});
     } else if (running) {
-      this.driver.adoptTask(running);
+      this.driver.adoptTask(running).catch(() => {});
     }
     return tasks;
   }
@@ -638,7 +638,6 @@ class App {
           app.store.upsertTask(task);
           app.store.setComposer({ taskText: '', attachments: [], treeName: '' }, 'silent');
           app.store.set({ activeTaskId: task.taskId, activity: [] }, 'tasks');
-          await app.refreshTrees().catch(() => {});
           app.renderActiveView();
           if (submit) await app.actions.submitTask(task.taskId);
           return task;

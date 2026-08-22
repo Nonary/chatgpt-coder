@@ -1,4 +1,3 @@
-const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { fingerprintRepository, inspectRepository, runGit, slugify } = require('./git');
@@ -85,23 +84,13 @@ function parseWorktreeList(output) {
   return worktrees;
 }
 
-function branchName(value) {
-  return String(value || '').replace(/^refs\/heads\//, '') || '(detached HEAD)';
-}
-
-function discoveredTreeId(worktreePath) {
-  return `git-${crypto.createHash('sha256').update(worktreePath).digest('hex').slice(0, 12)}`;
-}
-
 class WorktreeService {
-  constructor(dataRoot, onEvent = () => {}, repositoryProvider = async () => []) {
+  constructor(dataRoot, onEvent = () => {}) {
     this.dataRoot = dataRoot;
     this.worktreesRoot = path.join(dataRoot, 'worktrees');
     this.mergesRoot = path.join(dataRoot, 'merge-workspaces');
     this.recordsFile = path.join(dataRoot, 'worktrees.json');
     this.onEvent = onEvent;
-    this.repositoryProvider = repositoryProvider;
-    this.discoverySync = null;
   }
 
   async initialize() {
@@ -119,7 +108,12 @@ class WorktreeService {
   async readRecords() {
     await this.initialize();
     const value = JSON.parse(await fs.readFile(this.recordsFile, 'utf8'));
-    return Array.isArray(value.worktrees) ? value.worktrees : [];
+    // Older versions persisted automatically discovered Git worktrees. They
+    // are not Patchwork coding trees and must not reappear after discovery is
+    // disabled, so only explicit records remain visible to the service.
+    return Array.isArray(value.worktrees)
+      ? value.worktrees.filter((tree) => tree?.managed !== false && tree?.discovered !== true)
+      : [];
   }
 
   async writeRecords(records) {
@@ -127,13 +121,13 @@ class WorktreeService {
   }
 
   async get(treeId) {
-    const tree = (await this.syncDiscoveredWorktrees()).find((item) => item.id === treeId);
+    const tree = (await this.readRecords()).find((item) => item.id === treeId);
     if (!tree) throw new Error('The selected coding tree no longer exists.');
     return tree;
   }
 
   async findForTask(task) {
-    const trees = await this.syncDiscoveredWorktrees();
+    const trees = await this.readRecords();
     const taskId = String(task?.taskId || '').trim();
     if (taskId && task?.treeId) {
       const attached = trees.find((tree) => tree.id === task.treeId
@@ -158,88 +152,6 @@ class WorktreeService {
       if (inspected.available) return inspected;
     }
     return null;
-  }
-
-  async syncDiscoveredWorktrees() {
-    if (this.discoverySync) return this.discoverySync;
-    const sync = this.performDiscoverySync().finally(() => {
-      if (this.discoverySync === sync) this.discoverySync = null;
-    });
-    this.discoverySync = sync;
-    return sync;
-  }
-
-  async performDiscoverySync() {
-    const records = await this.readRecords();
-    let repositories;
-    try {
-      repositories = await this.repositoryProvider();
-    } catch {
-      return records;
-    }
-    if (!Array.isArray(repositories) || repositories.length === 0) return records;
-
-    const byPath = new Map();
-    for (const record of records) {
-      const resolvedPath = await fs.realpath(record.path).catch(() => path.resolve(record.path));
-      byPath.set(resolvedPath, record);
-    }
-    let changed = false;
-    const scannedRepositories = new Set();
-    for (const suppliedRepository of repositories) {
-      if (!suppliedRepository?.path || suppliedRepository.unavailable) continue;
-      let worktrees;
-      try {
-        const { stdout } = await runGit(suppliedRepository.path, ['worktree', 'list', '--porcelain', '-z']);
-        worktrees = parseWorktreeList(stdout);
-      } catch {
-        continue;
-      }
-      if (worktrees.length < 2) continue;
-      const primaryPath = await fs.realpath(worktrees[0].path).catch(() => path.resolve(worktrees[0].path));
-      if (scannedRepositories.has(primaryPath)) continue;
-      scannedRepositories.add(primaryPath);
-      const source = await inspectRepository(primaryPath).catch(() => suppliedRepository);
-      const sourceBranch = branchName(worktrees[0].branch || source.branch);
-
-      for (const discovered of worktrees.slice(1)) {
-        const discoveredPath = await fs.realpath(discovered.path).catch(() => path.resolve(discovered.path));
-        const existing = byPath.get(discoveredPath);
-        if (existing && existing.managed !== false) continue;
-        const branch = branchName(discovered.branch);
-        const { stdout: mergeBaseOutput } = await runGit(discoveredPath, [
-          'merge-base', worktrees[0].HEAD, discovered.HEAD,
-        ]).catch(() => ({ stdout: discovered.HEAD || '' }));
-        const stat = await fs.stat(discoveredPath).catch(() => null);
-        const next = {
-          ...existing,
-          id: existing?.id || discoveredTreeId(discoveredPath),
-          name: existing?.name || (branch === '(detached HEAD)' ? path.basename(discoveredPath) : branch),
-          repositoryId: source.id,
-          repositoryName: source.name || path.basename(primaryPath),
-          repositoryPath: primaryPath,
-          path: discoveredPath,
-          branch,
-          sourceBranch,
-          baseCommit: mergeBaseOutput.trim() || discovered.HEAD,
-          createdAt: existing?.createdAt || stat?.birthtime?.toISOString() || new Date().toISOString(),
-          updatedAt: existing?.updatedAt || new Date().toISOString(),
-          taskIds: existing?.taskIds || [],
-          chatgptProject: existing?.chatgptProject || null,
-          mergeState: existing?.mergeState || null,
-          mergeConversationUrl: existing?.mergeConversationUrl || null,
-          managed: false,
-          discovered: true,
-        };
-        const index = records.findIndex((item) => item.id === next.id);
-        if (index >= 0) records[index] = next;
-        else records.push(next);
-        byPath.set(discoveredPath, next);
-        changed = true;
-      }
-    }
-    if (changed) await this.writeRecords(records);
-    return records;
   }
 
   async create(repositoryPath, requestedName) {
@@ -319,7 +231,7 @@ class WorktreeService {
   }
 
   async list() {
-    return Promise.all((await this.syncDiscoveredWorktrees()).map((tree) => this.inspect(tree)));
+    return Promise.all((await this.readRecords()).map((tree) => this.inspect(tree)));
   }
 
   async attachTask(treeId, taskId, chatgptProject = undefined) {

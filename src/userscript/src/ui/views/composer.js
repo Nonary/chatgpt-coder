@@ -15,6 +15,7 @@ const {
   skillCommandName,
 } = require('../composer-controls');
 const { MODEL_LABELS, REASONING_LABELS, TASK_MODE_LABELS } = require('../labels');
+const { taskModelSupportsReasoning } = require('../../../../shared/chatgpt');
 const { openComposerSettings } = require('../dialogs/composer-settings');
 
 const NEW_TREE_VALUE = '__new__';
@@ -670,18 +671,18 @@ function renderComposer(ctx) {
   }
 
   function openModelMenu() {
+    const currentComposer = ctx.store.state.composer;
     const modelChoices = Object.entries(MODEL_LABELS).map(([value, label]) => ({
       kind: 'model', value, label,
     }));
-    const reasoningChoices = Object.entries(REASONING_LABELS).map(([value, label]) => ({
-      kind: 'reasoning', value, label,
-    }));
+    const reasoningChoices = Object.entries(REASONING_LABELS)
+      .filter(([value]) => taskModelSupportsReasoning(currentComposer.model, value))
+      .map(([value, label]) => ({ kind: 'reasoning', value, label }));
     const choices = [...modelChoices, ...reasoningChoices];
     const groups = [
       { label: 'Model', choices: modelChoices },
       { label: 'Reasoning', choices: reasoningChoices },
     ];
-    const currentComposer = ctx.store.state.composer;
     let activeIndex = Math.max(0, choices.findIndex((choice) => (
       choice.kind === 'model'
         ? currentComposer.model === choice.value
@@ -710,8 +711,12 @@ function renderComposer(ctx) {
 
     const selectChoice = (choice) => {
       if (choice.kind === 'model') {
-        ctx.store.setComposer({ model: choice.value }, 'silent');
+        const reasoningMode = taskModelSupportsReasoning(choice.value, ctx.store.state.composer.reasoningMode)
+          ? ctx.store.state.composer.reasoningMode
+          : 'default';
+        ctx.store.setComposer({ model: choice.value, reasoningMode }, 'silent');
         ctx.persist('task-model', choice.value);
+        ctx.persist('task-reasoning', reasoningMode);
       } else {
         ctx.store.setComposer({ reasoningMode: choice.value }, 'silent');
         ctx.persist('task-reasoning', choice.value);

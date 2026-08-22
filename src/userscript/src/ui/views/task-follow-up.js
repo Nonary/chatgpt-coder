@@ -13,6 +13,7 @@ const {
   skillCommandName,
 } = require('../composer-controls');
 const { MODEL_LABELS, REASONING_LABELS, TASK_MODE_LABELS } = require('../labels');
+const { taskModelSupportsReasoning } = require('../../../../shared/chatgpt');
 const { MODE_OPTIONS } = require('./composer');
 
 function promptDescription(prompt) {
@@ -487,10 +488,12 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
   }
 
   function openModelMenu() {
-    const modelChoices = Object.entries(MODEL_LABELS).map(([value, label]) => ({ kind: 'model', value, label }));
-    const reasoningChoices = Object.entries(REASONING_LABELS).map(([value, label]) => ({ kind: 'reasoning', value, label }));
-    const choices = [...modelChoices, ...reasoningChoices];
     const currentFollowUp = ctx.store.state.followUp;
+    const modelChoices = Object.entries(MODEL_LABELS).map(([value, label]) => ({ kind: 'model', value, label }));
+    const reasoningChoices = Object.entries(REASONING_LABELS)
+      .filter(([value]) => taskModelSupportsReasoning(currentFollowUp.model, value))
+      .map(([value, label]) => ({ kind: 'reasoning', value, label }));
+    const choices = [...modelChoices, ...reasoningChoices];
     let activeIndex = Math.max(0, choices.findIndex((choice) => choice.kind === 'model'
       ? currentFollowUp.model === choice.value
       : currentFollowUp.reasoningMode === choice.value));
@@ -510,7 +513,14 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
       ? ctx.store.state.followUp.model === choice.value
       : ctx.store.state.followUp.reasoningMode === choice.value;
     const selectChoice = (choice) => {
-      ctx.store.setFollowUp(choice.kind === 'model' ? { model: choice.value } : { reasoningMode: choice.value }, 'silent');
+      if (choice.kind === 'model') {
+        const reasoningMode = taskModelSupportsReasoning(choice.value, ctx.store.state.followUp.reasoningMode)
+          ? ctx.store.state.followUp.reasoningMode
+          : 'default';
+        ctx.store.setFollowUp({ model: choice.value, reasoningMode }, 'silent');
+      } else {
+        ctx.store.setFollowUp({ reasoningMode: choice.value }, 'silent');
+      }
       controller.close();
       refreshTaskFollowUp();
     };
