@@ -50,8 +50,17 @@ function searchRepositoryCatalog(repositories, query) {
 
 // The local agent owns the native directory dialog because a userscript cannot
 // read the absolute path selected by a browser-controlled folder input.
-function openRepositoryPicker({ shell, api, repositories = [], onChoose }) {
-  const selected = new Set();
+function openRepositoryPicker({
+  shell,
+  api,
+  repositories = [],
+  selectedPaths = [],
+  allowEmpty = false,
+  title = 'Add Git repositories',
+  confirmLabel = 'Add selected',
+  onChoose,
+}) {
+  const selected = new Set(selectedPaths);
   const workspacePaths = new Set(repositories.map((repository) => repositoryPathKey(repository.path)));
   const searchInput = h('input', {
     type: 'search',
@@ -80,19 +89,21 @@ function openRepositoryPicker({ shell, api, repositories = [], onChoose }) {
 
   const chooseButton = h('button', {
     class: 'primary',
-    disabled: true,
+    disabled: !allowEmpty && selected.size === 0,
     onclick: async () => {
       const paths = [...selected];
       handle.close();
       await onChoose(paths);
     },
-  }, 'Add selected');
+  }, confirmLabel);
 
   const syncChoose = () => {
-    chooseButton.disabled = selected.size === 0;
-    chooseButton.textContent = selected.size > 1 ? `Add ${selected.size} repositories` : 'Add repository';
+    chooseButton.disabled = !allowEmpty && selected.size === 0;
+    chooseButton.textContent = allowEmpty
+      ? confirmLabel
+      : (selected.size > 1 ? `Add ${selected.size} repositories` : 'Add repository');
     selectionStatus.textContent = selected.size === 0
-      ? 'Select one or more Git repositories.'
+      ? (allowEmpty ? 'No repositories selected.' : 'Select one or more Git repositories.')
       : `${selected.size} repositor${selected.size === 1 ? 'y' : 'ies'} selected`;
   };
 
@@ -303,7 +314,7 @@ function openRepositoryPicker({ shell, api, repositories = [], onChoose }) {
   });
 
   handle = shell.modal({
-    title: 'Add Git repositories',
+    title,
     width: '700px',
     body: h(
       'div',

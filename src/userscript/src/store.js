@@ -9,6 +9,23 @@ function readPreference(key, fallback = '') {
   }
 }
 
+function readJsonPreference(key, fallback) {
+  const raw = readPreference(key, '');
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function initialRepositoryScope() {
+  const stored = readJsonPreference('repository-scope', null);
+  if (Array.isArray(stored)) return stored.filter((value) => typeof value === 'string' && value);
+  const legacy = readPreference('source-repository');
+  return legacy ? [legacy] : [];
+}
+
 function writePreference(key, value) {
   try {
     if (value == null || value === '') localStorage.removeItem(PREFERENCE_PREFIX + key);
@@ -33,10 +50,10 @@ class Store {
       iac: { exists: false, valid: true, selectors: [] },
       activity: [],
       activeTaskId: null,
-      sourceRepositoryPath: readPreference('source-repository'),
-      sourceStatus: null,
-      sourceHistory: [],
-      sourceCommitMessage: '',
+      repositoryScopePaths: initialRepositoryScope(),
+      sourceStatuses: {},
+      sourceExpandedPaths: [],
+      sourceCommitMessages: {},
       historySearch: '',
       historyState: 'all',
       composer: {
@@ -137,4 +154,4 @@ class Store {
   }
 }
 
-module.exports = { Store, readPreference, writePreference };
+module.exports = { Store, readJsonPreference, readPreference, writePreference };

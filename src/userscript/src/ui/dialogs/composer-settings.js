@@ -68,9 +68,9 @@ function openComposerSettings({ ctx, newTreeValue, newProjectValue }) {
         ),
         h('button', {
           class: 'icon-button',
-          title: `Remove ${repository.name}`,
+          title: `Remove ${repository.name} from current work`,
           type: 'button',
-          onclick: () => ctx.actions.removeComposerRepository(repository.path, { onDone: sync }),
+          onclick: () => ctx.actions.removeRepositoryFromScope(repository.path, { onDone: sync }),
         }, '×'),
       )),
       composer.repositories.length === 0
@@ -110,8 +110,8 @@ function openComposerSettings({ ctx, newTreeValue, newProjectValue }) {
   const addRepository = h('button', {
     class: 'secondary',
     type: 'button',
-    onclick: () => ctx.actions.chooseRepositories({ onDone: sync }),
-  }, 'Add repository');
+    onclick: () => ctx.actions.manageRepositoryScope({ onDone: sync }),
+  }, 'Manage repositories');
 
   projectSelect.addEventListener('change', () => {
     ctx.store.setComposer({ projectSelection: projectSelect.value });
@@ -144,7 +144,7 @@ function openComposerSettings({ ctx, newTreeValue, newProjectValue }) {
     h('section', { class: 'composer-settings-section' },
       h('div', { class: 'composer-settings-heading' },
         h('div', {}, h('p', { class: 'eyebrow' }, 'Target'), h('strong', {}, 'Coding workspace')),
-        h('span', { class: 'field-help' }, 'These choices define the repositories and coding tree used for the task.'),
+        h('span', { class: 'field-help' }, 'Repository scope is shared with Source Control. Coding tree selection still applies only to this task.'),
       ),
       h('label', { class: 'field' }, h('span', {}, 'Coding tree'), treeSelect),
       treeNameRow,

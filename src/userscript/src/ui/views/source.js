@@ -1,5 +1,5 @@
 const {
-  formatDateTime, h, option, replace, shortCommit,
+  formatDateTime, h, replace, shortCommit,
 } = require('../dom');
 
 function statusClass(change) {
@@ -91,26 +91,26 @@ function gitSummaryIsStale(task, status) {
     && repository.snapshotFingerprint !== status.changeFingerprint);
 }
 
-function fileRow(ctx, change, staged) {
+function fileRow(ctx, repositoryPath, change, staged) {
   return h(
     'div',
     { class: 'row', style: { gap: '0' } },
     h('button', {
       class: 'git-file',
       style: { flex: '1' },
-      onclick: () => ctx.actions.openDiff(change.path, staged),
+      onclick: () => ctx.actions.openDiff(repositoryPath, change.path, staged),
     }, h('span', { class: 'path' }, change.path), h('span', { class: `badge ${statusClass(change)}` }, change.label?.[0] || '?')),
     h('button', {
       class: 'icon-button',
       title: staged ? 'Unstage' : 'Stage',
       onclick: () => (staged
-        ? ctx.actions.gitUnstage([change.path])
-        : ctx.actions.gitStage([change.path])),
+        ? ctx.actions.gitUnstage(repositoryPath, [change.path])
+        : ctx.actions.gitStage(repositoryPath, [change.path])),
     }, staged ? '−' : '＋'),
   );
 }
 
-function group(ctx, title, changes, staged, allAction) {
+function group(ctx, repositoryPath, title, changes, staged, allAction) {
   return h(
     'div',
     { class: 'git-group' },
@@ -126,17 +126,17 @@ function group(ctx, title, changes, staged, allAction) {
         onclick: allAction,
       }, staged ? '−' : '＋'),
     ),
-    ...changes.map((change) => fileRow(ctx, change, staged)),
+    ...changes.map((change) => fileRow(ctx, repositoryPath, change, staged)),
     changes.length === 0 ? h('div', { class: 'empty-state', style: { border: '0' } }, 'Nothing here.') : null,
   );
 }
 
-function renderSourceSuggestionCard(ctx, task) {
+function renderSourceSuggestionCard(ctx, task, repositoryPath, status) {
   const phase = gitSummaryPhase(task);
   const appliedTask = !task.summaryOnly && task.state === 'applied';
   const message = task.result?.commitMessage || '';
-  const stale = ['ready', 'completed'].includes(phase) && gitSummaryIsStale(task, ctx.store.state.sourceStatus);
-  const repository = (task.repositories || []).find((entry) => entry.path === ctx.store.state.sourceRepositoryPath)
+  const stale = ['ready', 'completed'].includes(phase) && gitSummaryIsStale(task, status);
+  const repository = (task.repositories || []).find((entry) => entry.path === repositoryPath)
     || (task.repositories || []).find((entry) => entry.path === taskRepositoryPath(task))
     || task.repositories?.[0];
   const statusLabels = {
@@ -162,18 +162,18 @@ function renderSourceSuggestionCard(ctx, task) {
     'div',
     { class: 'row wrap' },
     task.summaryOnly && phase === 'failed'
-      ? h('button', { class: 'primary', onclick: () => ctx.actions.generateGitSummary() }, 'Regenerate')
+      ? h('button', { class: 'primary', onclick: () => ctx.actions.generateGitSummary(repositoryPath) }, 'Regenerate')
       : null,
     message && (appliedTask || ['ready', 'completed'].includes(phase))
       ? h('button', {
         class: 'primary',
         onclick: () => (appliedTask
-          ? ctx.actions.useTaskCommitMessage(task.taskId)
+          ? ctx.actions.useTaskCommitMessage(task.taskId, repositoryPath)
           : ctx.actions.useGitSummary(task.taskId)),
       }, stale ? 'Use anyway' : 'Use suggestion')
       : null,
     task.summaryOnly && phase !== 'failed' && ['ready', 'completed'].includes(phase)
-      ? h('button', { class: 'secondary', onclick: () => ctx.actions.generateGitSummary() }, 'Regenerate')
+      ? h('button', { class: 'secondary', onclick: () => ctx.actions.generateGitSummary(repositoryPath) }, 'Regenerate')
       : null,
   );
 
@@ -236,66 +236,77 @@ function renderSourceSuggestionCard(ctx, task) {
   );
 }
 
-function renderSource(ctx) {
+function renderRepositoryPanel(ctx, repository) {
   const { state } = ctx.store;
-  const status = state.sourceStatus;
-  const summaryTask = latestGitSummaryTask(state.tasks, state.sourceRepositoryPath);
-  const suggestionTask = latestSourceSuggestionTask(state.tasks, state.sourceRepositoryPath);
+  const repositoryPath = repository.path;
+  const status = state.sourceStatuses[repositoryPath] || null;
+  const expanded = state.sourceExpandedPaths.includes(repositoryPath);
+  const summaryTask = latestGitSummaryTask(state.tasks, repositoryPath);
+  const suggestionTask = latestSourceSuggestionTask(state.tasks, repositoryPath);
   const summaryPhase = gitSummaryPhase(summaryTask);
   const summaryBusy = ['preparing', 'running', 'finalizing'].includes(summaryPhase);
+  const changeCount = status?.changes?.length || 0;
+  const branch = status?.repository?.branch || repository.branch || 'no branch';
+  const revision = status?.repository?.baseCommit ? shortCommit(status.repository.baseCommit) : 'no commit';
 
-  const repositorySelect = h(
-    'select',
-    {
-      class: 'field-control',
-      onchange: () => ctx.actions.selectSourceRepository(repositorySelect.value),
-    },
-    option('', 'Choose a repository', !state.sourceRepositoryPath),
-    ...state.repositories.map((repository) => option(
-      repository.path,
-      repository.unavailable ? `${repository.name} · unavailable` : repository.name,
-      repository.path === state.sourceRepositoryPath,
-    )),
-  );
-
-  const commitMessage = h('textarea', {
-    class: 'field-control',
-    rows: 3,
-    placeholder: 'Commit message',
-    value: state.sourceCommitMessage,
-    oninput: () => ctx.store.set({ sourceCommitMessage: commitMessage.value }, 'silent'),
-  });
-
-  const header = h(
+  const panelHeader = h(
     'div',
-    { class: 'card' },
+    { class: 'source-repository-header' },
     h(
-      'div',
-      { class: 'row' },
-      repositorySelect,
-      h('button', { class: 'icon-button', title: 'Add repository', onclick: () => ctx.actions.chooseRepositories({ forSource: true }) }, '＋'),
-      h('button', { class: 'icon-button', title: 'Refresh', onclick: () => ctx.actions.refreshSource() }, '↻'),
-      h('button', {
-        class: 'icon-button',
-        title: 'Remove from workspace',
-        disabled: !state.sourceRepositoryPath,
-        onclick: () => ctx.actions.removeSourceRepository(),
-      }, '×'),
+      'button',
+      {
+        class: 'source-repository-toggle',
+        'aria-expanded': String(expanded),
+        onclick: () => ctx.actions.toggleSourceRepository(repositoryPath),
+      },
+      h('span', { class: 'source-repository-chevron', 'aria-hidden': 'true' }, expanded ? '▾' : '▸'),
+      h(
+        'span',
+        { class: 'grow source-repository-title' },
+        h('strong', {}, repository.name || repositoryPath),
+        h('span', { class: 'field-help' }, status ? `${branch} · ${revision}` : `${branch} · status unavailable`),
+      ),
+      h('span', { class: `status-badge ${status ? (changeCount ? 'ready' : '') : 'failed'}` }, status
+        ? (changeCount ? `${changeCount} change${changeCount === 1 ? '' : 's'}` : 'Clean')
+        : 'Unavailable'),
     ),
-    h('p', { class: 'field-help' }, status
-      ? `${status.repository.branch} · ${status.repository.baseCommit ? shortCommit(status.repository.baseCommit) : 'no commit'}`
-      : 'No repository selected'),
+    h('button', {
+      class: 'icon-button',
+      title: 'Remove from current work',
+      onclick: () => ctx.actions.removeRepositoryFromScope(repositoryPath),
+    }, '×'),
   );
+
+  if (!expanded) return h('section', { class: 'source-repository' }, panelHeader);
 
   if (!status) {
-    return [
-      header,
-      suggestionTask ? renderSourceSuggestionCard(ctx, suggestionTask) : h('div', { class: 'empty-state' }, 'Choose a repository to see its working changes.'),
-    ];
+    return h(
+      'section',
+      { class: 'source-repository expanded' },
+      panelHeader,
+      h(
+        'div',
+        { class: 'source-repository-body' },
+        suggestionTask ? renderSourceSuggestionCard(ctx, suggestionTask, repositoryPath, status) : null,
+        h('div', { class: 'empty-state' }, 'Patchwork could not load Git status for this repository.'),
+        h('div', { class: 'row' },
+          h('button', { class: 'secondary', onclick: () => ctx.actions.refreshSource(repositoryPath) }, 'Retry'),
+          h('div', { class: 'spacer' }),
+          h('button', { class: 'text-button', onclick: () => ctx.actions.removeWorkspaceRepository(repositoryPath) }, 'Forget from workspace')),
+      ),
+    );
   }
 
   const staged = status.changes.filter((change) => change.staged);
   const unstaged = status.changes.filter((change) => change.unstaged);
+  const draft = state.sourceCommitMessages[repositoryPath] || '';
+  const commitMessage = h('textarea', {
+    class: 'field-control',
+    rows: 3,
+    placeholder: 'Commit message',
+    value: draft,
+    oninput: () => ctx.actions.setSourceCommitMessage(repositoryPath, commitMessage.value),
+  });
 
   const commitCard = h(
     'div',
@@ -308,13 +319,13 @@ function renderSource(ctx) {
       h('button', {
         class: 'secondary',
         disabled: summaryBusy || status.changes.length === 0,
-        onclick: () => ctx.actions.generateGitSummary(),
+        onclick: () => ctx.actions.generateGitSummary(repositoryPath),
       }, summaryBusy ? '✦ Generating…' : '✦ Generate commit message'),
       h('div', { class: 'spacer' }),
       h('button', {
         class: 'primary',
         disabled: staged.length === 0,
-        onclick: () => ctx.actions.commit(commitMessage.value),
+        onclick: () => ctx.actions.commit(repositoryPath, commitMessage.value),
       }, 'Commit staged changes'),
     ),
     h('p', { class: 'field-help' }, state.prompts.some((prompt) => prompt.name.trim().toLowerCase() === 'git summary')
@@ -325,7 +336,10 @@ function renderSource(ctx) {
   const history = h(
     'div',
     { class: 'card' },
-    h('h3', {}, 'Recent commits'),
+    h('div', { class: 'row' },
+      h('h3', {}, 'Recent commits'),
+      h('div', { class: 'spacer' }),
+      h('button', { class: 'text-button', onclick: () => ctx.actions.removeWorkspaceRepository(repositoryPath) }, 'Forget from workspace')),
     h('div', { class: 'list' }, ...(status.history || []).map((commit) => h(
       'div',
       { class: 'list-item' },
@@ -338,14 +352,69 @@ function renderSource(ctx) {
     ))),
   );
 
-  return [
-    header,
-    commitCard,
-    suggestionTask ? renderSourceSuggestionCard(ctx, suggestionTask) : null,
-    group(ctx, 'Staged changes', staged, true, () => ctx.actions.gitUnstageAll()),
-    group(ctx, 'Changes', unstaged, false, () => ctx.actions.gitStageAll()),
-    history,
-  ];
+  return h(
+    'section',
+    { class: 'source-repository expanded' },
+    panelHeader,
+    h(
+      'div',
+      { class: 'source-repository-body' },
+      commitCard,
+      suggestionTask ? renderSourceSuggestionCard(ctx, suggestionTask, repositoryPath, status) : null,
+      group(ctx, repositoryPath, 'Staged changes', staged, true, () => ctx.actions.gitUnstageAll(repositoryPath)),
+      group(ctx, repositoryPath, 'Changes', unstaged, false, () => ctx.actions.gitStageAll(repositoryPath)),
+      history,
+    ),
+  );
+}
+
+function renderSource(ctx) {
+  const { state } = ctx.store;
+  const repositories = state.repositoryScopePaths
+    .map((repositoryPath) => state.repositories.find((repository) => repository.path === repositoryPath))
+    .filter(Boolean);
+  const totalChanges = repositories.reduce((count, repository) => (
+    count + (state.sourceStatuses[repository.path]?.changes?.length || 0)
+  ), 0);
+
+  const header = h(
+    'div',
+    { class: 'card source-scope-card' },
+    h(
+      'div',
+      { class: 'row' },
+      h(
+        'span',
+        { class: 'grow' },
+        h('strong', {}, 'Repository scope'),
+        h('span', { class: 'field-help source-scope-copy' }, repositories.length
+          ? `${repositories.length} repositor${repositories.length === 1 ? 'y' : 'ies'} shared by New Task and Source Control${totalChanges ? ` · ${totalChanges} change${totalChanges === 1 ? '' : 's'}` : ''}.`
+          : 'New Task and Source Control use the same repository selection.'),
+      ),
+      h('button', { class: 'secondary', onclick: () => ctx.actions.manageRepositoryScope() }, 'Manage'),
+      h('button', {
+        class: 'icon-button',
+        title: 'Refresh selected repositories',
+        disabled: repositories.length === 0,
+        onclick: () => ctx.actions.refreshSource(),
+      }, '↻'),
+    ),
+  );
+
+  if (repositories.length === 0) {
+    return [
+      header,
+      h(
+        'div',
+        { class: 'empty-state' },
+        h('strong', {}, 'No repositories selected'),
+        h('p', { class: 'field-help' }, 'Choose the repositories for your current work. The same selection will appear in New Task.'),
+        h('button', { class: 'primary', onclick: () => ctx.actions.manageRepositoryScope() }, 'Choose repositories'),
+      ),
+    ];
+  }
+
+  return [header, ...repositories.map((repository) => renderRepositoryPanel(ctx, repository))];
 }
 
 function renderDiffOverlay(ctx, diff) {

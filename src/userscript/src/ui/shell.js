@@ -2,6 +2,7 @@ const styles = require('./styles.css');
 const {
   clear, h, replace, svg,
 } = require('./dom');
+const { installEventBoundary } = require('./event-boundary');
 const { observeTheme } = require('./theme');
 
 const HOST_ID = 'patchwork-root';
@@ -87,6 +88,7 @@ class Shell {
     document.getElementById(HOST_ID)?.remove();
     this.host = h('div', { id: HOST_ID });
     this.root = this.host.attachShadow({ mode: 'open' });
+    this.stopEventBoundary = installEventBoundary(this.root);
     const sheet = new CSSStyleSheet();
     sheet.replaceSync(styles);
     this.root.adoptedStyleSheets = [sheet];
@@ -418,6 +420,7 @@ class Shell {
   }
 
   destroy() {
+    this.stopEventBoundary?.();
     this.stopThemeWatch?.();
     document.documentElement.classList.remove('patchwork-pushed');
     document.documentElement.style.removeProperty('--patchwork-dock-width');

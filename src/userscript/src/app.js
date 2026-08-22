@@ -64,6 +64,37 @@ class App {
     writePreference(key, value);
   }
 
+  setRepositoryScope(paths, { reason = 'repository-scope' } = {}) {
+    const repositoryByPath = new Map(this.store.state.repositories.map((repository) => [repository.path, repository]));
+    const normalized = [];
+    const seen = new Set();
+    for (const repositoryPath of paths || []) {
+      if (seen.has(repositoryPath)) continue;
+      const repository = repositoryByPath.get(repositoryPath);
+      if (!repository || repository.unavailable) continue;
+      seen.add(repositoryPath);
+      normalized.push(repositoryPath);
+    }
+
+    this.store.state.composer.repositories = normalized.map((repositoryPath) => repositoryByPath.get(repositoryPath));
+    const sourceStatuses = Object.fromEntries(
+      Object.entries(this.store.state.sourceStatuses)
+        .filter(([repositoryPath]) => normalized.includes(repositoryPath)),
+    );
+    const sourceExpandedPaths = this.store.state.sourceExpandedPaths
+      .filter((repositoryPath) => normalized.includes(repositoryPath));
+    if (normalized.length > 0 && sourceExpandedPaths.length === 0) sourceExpandedPaths.push(normalized[0]);
+
+    this.store.set({
+      repositoryScopePaths: normalized,
+      sourceStatuses,
+      sourceExpandedPaths,
+    }, reason);
+    this.persist('repository-scope', JSON.stringify(normalized));
+    this.persist('source-repository', '');
+    return normalized;
+  }
+
   /* ---------------------------------------------------------------- rendering */
 
   renderActiveView() {
@@ -74,7 +105,8 @@ class App {
     if (view === 'history') this.shell.render('history', ...renderHistory(this));
     this.shell.setCount('trees', this.store.state.trees.length);
     this.shell.setCount('history', this.store.state.tasks.length);
-    this.shell.setCount('source', this.store.state.sourceStatus?.changes?.length || 0);
+    this.shell.setCount('source', Object.values(this.store.state.sourceStatuses)
+      .reduce((count, status) => count + (status?.changes?.length || 0), 0));
     this.shell.setPendingBadge(this.store.pendingCount());
   }
 
@@ -187,8 +219,8 @@ class App {
     }
     if (event.type === 'git-summary-ready' && event.commitMessage) {
       const repositoryPath = event.repositoryPath || event.task?.sourceRepositoryPath || event.task?.repositories?.[0]?.path;
-      if (repositoryPath === this.store.state.sourceRepositoryPath) {
-        this.refreshSource()
+      if (this.store.state.repositoryScopePaths.includes(repositoryPath)) {
+        this.refreshSource(repositoryPath)
           .then(() => {
             if (this.shell.activeView === 'source') this.renderActiveView();
           })
@@ -199,13 +231,11 @@ class App {
       this.refreshTrees().catch(() => {});
     }
     if (event.type === 'task-applied') {
-      const repositoryPath = this.store.state.sourceRepositoryPath;
-      const appliesToSource = repositoryPath
-        && (event.task?.repositories || []).some((repository) => (
-          !repository.readOnly && repository.path === repositoryPath
-        ));
-      if (appliesToSource) {
-        this.ensureSourceControlSuggestion(repositoryPath)
+      const appliedPaths = (event.task?.repositories || [])
+        .filter((repository) => !repository.readOnly && this.store.state.repositoryScopePaths.includes(repository.path))
+        .map((repository) => repository.path);
+      if (appliedPaths.length > 0) {
+        Promise.all(appliedPaths.map((repositoryPath) => this.ensureSourceControlSuggestion(repositoryPath)))
           .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`));
       } else {
         this.refreshSource().catch(() => {});
@@ -283,22 +313,25 @@ class App {
     return iac;
   }
 
-  async refreshSource() {
-    const path = this.store.state.sourceRepositoryPath;
-    if (!path) {
-      this.store.set({ sourceStatus: null }, 'source');
-      return null;
+  async refreshSource(repositoryPath = null) {
+    const paths = repositoryPath ? [repositoryPath] : this.store.state.repositoryScopePaths;
+    if (paths.length === 0) {
+      this.store.set({ sourceStatuses: {} }, 'source');
+      return repositoryPath ? null : {};
     }
-    try {
-      const summaryTask = latestGitSummaryTask(this.store.state.tasks, path);
-      const status = await this.api.gitStatus(path, { fingerprint: Boolean(summaryTask) });
-      this.store.set({ sourceStatus: status }, 'source');
-      return status;
-    } catch (error) {
-      this.store.set({ sourceStatus: null }, 'source');
-      this.toast(error.message, true);
-      return null;
-    }
+
+    const next = { ...this.store.state.sourceStatuses };
+    await Promise.all(paths.map(async (path) => {
+      try {
+        const summaryTask = latestGitSummaryTask(this.store.state.tasks, path);
+        next[path] = await this.api.gitStatus(path, { fingerprint: Boolean(summaryTask) });
+      } catch (error) {
+        delete next[path];
+        this.toast(error.message, true);
+      }
+    }));
+    this.store.set({ sourceStatuses: next }, 'source');
+    return repositoryPath ? next[repositoryPath] || null : next;
   }
 
   showUpdateStatus(status, { manual = false } = {}) {
@@ -394,18 +427,18 @@ class App {
     this.store.upsertTask(task);
     const submitted = await this.driver.submitTask(task);
     this.store.upsertTask(submitted);
-    await this.refreshSource();
+    await this.refreshSource(repositoryPath);
     this.renderActiveView();
     return submitted;
   }
 
   async ensureSourceControlSuggestion(repositoryPath, status = null) {
-    if (!repositoryPath || this.store.state.sourceRepositoryPath !== repositoryPath) return null;
+    if (!repositoryPath || !this.store.state.repositoryScopePaths.includes(repositoryPath)) return null;
     const pending = this.sourceSuggestionRequests.get(repositoryPath);
     if (pending) return pending;
 
     const request = (async () => {
-      const currentStatus = status || await this.refreshSource();
+      const currentStatus = status || await this.refreshSource(repositoryPath);
       if (!currentStatus?.changes?.length) return null;
 
       const suggestionTask = latestSourceSuggestionTask(this.store.state.tasks, repositoryPath);
@@ -472,39 +505,38 @@ class App {
         }
       },
 
-      async chooseRepositories({ forSource = false, onDone = null } = {}) {
+      manageRepositoryScope({ onDone = null } = {}) {
         openRepositoryPicker({
           shell: app.shell,
           api: app.api,
           repositories: app.store.state.repositories,
+          selectedPaths: app.store.state.repositoryScopePaths,
+          allowEmpty: true,
+          title: 'Manage repositories',
+          confirmLabel: 'Done',
           onChoose: async (paths) => {
-            if (paths.length === 0) return;
             await app.run(async () => {
-              const { repositories } = await app.api.addRepositories(paths);
-              app.store.set({ repositories }, 'repositories');
-              const added = repositories.filter((repository) => paths.includes(repository.path));
-              if (forSource) {
-                app.actions.selectSourceRepository(added[0]?.path || paths[0]);
-                onDone?.();
-                return;
+              let repositories = app.store.state.repositories;
+              if (paths.length > 0) {
+                ({ repositories } = await app.api.addRepositories(paths));
+                app.store.set({ repositories }, 'silent');
               }
-              const existing = app.store.state.composer.repositories;
-              const merged = [...existing];
-              for (const repository of added) {
-                if (!merged.some((item) => item.path === repository.path)) merged.push(repository);
-              }
-              app.store.setComposer({ repositories: merged });
+              const scope = app.setRepositoryScope(paths, { reason: 'repository-scope' });
+              await app.refreshSource();
+              await Promise.all(scope.map((repositoryPath) => (
+                app.ensureSourceControlSuggestion(repositoryPath, app.store.state.sourceStatuses[repositoryPath])
+              )));
               app.renderActiveView();
               onDone?.();
-            }, { success: 'Repository added.' });
+            }, { success: 'Repository scope updated.' });
           },
         });
       },
 
-      removeComposerRepository(path, { onDone = null } = {}) {
-        app.store.setComposer({
-          repositories: app.store.state.composer.repositories.filter((item) => item.path !== path),
-        });
+      removeRepositoryFromScope(path, { onDone = null } = {}) {
+        app.setRepositoryScope(
+          app.store.state.repositoryScopePaths.filter((repositoryPath) => repositoryPath !== path),
+        );
         app.renderActiveView();
         onDone?.();
       },
@@ -773,33 +805,60 @@ class App {
           const existing = app.store.task(taskId) || (await app.api.task(taskId)).task;
           const repositoryPath = existing?.sourceRepositoryPath || existing?.repositories?.[0]?.path;
           if (!existing?.summaryOnly || !repositoryPath) throw new Error('This Git Summary is not associated with a repository.');
-          if (app.store.state.sourceRepositoryPath !== repositoryPath) {
-            app.store.set({ sourceRepositoryPath: repositoryPath, sourceStatus: null }, 'source');
-            app.persist('source-repository', repositoryPath);
+          if (!app.store.state.repositories.some((repository) => repository.path === repositoryPath)) {
+            const { repositories } = await app.api.addRepositories([repositoryPath]);
+            app.store.set({ repositories }, 'silent');
+          }
+          if (!app.store.state.repositoryScopePaths.includes(repositoryPath)) {
+            app.setRepositoryScope([...app.store.state.repositoryScopePaths, repositoryPath], { reason: 'silent' });
           }
           const { task } = await app.api.useGitSummary(taskId);
           app.store.upsertTask(task);
-          app.store.set({ sourceCommitMessage: task.result.commitMessage }, 'source');
-          await app.refreshSource();
+          app.actions.setSourceCommitMessage(repositoryPath, task.result.commitMessage);
+          await app.refreshSource(repositoryPath);
+          app.actions.expandSourceRepository(repositoryPath);
           app.shell.show('source');
           app.renderActiveView();
         }, { success: 'Commit message added to Source Control.' });
       },
 
-      useTaskCommitMessage(taskId) {
+      useTaskCommitMessage(taskId, repositoryPath) {
         return app.run(async () => {
           const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
-          const repositoryPath = app.store.state.sourceRepositoryPath;
           const appliesToRepository = (task?.repositories || []).some((repository) => (
             !repository.readOnly && repository.path === repositoryPath
           ));
           if (task?.state !== 'applied' || !task?.result?.commitMessage || !appliesToRepository) {
-            throw new Error('This task does not contain a commit message for the selected Source Control repository.');
+            throw new Error('This task does not contain a commit message for that Source Control repository.');
           }
-          app.store.set({ sourceCommitMessage: task.result.commitMessage }, 'source');
+          if (!app.store.state.repositories.some((repository) => repository.path === repositoryPath)) {
+            const { repositories } = await app.api.addRepositories([repositoryPath]);
+            app.store.set({ repositories }, 'silent');
+          }
+          if (!app.store.state.repositoryScopePaths.includes(repositoryPath)) {
+            app.setRepositoryScope([...app.store.state.repositoryScopePaths, repositoryPath], { reason: 'silent' });
+          }
+          app.actions.setSourceCommitMessage(repositoryPath, task.result.commitMessage);
+          app.actions.expandSourceRepository(repositoryPath);
           app.shell.show('source');
           app.renderActiveView();
         }, { success: 'Commit message added to Source Control.' });
+      },
+
+      openTaskInSource(taskId) {
+        return app.run(async () => {
+          const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
+          const repositoryPaths = (task?.repositories || [])
+            .filter((repository) => !repository.readOnly && repository.path)
+            .map((repository) => repository.path);
+          if (repositoryPaths.length === 0) throw new Error('This task has no writable repositories to inspect.');
+          const { repositories } = await app.api.addRepositories(repositoryPaths);
+          app.store.set({ repositories }, 'silent');
+          app.setRepositoryScope(repositoryPaths, { reason: 'repository-scope' });
+          await app.refreshSource();
+          app.shell.show('source');
+          app.renderActiveView();
+        }, { success: 'Task repositories opened in Source Control.' });
       },
 
       setTaskTarget(taskId, input) {
@@ -824,90 +883,116 @@ class App {
 
       /* -------------------------------------------------------- source control */
 
-      selectSourceRepository(path) {
-        app.store.set({ sourceRepositoryPath: path, sourceStatus: null });
-        app.persist('source-repository', path);
-        app.refreshSource()
-          .then((status) => app.ensureSourceControlSuggestion(path, status))
-          .then(() => app.renderActiveView())
-          .catch(() => app.renderActiveView());
+      toggleSourceRepository(repositoryPath) {
+        const expanded = new Set(app.store.state.sourceExpandedPaths);
+        if (expanded.has(repositoryPath)) expanded.delete(repositoryPath);
+        else expanded.add(repositoryPath);
+        app.store.set({ sourceExpandedPaths: [...expanded] }, 'source');
       },
 
-      refreshSource() {
-        const repositoryPath = app.store.state.sourceRepositoryPath;
-        return app.refreshSource()
-          .then((status) => app.ensureSourceControlSuggestion(repositoryPath, status))
-          .then(() => app.renderActiveView());
+      expandSourceRepository(repositoryPath) {
+        if (app.store.state.sourceExpandedPaths.includes(repositoryPath)) return;
+        app.store.set({ sourceExpandedPaths: [...app.store.state.sourceExpandedPaths, repositoryPath] }, 'source');
       },
 
-      async removeSourceRepository() {
-        const path = app.store.state.sourceRepositoryPath;
+      setSourceCommitMessage(repositoryPath, message) {
+        app.store.set({
+          sourceCommitMessages: {
+            ...app.store.state.sourceCommitMessages,
+            [repositoryPath]: message,
+          },
+        }, 'silent');
+      },
+
+      refreshSource(repositoryPath = null) {
+        const paths = repositoryPath ? [repositoryPath] : app.store.state.repositoryScopePaths;
+        return app.refreshSource(repositoryPath)
+          .then((result) => Promise.all(paths.map((path) => app.ensureSourceControlSuggestion(
+            path,
+            repositoryPath ? result : result?.[path],
+          ))).then(() => result))
+          .then((result) => {
+            app.renderActiveView();
+            return result;
+          });
+      },
+
+      async removeWorkspaceRepository(path) {
         if (!path) return;
         const confirmed = await app.shell.confirm({
-          title: 'Remove from workspace?',
-          message: 'This only removes the repository from the workspace. Nothing on disk changes.',
-          confirmLabel: 'Remove',
+          title: 'Forget repository from workspace?',
+          message: 'This removes the repository from Patchwork and from the shared repository scope. Nothing on disk changes.',
+          confirmLabel: 'Forget',
         });
         if (!confirmed) return;
         await app.run(async () => {
           const { repositories } = await app.api.removeRepository(path);
-          app.store.set({ repositories, sourceRepositoryPath: repositories[0]?.path || '', sourceStatus: null });
-          app.persist('source-repository', repositories[0]?.path || '');
+          app.store.set({ repositories }, 'silent');
+          app.setRepositoryScope(
+            app.store.state.repositoryScopePaths.filter((repositoryPath) => repositoryPath !== path),
+            { reason: 'repository-scope' },
+          );
           await app.refreshSource();
           app.renderActiveView();
-        }, { success: 'Repository removed from the workspace.' });
+        }, { success: 'Repository forgotten from the workspace.' });
       },
 
-      gitStage(files) {
-        return app.actions.mutateSource(() => app.api.gitStage(app.store.state.sourceRepositoryPath, files));
+      gitStage(repositoryPath, files) {
+        return app.actions.mutateSource(repositoryPath, () => app.api.gitStage(repositoryPath, files));
       },
 
-      gitStageAll() {
-        return app.actions.mutateSource(() => app.api.gitStageAll(app.store.state.sourceRepositoryPath));
+      gitStageAll(repositoryPath) {
+        return app.actions.mutateSource(repositoryPath, () => app.api.gitStageAll(repositoryPath));
       },
 
-      gitUnstage(files) {
-        return app.actions.mutateSource(() => app.api.gitUnstage(app.store.state.sourceRepositoryPath, files));
+      gitUnstage(repositoryPath, files) {
+        return app.actions.mutateSource(repositoryPath, () => app.api.gitUnstage(repositoryPath, files));
       },
 
-      gitUnstageAll() {
-        return app.actions.mutateSource(() => app.api.gitUnstageAll(app.store.state.sourceRepositoryPath));
+      gitUnstageAll(repositoryPath) {
+        return app.actions.mutateSource(repositoryPath, () => app.api.gitUnstageAll(repositoryPath));
       },
 
-      mutateSource(operation) {
+      mutateSource(repositoryPath, operation) {
         return app.run(async () => {
           const status = await operation();
-          const summaryTask = latestGitSummaryTask(app.store.state.tasks, app.store.state.sourceRepositoryPath);
-          if (summaryTask) await app.refreshSource();
-          else app.store.set({ sourceStatus: status }, 'source');
+          const summaryTask = latestGitSummaryTask(app.store.state.tasks, repositoryPath);
+          if (summaryTask) await app.refreshSource(repositoryPath);
+          else app.store.set({
+            sourceStatuses: { ...app.store.state.sourceStatuses, [repositoryPath]: status },
+          }, 'source');
           app.renderActiveView();
         });
       },
 
-      commit(message) {
+      commit(repositoryPath, message) {
         if (!message.trim()) {
           app.toast('Write a commit message first.', true);
           return null;
         }
         return app.run(async () => {
-          const status = await app.api.gitCommit(app.store.state.sourceRepositoryPath, message);
-          const summaryTask = latestGitSummaryTask(app.store.state.tasks, app.store.state.sourceRepositoryPath);
-          app.store.set({ sourceStatus: status, sourceCommitMessage: '' });
-          if (summaryTask) await app.refreshSource();
+          const status = await app.api.gitCommit(repositoryPath, message);
+          const summaryTask = latestGitSummaryTask(app.store.state.tasks, repositoryPath);
+          const sourceCommitMessages = { ...app.store.state.sourceCommitMessages, [repositoryPath]: '' };
+          app.store.set({
+            sourceStatuses: { ...app.store.state.sourceStatuses, [repositoryPath]: status },
+            sourceCommitMessages,
+          }, 'source');
+          if (summaryTask) await app.refreshSource(repositoryPath);
           app.renderActiveView();
         }, { success: 'Commit created.' });
       },
 
-      generateGitSummary() {
+      generateGitSummary(repositoryPath) {
         return app.run(
-          () => app.startGitSummaryTask(app.store.state.sourceRepositoryPath),
+          () => app.startGitSummaryTask(repositoryPath),
           { failure: 'The Git summary could not be generated.' },
         );
       },
 
-      async openDiff(path, staged) {
+      async openDiff(repositoryPath, path, staged) {
         await app.run(async () => {
-          app.diff = await app.api.gitDiff(app.store.state.sourceRepositoryPath, path, staged);
+          app.diff = await app.api.gitDiff(repositoryPath, path, staged);
           app.renderSourceView();
         });
       },
@@ -927,8 +1012,14 @@ class App {
       },
 
       inspectTreeInSource(tree) {
-        app.actions.selectSourceRepository(tree.path);
-        app.shell.show('source');
+        return app.run(async () => {
+          const { repositories } = await app.api.addRepositories([tree.path]);
+          app.store.set({ repositories }, 'silent');
+          app.setRepositoryScope([tree.path], { reason: 'repository-scope' });
+          await app.refreshSource(tree.path);
+          app.shell.show('source');
+          app.renderActiveView();
+        }, { failure: 'The coding tree could not be opened in Source Control.' });
       },
 
       revealTree(treeId) {
@@ -1035,16 +1126,21 @@ class App {
       this.refreshTrees(),
       this.refreshPrompts(),
       this.refreshIac(),
-      this.refreshSource(),
     ]);
-    this.ensureSourceControlSuggestion(this.store.state.sourceRepositoryPath, this.store.state.sourceStatus)
-      .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`));
     this.refreshProjects().catch(() => {});
 
-    const composerRepositories = this.store.state.repositories.filter((repository) => !repository.unavailable);
-    if (this.store.state.composer.repositories.length === 0 && composerRepositories.length === 1) {
-      this.store.setComposer({ repositories: composerRepositories }, 'silent');
+    const availableRepositories = this.store.state.repositories.filter((repository) => !repository.unavailable);
+    let repositoryScopePaths = this.store.state.repositoryScopePaths
+      .filter((repositoryPath) => availableRepositories.some((repository) => repository.path === repositoryPath));
+    if (repositoryScopePaths.length === 0 && availableRepositories.length === 1) {
+      repositoryScopePaths = [availableRepositories[0].path];
     }
+    this.setRepositoryScope(repositoryScopePaths, { reason: 'silent' });
+    const sourceStatuses = await this.refreshSource();
+    await Promise.all(repositoryScopePaths.map((repositoryPath) => (
+      this.ensureSourceControlSuggestion(repositoryPath, sourceStatuses[repositoryPath])
+        .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`))
+    )));
 
     this.installComposerPicker();
     this.renderActiveView();

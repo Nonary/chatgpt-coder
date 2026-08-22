@@ -772,6 +772,79 @@ test('task text inputs keep typing events inside the Patchwork shadow root', () 
   }
 });
 
+test('the Patchwork shadow root contains every composed editing and focus event', () => {
+  const { PRIVATE_EVENT_TYPES, installEventBoundary } = require('../src/userscript/src/ui/event-boundary');
+  const listeners = new Map();
+  const removed = [];
+  const root = {
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) { removed.push([type, listener]); },
+  };
+  const dispose = installEventBoundary(root);
+
+  for (const type of [
+    'beforeinput',
+    'compositionend',
+    'compositionstart',
+    'compositionupdate',
+    'focusin',
+    'focusout',
+    'input',
+    'keydown',
+    'keypress',
+    'keyup',
+    'textInput',
+  ]) {
+    assert.ok(PRIVATE_EVENT_TYPES.includes(type), `${type} must not escape to ChatGPT`);
+    let stopped = 0;
+    listeners.get(type)({ stopPropagation: () => { stopped += 1; } });
+    assert.equal(stopped, 1);
+  }
+
+  dispose();
+  assert.equal(removed.length, PRIVATE_EVENT_TYPES.length);
+  for (const [type, listener] of removed) assert.equal(listener, listeners.get(type));
+});
+
+test('plain typing is contained before ChatGPT capture handlers can steal Safari focus', () => {
+  const { installEventBoundary } = require('../src/userscript/src/ui/event-boundary');
+  const windowListeners = new Map();
+  const pageWindow = {
+    addEventListener(type, listener, capture) { windowListeners.set(type, { listener, capture }); },
+    removeEventListener(type, listener, capture) {
+      assert.deepEqual({ type, listener, capture }, {
+        type: 'keydown',
+        listener: windowListeners.get('keydown').listener,
+        capture: true,
+      });
+    },
+  };
+  const root = {
+    activeElement: { matches: () => true },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const dispose = installEventBoundary(root, pageWindow);
+  const keydown = windowListeners.get('keydown');
+  assert.equal(keydown.capture, true);
+
+  let stopped = 0;
+  keydown.listener({ key: 'a', stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'A', shiftKey: true, stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'å', altKey: true, stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'Dead', altKey: true, stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'Process', isComposing: true, stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'a', metaKey: true, stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'p', altKey: true, stopImmediatePropagation: () => { stopped += 1; } });
+  keydown.listener({ key: 'Enter', stopImmediatePropagation: () => { stopped += 1; } });
+  assert.equal(stopped, 5, 'typing and IME input are private while shortcuts and control keys retain local handling');
+
+  root.activeElement = null;
+  keydown.listener({ key: 'b', stopImmediatePropagation: () => { stopped += 1; } });
+  assert.equal(stopped, 5, 'typing outside Patchwork is untouched');
+  dispose();
+});
+
 test('unchanged model selection does not repaint ChatGPT while Patchwork form fields are edited', () => {
   const modulePath = require.resolve('../src/userscript/src/chatgpt/model-picker');
   const previousDocument = global.document;
@@ -859,7 +932,27 @@ test('composer target summary reflects the real selected tree, repository, and p
 
 test('new task composers default to Ask mode', () => {
   const { Store } = require('../src/userscript/src/store');
-  assert.equal(new Store().state.composer.mode, 'ask');
+  const store = new Store();
+  assert.equal(store.state.composer.mode, 'ask');
+  assert.deepEqual(store.state.repositoryScopePaths, []);
+  assert.deepEqual(store.state.sourceStatuses, {});
+  assert.deepEqual(store.state.sourceCommitMessages, {});
+});
+
+test('repository scope is shared by New Task and multi-repository Source Control', () => {
+  const appSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'), 'utf8');
+  const sourceView = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'source.js'), 'utf8');
+  const pickerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'dialogs', 'repository-picker.js'), 'utf8');
+
+  assert.match(appSource, /setRepositoryScope\(paths/);
+  assert.match(appSource, /composer\.repositories = normalized\.map/);
+  assert.match(appSource, /repositoryScopePaths/);
+  assert.doesNotMatch(appSource, /selectSourceRepository\(/);
+  assert.match(sourceView, /sourceStatuses\[repositoryPath\]/);
+  assert.match(sourceView, /sourceCommitMessages\[repositoryPath\]/);
+  assert.match(sourceView, /source-repository-chevron/);
+  assert.match(pickerSource, /selectedPaths = \[\]/);
+  assert.match(pickerSource, /allowEmpty = false/);
 });
 
 test('task-detail send path persists and sends a follow-up without creating a new task', () => {

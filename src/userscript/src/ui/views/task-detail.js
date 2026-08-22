@@ -156,11 +156,16 @@ function renderResultCard(ctx, task) {
       : null,
   );
 
+  const writableRepositories = (task.repositories || []).filter((repository) => !repository.readOnly && repository.path);
   const actions = h(
     'div',
     { class: 'row wrap' },
     !task.summaryOnly && taskHasAgentTurn(task) && task.state === 'ready'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.applyTask(task.taskId) }, applyActionLabel(task))
+      : null,
+    writableRepositories.length > 0
+      ? h('button', { class: 'secondary', onclick: () => ctx.actions.openTaskInSource(task.taskId) },
+        writableRepositories.length > 1 ? 'Open repositories in Source Control' : 'Open in Source Control')
       : null,
     task.state === 'conflicted'
       ? h('button', { class: 'primary', onclick: () => ctx.actions.retryApply(task.taskId) }, 'Retry apply')

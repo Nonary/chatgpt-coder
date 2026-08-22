@@ -507,6 +507,30 @@ button.composer-send-button {
 
 /* ------------------------------------------------------------ source control */
 
+.source-scope-card .source-scope-copy { display: block; margin-top: 2px; }
+.source-repository {
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface);
+}
+.source-repository.expanded { border-color: var(--border-strong); }
+.source-repository-header {
+  display: flex; align-items: stretch; min-height: 58px; background: var(--surface-elevated);
+}
+.source-repository-toggle {
+  display: flex; flex: 1; min-width: 0; align-items: center; gap: 10px; padding: 9px 8px 9px 12px;
+  border: 0; background: transparent; color: inherit; text-align: left;
+}
+.source-repository-toggle:hover { background: var(--surface-hover); }
+.source-repository-chevron { flex: none; width: 14px; color: var(--text-tertiary); font-size: 12px; text-align: center; }
+.source-repository-title { display: flex; min-width: 0; flex-direction: column; }
+.source-repository-title strong, .source-repository-title .field-help {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.source-repository-header > .icon-button { align-self: center; margin-right: 8px; }
+.source-repository-body {
+  display: flex; flex-direction: column; gap: 10px; padding: 10px; border-top: 1px solid var(--border);
+}
+.source-repository-body > .card { margin: 0; }
+
 .git-summary-card { border-color: var(--accent-border, var(--border)); }
 .git-summary-card.stale { border-color: var(--warning); }
 .git-summary-preview {
