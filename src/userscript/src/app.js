@@ -11,7 +11,7 @@ const { openPromptManager } = require('./ui/dialogs/prompts');
 const { openRepositoryPicker } = require('./ui/dialogs/repository-picker');
 const { openSkillDrawer } = require('./ui/dialogs/skills');
 const { renderComposer, NEW_PROJECT_VALUE, NEW_TREE_VALUE } = require('./ui/views/composer');
-const { latestGitSummaryTask, latestSourceSuggestionTask, renderDiffOverlay, renderSource } = require('./ui/views/source');
+const { latestGitSummaryTask, renderDiffOverlay, renderSource } = require('./ui/views/source');
 const { renderHistory } = require('./ui/views/history');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
@@ -46,7 +46,6 @@ class App {
     this.eventSequence = 0;
     this.notifiedUpdateKey = null;
     this.taskTargetUpdates = new Map();
-    this.sourceSuggestionRequests = new Map();
     this.actions = this.buildActions();
     this.setupViews();
   }
@@ -230,17 +229,7 @@ class App {
     if (['merge-completed', 'merge-failed', 'merge-submitted', 'tree-created', 'tree-removed'].includes(event.type)) {
       this.refreshTrees().catch(() => {});
     }
-    if (event.type === 'task-applied') {
-      const appliedPaths = (event.task?.repositories || [])
-        .filter((repository) => !repository.readOnly && this.store.state.repositoryScopePaths.includes(repository.path))
-        .map((repository) => repository.path);
-      if (appliedPaths.length > 0) {
-        Promise.all(appliedPaths.map((repositoryPath) => this.ensureSourceControlSuggestion(repositoryPath)))
-          .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`));
-      } else {
-        this.refreshSource().catch(() => {});
-      }
-    } else if (['task-rolled-back', 'task-conflicted'].includes(event.type)) {
+    if (['task-applied', 'task-rolled-back', 'task-conflicted'].includes(event.type)) {
       this.refreshSource().catch(() => {});
     }
     this.renderActiveView();
@@ -432,29 +421,6 @@ class App {
     return submitted;
   }
 
-  async ensureSourceControlSuggestion(repositoryPath, status = null) {
-    if (!repositoryPath || !this.store.state.repositoryScopePaths.includes(repositoryPath)) return null;
-    const pending = this.sourceSuggestionRequests.get(repositoryPath);
-    if (pending) return pending;
-
-    const request = (async () => {
-      const currentStatus = status || await this.refreshSource(repositoryPath);
-      if (!currentStatus?.changes?.length) return null;
-
-      const suggestionTask = latestSourceSuggestionTask(this.store.state.tasks, repositoryPath);
-      if (!suggestionTask || suggestionTask.summaryOnly) return null;
-
-      return this.startGitSummaryTask(repositoryPath);
-    })();
-    this.sourceSuggestionRequests.set(repositoryPath, request);
-    request.finally(() => {
-      if (this.sourceSuggestionRequests.get(repositoryPath) === request) {
-        this.sourceSuggestionRequests.delete(repositoryPath);
-      }
-    }).catch(() => {});
-    return request;
-  }
-
   /* ------------------------------------------------------------------ actions */
 
   buildActions() {
@@ -521,11 +487,8 @@ class App {
                 ({ repositories } = await app.api.addRepositories(paths));
                 app.store.set({ repositories }, 'silent');
               }
-              const scope = app.setRepositoryScope(paths, { reason: 'repository-scope' });
+              app.setRepositoryScope(paths, { reason: 'repository-scope' });
               await app.refreshSource();
-              await Promise.all(scope.map((repositoryPath) => (
-                app.ensureSourceControlSuggestion(repositoryPath, app.store.state.sourceStatuses[repositoryPath])
-              )));
               app.renderActiveView();
               onDone?.();
             }, { success: 'Repository scope updated.' });
@@ -686,7 +649,7 @@ class App {
       openConversation(taskId) {
         const task = app.store.task(taskId);
         if (!task?.conversationUrl) return;
-        navigate.openConversationInNewTab(task.conversationUrl);
+        navigate.openConversation(task.conversationUrl);
       },
 
       async copyPrompt(taskId) {
@@ -905,12 +868,7 @@ class App {
       },
 
       refreshSource(repositoryPath = null) {
-        const paths = repositoryPath ? [repositoryPath] : app.store.state.repositoryScopePaths;
         return app.refreshSource(repositoryPath)
-          .then((result) => Promise.all(paths.map((path) => app.ensureSourceControlSuggestion(
-            path,
-            repositoryPath ? result : result?.[path],
-          ))).then(() => result))
           .then((result) => {
             app.renderActiveView();
             return result;
@@ -1136,11 +1094,7 @@ class App {
       repositoryScopePaths = [availableRepositories[0].path];
     }
     this.setRepositoryScope(repositoryScopePaths, { reason: 'silent' });
-    const sourceStatuses = await this.refreshSource();
-    await Promise.all(repositoryScopePaths.map((repositoryPath) => (
-      this.ensureSourceControlSuggestion(repositoryPath, sourceStatuses[repositoryPath])
-        .catch((error) => this.store.addActivity(`Source Control AI suggestion could not be regenerated: ${error.message}`))
-    )));
+    await this.refreshSource();
 
     this.installComposerPicker();
     this.renderActiveView();

@@ -157,6 +157,7 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
     oninput: (event) => {
       event.stopPropagation();
       ctx.store.setFollowUp({ taskText: taskText.value }, 'silent');
+      syncSendButton();
       const token = findSlashCommand(taskText.value, taskText.selectionStart);
       if (!token || Boolean(activeTurn(taskRef)) || Boolean(taskRef.applyInProgress)) {
         commandPickerController?.close();
@@ -264,6 +265,14 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
   const statusNote = h('div', { class: 'task-follow-up-note', hidden: true });
   const headingDescription = h('p', { class: 'field-help', style: { margin: '3px 0 0' } });
 
+  function syncSendButton() {
+    const currentTurn = activeTurn(taskRef);
+    const busy = Boolean(currentTurn) || Boolean(taskRef.applyInProgress);
+    sendButton.disabled = !canSendFollowUp(taskRef, ctx.store.state.followUp);
+    sendButton.title = busy ? 'A follow-up is already running' : 'Send follow-up';
+    sendButton.querySelector('.composer-send-label').textContent = currentTurn ? 'Running' : 'Send';
+  }
+
   const composerSurface = h(
     'div',
     { class: 'composer-surface' },
@@ -357,9 +366,7 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
     modeButton.disabled = busy;
     modeButton.setAttribute('aria-label', `Follow-up mode: ${TASK_MODE_LABELS[currentFollowUp.mode] || TASK_MODE_LABELS.ask}`);
     plusButton.disabled = busy;
-    sendButton.disabled = !canSendFollowUp(taskRef, currentFollowUp);
-    sendButton.title = busy ? 'A follow-up is already running' : 'Send follow-up';
-    sendButton.querySelector('.composer-send-label').textContent = currentTurn ? 'Running' : 'Send';
+    syncSendButton();
 
     if (busy) {
       commandPickerController?.close();

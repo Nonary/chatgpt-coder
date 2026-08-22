@@ -6,7 +6,9 @@ const { test } = require('node:test');
 
 const { buildRestartArguments } = require('../src/agent/cli');
 const { runGit } = require('../src/agent/services/git');
-const { UpdateService, parseRevisionCounts } = require('../src/agent/services/update-service');
+const {
+  UpdateService, packageManagerInvocation, parseRevisionCounts, runPackageManager,
+} = require('../src/agent/services/update-service');
 const { Api } = require('../src/userscript/src/api');
 
 async function configureAuthor(repositoryPath) {
@@ -40,6 +42,54 @@ async function createUpdateRepositories(context) {
 
 test('revision counts map Git left/right output to ahead and behind', () => {
   assert.deepEqual(parseRevisionCounts('2\t7\n'), { ahead: 2, behind: 7 });
+});
+
+test('npm package-manager commands use npm script semantics', () => {
+  assert.deepEqual(
+    packageManagerInvocation('npm', ['install', '--frozen-lockfile'], { platform: 'linux' }),
+    { manager: 'npm', executable: 'npm', args: ['install'], shell: false },
+  );
+  assert.deepEqual(
+    packageManagerInvocation('npm', ['build'], { platform: 'linux' }),
+    { manager: 'npm', executable: 'npm', args: ['run', 'build'], shell: false },
+  );
+});
+
+test('the updater uses npm when the agent was launched by npm', async () => {
+  const calls = [];
+  await runPackageManager('/tmp/patchwork', ['build'], {
+    env: { npm_execpath: '/opt/npm/bin/npm-cli.js' },
+    execFile: async (executable, args, options) => {
+      calls.push({ executable, args, cwd: options.cwd });
+      return { stdout: '', stderr: '' };
+    },
+  });
+  assert.deepEqual(calls, [{
+    executable: process.execPath,
+    args: ['/opt/npm/bin/npm-cli.js', 'run', 'build'],
+    cwd: '/tmp/patchwork',
+  }]);
+});
+
+test('the updater falls back to npm when pnpm is not installed', async () => {
+  const calls = [];
+  await runPackageManager('/tmp/patchwork', ['build'], {
+    env: {},
+    platform: 'linux',
+    execFile: async (executable, args) => {
+      calls.push({ executable, args });
+      if (executable === 'pnpm') {
+        const error = new Error('spawn pnpm ENOENT');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return { stdout: '', stderr: '' };
+    },
+  });
+  assert.deepEqual(calls, [
+    { executable: 'pnpm', args: ['build'] },
+    { executable: 'npm', args: ['run', 'build'] },
+  ]);
 });
 
 test('simultaneous update checks share one Git inspection', async () => {

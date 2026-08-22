@@ -14,25 +14,56 @@ function parseRevisionCounts(value) {
   };
 }
 
-async function runPackageManager(projectRoot, args) {
-  const pnpmScript = process.env.npm_execpath && /pnpm/i.test(process.env.npm_execpath)
-    ? process.env.npm_execpath
-    : null;
-  const executable = pnpmScript
-    ? process.execPath
-    : (process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm');
-  const commandArguments = pnpmScript ? [pnpmScript, ...args] : args;
+function packageManagerInvocation(manager, args, options = {}) {
+  const platform = options.platform || process.platform;
+  const script = options.script || null;
+  const managerArgs = manager === 'npm'
+    ? (args[0] === 'install'
+      ? args.filter((argument) => argument !== '--frozen-lockfile')
+      : ['run', ...args])
+    : args;
+  return {
+    manager,
+    executable: script ? process.execPath : (platform === 'win32' ? `${manager}.cmd` : manager),
+    args: script ? [script, ...managerArgs] : managerArgs,
+    shell: !script && platform === 'win32',
+  };
+}
+
+async function runPackageManager(projectRoot, args, options = {}) {
+  const environment = options.env || process.env;
+  const run = options.execFile || execFileAsync;
+  const managerScript = environment.npm_execpath || '';
+  let invocation;
+  if (/pnpm/i.test(managerScript)) {
+    invocation = packageManagerInvocation('pnpm', args, { script: managerScript });
+  } else if (/(?:^|[/\\])npm-cli\.js$/i.test(managerScript)) {
+    invocation = packageManagerInvocation('npm', args, { script: managerScript });
+  } else {
+    invocation = packageManagerInvocation('pnpm', args, options);
+  }
+
+  const execute = async (command) => run(command.executable, command.args, {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+    shell: command.shell,
+    windowsHide: true,
+  });
+
   try {
-    return await execFileAsync(executable, commandArguments, {
-      cwd: projectRoot,
-      encoding: 'utf8',
-      maxBuffer: 32 * 1024 * 1024,
-      shell: !pnpmScript && process.platform === 'win32',
-      windowsHide: true,
-    });
+    return await execute(invocation);
   } catch (error) {
+    if (!managerScript && invocation.manager === 'pnpm' && error.code === 'ENOENT') {
+      invocation = packageManagerInvocation('npm', args, options);
+      try {
+        return await execute(invocation);
+      } catch (fallbackError) {
+        error = fallbackError;
+      }
+    }
     const detail = String(error.stderr || error.stdout || error.message || error).trim();
-    throw new Error(`pnpm ${args.join(' ')} failed${detail ? `\n${detail}` : ''}`);
+    throw new Error(`${invocation.manager} ${invocation.args.join(' ')} failed${detail ? `\n${detail}` : ''}`);
   }
 }
 
@@ -217,6 +248,7 @@ class UpdateService {
 module.exports = {
   PROJECT_ROOT,
   UpdateService,
+  packageManagerInvocation,
   parseRevisionCounts,
   runPackageManager,
 };

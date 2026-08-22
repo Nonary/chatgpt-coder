@@ -47,31 +47,54 @@ test('only real ChatGPT conversation routes are accepted as submission proof', (
   assert.equal(conversationIdFromRouteUrl('https://chatgpt.com/c/not-a-uuid'), null);
 });
 
-test('opening a task conversation uses a new tab without changing the current route', () => {
-  const { openConversationInNewTab } = require('../src/userscript/src/chatgpt/navigate');
-  const previousDocument = global.document;
-  const clicks = [];
-  global.document = {
-    createElement: (tagName) => {
-      assert.equal(tagName, 'a');
-      return {
-        href: '',
-        target: '',
-        rel: '',
-        click() { clicks.push(this); },
-      };
-    },
+test('opening a task conversation uses ChatGPT in-page navigation', async () => {
+  const { openConversation } = require('../src/userscript/src/chatgpt/navigate');
+  const previous = {
+    document: global.document,
+    getComputedStyle: global.getComputedStyle,
+    HTMLAnchorElement: global.HTMLAnchorElement,
+    location: global.location,
+  };
+  const url = 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  const anchor = {
+    href: url,
+    click() { this.clicks += 1; },
+    clicks: 0,
+    getAttribute: () => null,
+    textContent: '',
+  };
+  global.HTMLAnchorElement = class HTMLAnchorElement {};
+  Object.setPrototypeOf(anchor, global.HTMLAnchorElement.prototype);
+  global.document = { querySelectorAll: () => [anchor] };
+  global.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+  global.location = {
+    href: 'https://chatgpt.com/g/g-p-abc123',
+    origin: 'https://chatgpt.com',
+    pathname: '/g/g-p-abc123',
+    search: '',
+    hash: '',
   };
   try {
-    const url = 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
-    assert.deepEqual(openConversationInNewTab(url), { navigated: false, method: 'new-tab' });
-    assert.equal(clicks.length, 1);
-    assert.equal(clicks[0].href, url);
-    assert.equal(clicks[0].target, '_blank');
-    assert.equal(clicks[0].rel, 'noopener noreferrer');
+    assert.deepEqual(await openConversation(url), { navigated: true, method: 'in-page-control' });
+    assert.equal(anchor.clicks, 1);
   } finally {
-    global.document = previousDocument;
+    global.document = previous.document;
+    global.getComputedStyle = previous.getComputedStyle;
+    global.HTMLAnchorElement = previous.HTMLAnchorElement;
+    global.location = previous.location;
   }
+});
+
+test('task conversation actions delegate to the SPA-aware navigation helper', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'),
+    'utf8',
+  );
+  const actionStart = source.indexOf('openConversation(taskId) {');
+  const actionEnd = source.indexOf('async copyPrompt(taskId)', actionStart);
+  const actionSource = source.slice(actionStart, actionEnd);
+  assert.match(actionSource, /navigate\.openConversation\(task\.conversationUrl\)/);
+  assert.doesNotMatch(actionSource, /openConversationInNewTab/);
 });
 
 test('project URLs reject identifiers that do not belong to the project', () => {
@@ -691,6 +714,18 @@ test('an applied task permanently supersedes an older Git Summary, even when tha
   assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask, regeneratedSummary], '/repo/a')?.taskId, 'summary-new');
 });
 
+test('applying a task does not automatically launch a redundant Git Summary task', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'),
+    'utf8',
+  );
+  const startGitSummaryCalls = source.match(/startGitSummaryTask\(/g) || [];
+
+  assert.equal(startGitSummaryCalls.length, 2, 'Git Summary should only have its method definition and explicit generate action');
+  assert.doesNotMatch(source, /ensureSourceControlSuggestion|sourceSuggestionRequests/);
+  assert.match(source, /\['task-applied', 'task-rolled-back', 'task-conflicted'\]\.includes\(event\.type\)[\s\S]*this\.refreshSource\(\)\.catch/);
+});
+
 test('Git Summary source-control state stays tied to its originating repository and snapshot', () => {
   const {
     gitSummaryIsStale, gitSummaryPhase, latestGitSummaryTask,
@@ -990,6 +1025,19 @@ test('follow-up composer is unavailable while the original task is still generat
   const { canFollowUp } = require('../src/userscript/src/ui/views/task-follow-up');
   assert.equal(canFollowUp({ taskId: 'running', state: 'submitted', conversationId: 'conversation-1' }), false);
   assert.equal(canFollowUp({ taskId: 'ready', state: 'ready', conversationId: 'conversation-1' }), true);
+});
+
+test('typing a follow-up immediately refreshes the send-button state', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'task-follow-up.js'),
+    'utf8',
+  );
+  const inputStart = source.indexOf('oninput: (event) => {');
+  const inputEnd = source.indexOf('onkeydown: (event) => {', inputStart);
+  const inputSource = source.slice(inputStart, inputEnd);
+
+  assert.match(inputSource, /setFollowUp\(\{ taskText: taskText\.value \}, 'silent'\);\s*syncSendButton\(\);/);
+  assert.match(source, /function syncSendButton\(\)[\s\S]*sendButton\.disabled = !canSendFollowUp\(taskRef, ctx\.store\.state\.followUp\);/);
 });
 
 test('task mode follows the active or last durable turn before legacy answerOnly', () => {
