@@ -22,9 +22,36 @@ function taskHasAgentTurn(task) {
   return (task.turns || []).some((turn) => turn.mode === 'agent');
 }
 
+function changedWritableRepositoryCount(task) {
+  const repositories = new Map((task.repositories || []).map((repository) => [repository.id, repository]));
+  return (task.result?.patches || []).filter((patch) => {
+    const repository = repositories.get(patch.id);
+    return repository && !repository.readOnly && patch.stat !== 'No changes';
+  }).length;
+}
+
 function applyActionLabel(task) {
   if (task.treeId) return `Apply to coding tree: ${task.treeName || 'selected tree'}`;
-  return 'Apply to original repository';
+  const count = changedWritableRepositoryCount(task);
+  return count > 1 ? `Apply to ${count} repositories` : 'Apply to original repository';
+}
+
+function rollbackActionLabel(task) {
+  const count = changedWritableRepositoryCount(task);
+  return count > 1 ? `Roll back ${count} repositories` : 'Roll back';
+}
+
+function patchMetrics(patch) {
+  const rows = String(patch?.numstat || '').split(/\r?\n/).filter(Boolean);
+  let additions = 0;
+  let deletions = 0;
+  for (const row of rows) {
+    const [added, deleted] = row.split(/\s+/, 2);
+    if (/^\d+$/.test(added)) additions += Number(added);
+    if (/^\d+$/.test(deleted)) deletions += Number(deleted);
+  }
+  if (rows.length === 0) return patch?.stat === 'No changes' ? 'No changes' : '';
+  return `${rows.length} file${rows.length === 1 ? '' : 's'} · +${additions} -${deletions}`;
 }
 
 function taskTargetValue(task, trees) {
@@ -35,7 +62,22 @@ function taskTargetValue(task, trees) {
 }
 
 function renderTargetCard(ctx, task) {
-  if (!canChangeTaskTarget(task)) return null;
+  if (!canChangeTaskTarget(task)) {
+    const writableCount = (task.repositories || []).filter((repository) => !repository.readOnly).length;
+    if (!task.summaryOnly && taskHasAgentTurn(task) && writableCount > 1
+      && ['prepared', 'submitted', 'ready', 'failed', 'conflicted'].includes(task.state)) {
+      return h(
+        'div',
+        { class: 'card' },
+        h('h3', {}, 'Apply target'),
+        h('p', { class: 'muted', style: { margin: '0' } },
+          `This task uses the current checkouts for ${writableCount} editable repositories.`),
+        h('p', { class: 'field-help' },
+          'Coding trees currently support one editable repository. Mark the other repositories as Context before creating a tree.'),
+      );
+    }
+    return null;
+  }
   const { trees } = ctx.store.state;
   const sourcePath = task.sourceRepositoryPath
     || task.repositories?.find((repository) => !repository.readOnly)?.path
@@ -138,12 +180,30 @@ function renderResultCard(ctx, task) {
   const patches = h('div', { class: 'patch-list' });
   replace(
     patches,
-    ...(task.result.patches || []).map((patch) => h(
-      'div',
-      { class: 'patch' },
-      h('strong', {}, patch.name || patch.id),
-      h('pre', {}, patch.stat || 'No changes'),
-    )),
+    ...(task.result.patches || []).map((patch) => {
+      const repository = (task.repositories || []).find((item) => item.id === patch.id);
+      const conflict = (task.result.conflicts || []).find((item) => item.repositoryId === patch.id);
+      return h(
+        'div',
+        { class: 'patch' },
+        h(
+          'div',
+          { class: 'row patch-heading' },
+          h('strong', {}, patch.name || patch.id),
+          h('div', { class: 'spacer' }),
+          conflict
+            ? h('span', { class: 'status-badge conflicted' }, 'Conflict')
+            : repository?.readOnly
+              ? h('span', { class: 'status-badge' }, 'Context')
+              : h(
+                'span',
+                { class: 'patch-metrics' },
+                `${task.state === 'applied' && patch.stat !== 'No changes' ? 'Applied · ' : ''}${patchMetrics(patch)}`,
+              ),
+        ),
+        h('pre', {}, patch.stat || 'No changes'),
+      );
+    }),
     task.result.commitMessage
       ? h(
         'div',
@@ -174,7 +234,7 @@ function renderResultCard(ctx, task) {
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.resolveConflict(task.taskId) }, 'Resolve in a new chat')
       : null,
     task.state === 'applied'
-      ? h('button', { class: 'danger', onclick: () => ctx.actions.rollbackTask(task.taskId) }, 'Roll back')
+      ? h('button', { class: 'danger', onclick: () => ctx.actions.rollbackTask(task.taskId) }, rollbackActionLabel(task))
       : null,
   );
 
@@ -264,4 +324,13 @@ function renderTaskDetail(ctx, task, { followUpComposer = null } = {}) {
   ].filter(Boolean);
 }
 
-module.exports = { applyActionLabel, canChangeTaskTarget, renderTaskDetail, taskHasAgentTurn, taskTargetValue };
+module.exports = {
+  applyActionLabel,
+  canChangeTaskTarget,
+  changedWritableRepositoryCount,
+  patchMetrics,
+  renderTaskDetail,
+  rollbackActionLabel,
+  taskHasAgentTurn,
+  taskTargetValue,
+};

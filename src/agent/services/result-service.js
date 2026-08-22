@@ -96,6 +96,16 @@ async function matchesPackagedState(repository, current) {
   return current.baseCommit === repository.baseCommit && current.isClean;
 }
 
+class ApplyConflictError extends Error {
+  constructor(repository, error, applyAttempted = false) {
+    super(String(error?.message || error || 'The patch did not apply cleanly.'));
+    this.name = 'ApplyConflictError';
+    this.repository = repository;
+    this.applyAttempted = Boolean(applyAttempted);
+    this.originalError = error instanceof Error ? error : new Error(this.message);
+  }
+}
+
 class ResultService {
   constructor(taskService, onEvent = () => {}) {
     this.taskService = taskService;
@@ -511,6 +521,10 @@ class ResultService {
     const appliedRepositories = [];
     try {
       const replacementPatches = await this.prepareReplacementPatches(task);
+      const plan = [];
+
+      // Preflight every writable repository before mutating any of them. This
+      // keeps a later conflict from leaving earlier repositories partially applied.
       for (const patch of task.result.patches) {
         const repository = task.repositories.find((item) => item.id === patch.id);
         if (!repository || repository.readOnly) continue;
@@ -527,15 +541,20 @@ class ResultService {
 
         const body = await fs.readFile(effectivePatch.localPath);
         if (body.length === 0) continue;
+
         if (replacement) {
           try {
-            await applyPatch(repository.path, effectivePatch.localPath, {
-              index: Boolean(replacement.appliedState.indexApplied),
-            });
+            if (replacement.appliedState.indexApplied) {
+              await runGit(repository.path, [
+                'apply', '--check', '--index', '--binary', effectivePatch.localPath,
+              ]);
+            } else {
+              await checkPatch(repository.path, effectivePatch.localPath);
+            }
           } catch (error) {
-            return this.markConflicted(task, repository, error, true);
+            throw new ApplyConflictError(repository, error, false);
           }
-          applied.push({
+          plan.push({
             repository,
             patch: effectivePatch,
             applyMode: 'direct',
@@ -550,35 +569,55 @@ class ResultService {
         const exactState = await matchesPackagedState(repository, current);
         if (!exactState && !current.isClean) {
           const previousConflict = task.result.conflicts?.find((item) => item.repositoryId === repository.id);
-          return this.markConflicted(task, repository, new Error(
+          throw new ApplyConflictError(repository, new Error(
             `${repository.name} has new uncommitted or unmerged changes since this task was packaged.`,
           ), previousConflict?.applyAttempted === true);
         }
+
         let applyMode = 'direct';
-        if (!exactState) {
-          try {
-            await checkPatch(repository.path, effectivePatch.localPath);
-          } catch {
-            applyMode = 'three-way';
-          }
-        } else {
-          await checkPatch(repository.path, effectivePatch.localPath);
-        }
         try {
-          await applyPatch(repository.path, effectivePatch.localPath, applyMode === 'three-way'
-            ? { threeWay: true, index: true }
-            : {});
+          await checkPatch(repository.path, effectivePatch.localPath);
         } catch (error) {
-          return this.markConflicted(task, repository, error, true);
+          if (exactState) throw new ApplyConflictError(repository, error, false);
+          applyMode = 'three-way';
+          try {
+            await runGit(repository.path, [
+              'apply', '--check', '--3way', '--binary', effectivePatch.localPath,
+            ]);
+          } catch (threeWayError) {
+            throw new ApplyConflictError(repository, threeWayError, false);
+          }
         }
-        applied.push({
+
+        plan.push({
           repository,
           patch: effectivePatch,
           applyMode,
+          replacement: false,
+          indexApplied: applyMode === 'three-way',
           wasClean: current.isClean,
           headBefore: current.baseCommit,
         });
       }
+
+      for (const item of plan) {
+        try {
+          await applyPatch(item.repository.path, item.patch.localPath, item.replacement
+            ? { index: item.indexApplied }
+            : item.applyMode === 'three-way'
+              ? { threeWay: true, index: true }
+              : {});
+        } catch (error) {
+          if (item.wasClean && item.headBefore) {
+            await runGit(item.repository.path, ['reset', '--hard', item.headBefore]).catch(() => {});
+          } else if (item.applyMode === 'three-way') {
+            await runGit(item.repository.path, ['reset', '--mixed', '--quiet', 'HEAD']).catch(() => {});
+          }
+          throw new ApplyConflictError(item.repository, error, true);
+        }
+        applied.push(item);
+      }
+
       if (task.treeId) {
         const commitMessage = validateCommitMessage(task.result.commitMessage);
         for (const item of applied) {
@@ -607,14 +646,14 @@ class ResultService {
         });
       }
     } catch (error) {
-      for (const item of committed.reverse()) {
+      for (const item of [...committed].reverse()) {
         try {
           await runGit(item.repository.path, ['reset', '--hard', `${item.commit}^`]);
         } catch {
           // Preserve the original error and the worktree for manual recovery.
         }
       }
-      for (const item of applied.reverse()) {
+      for (const item of [...applied].reverse()) {
         if (committed.some((commit) => commit.repository.path === item.repository.path)) continue;
         try {
           if (item.wasClean && item.headBefore) {
@@ -632,10 +671,21 @@ class ResultService {
           // Preserve the original error; the UI will point the user to the saved patch.
         }
       }
+
+      if (error instanceof ApplyConflictError) {
+        return this.markConflicted(
+          task,
+          error.repository,
+          error.originalError,
+          error.applyAttempted,
+        );
+      }
+
       task = await this.taskService.updateTask(taskId, { state: 'failed', error: error.message });
       await this.onEvent({ type: 'task-failed', task, message: error.message });
       throw error;
     }
+
     const previousCommits = Array.isArray(task.appliedResult?.commits) ? task.appliedResult.commits : [];
     const newCommits = committed.map(({ repository, commit, message }) => ({
       repositoryId: repository.id,
@@ -704,9 +754,12 @@ class ResultService {
     const message = files.length
       ? `${repository.name} has merge conflicts in ${files.length} file${files.length === 1 ? '' : 's'}.`
       : `${repository.name} changed and the result could not be applied cleanly.`;
+    const recovery = files.length > 0 || applyAttempted
+      ? 'Clean up the target and retry the saved result, or resubmit a conflict-resolution task to preserve both versions.'
+      : 'The workspace was left unchanged. Retry the saved result after updating the target, or use conflict resolution to preserve both versions.';
     const conflictedTask = await this.taskService.updateTask(task.taskId, {
       state: 'conflicted',
-      error: `${message} Clean up the target and retry the saved result, or resubmit a conflict-resolution task to preserve both versions.`,
+      error: `${message} ${recovery}`,
       result: {
         ...task.result,
         conflicts: [{

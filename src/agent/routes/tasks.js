@@ -28,7 +28,7 @@ function sanitizeUploadName(value) {
 
 function register(router, context) {
   const {
-    emit, promptService, resultService, skillService, taskService, worktreeService, uploadsRoot,
+    emit, gitService, promptService, resultService, skillService, taskService, worktreeService, uploadsRoot,
   } = context;
 
   // Attachments arrive as bytes from a real file input in the page; there is no
@@ -52,28 +52,43 @@ function register(router, context) {
     const taskText = appendPromptInstructions(baseTaskText, selectedPrompts);
 
     let tree = null;
-    let taskRepositories = body.repositories;
+    let taskRepositories = await gitService.resolveTaskRepositories(
+      Array.isArray(body.repositories) ? body.repositories : [],
+      body.submodules,
+    );
     let skillsResolved = false;
-    let skillRepositoryPaths = Array.isArray(body.repositories)
-      ? body.repositories.map((item) => item.path)
-      : [];
+    let skillRepositoryPaths = taskRepositories.map((item) => item.path);
 
-    if (body.treeId) {
-      tree = await worktreeService.get(body.treeId);
-      const inspected = await worktreeService.inspect(tree);
-      if (!inspected.available) throw new Error(inspected.error);
-      if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
-    } else if (body.createTree) {
-      if (!Array.isArray(body.repositories) || body.repositories.length === 0) {
-        throw new Error('Choose at least one repository when creating a coding tree.');
+    if (body.treeId || body.createTree) {
+      if (body.treeId) {
+        tree = await worktreeService.get(body.treeId);
+        const inspected = await worktreeService.inspect(tree);
+        if (!inspected.available) throw new Error(inspected.error);
+        if (!inspected.clean) throw new Error('Commit or discard local coding-tree changes before starting a follow-up task.');
+        if (taskRepositories.length === 0) {
+          taskRepositories = await gitService.resolveTaskRepositories(
+            [{ path: tree.repositoryPath, readOnly: false }],
+            body.submodules,
+          );
+          skillRepositoryPaths = taskRepositories.map((item) => item.path);
+        }
       }
-      await skillService.resolveSelectedSkillIds(body.skillIds, skillRepositoryPaths);
-      skillsResolved = true;
-      const suggestedName = String(body.treeName || taskText || '').split('\n')[0].trim();
-      tree = await worktreeService.create(body.repositories[0].path, suggestedName);
+
+      const writableRepositories = taskRepositories.filter((repository) => !repository.readOnly);
+      if (writableRepositories.length !== 1) {
+        throw new Error(
+          'Coding trees currently support one editable repository. Use the current checkouts for this multi-repository task, or mark the other repositories as Context.',
+        );
+      }
+      if (!tree) {
+        await skillService.resolveSelectedSkillIds(body.skillIds, skillRepositoryPaths);
+        skillsResolved = true;
+        const suggestedName = String(body.treeName || taskText || '').split('\n')[0].trim();
+        tree = await worktreeService.create(writableRepositories[0].path, suggestedName);
+      }
     }
     if (tree) {
-      taskRepositories = await resolveTreeTaskRepositories(tree, body.repositories);
+      taskRepositories = await resolveTreeTaskRepositories(tree, taskRepositories);
       skillRepositoryPaths = taskRepositories.map((item) => item.path);
     }
     if (!skillsResolved) await skillService.resolveSelectedSkillIds(body.skillIds, skillRepositoryPaths);

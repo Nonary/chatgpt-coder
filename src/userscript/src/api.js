@@ -72,6 +72,8 @@ class Api {
 
   repositoryCatalog() { return this.get('/v1/workspace/repository-catalog'); }
 
+  submodules(path) { return this.get(`/v1/workspace/submodules${query({ path })}`); }
+
   addRepositories(paths) { return this.post('/v1/workspace/repositories', { paths }); }
 
   removeRepository(path) { return this.post('/v1/workspace/repositories/remove', { path }); }

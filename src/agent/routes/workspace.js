@@ -42,6 +42,10 @@ function register(router, context) {
     repositories: await gitService.listKnownRepositories(),
   }));
 
+  router.get('/v1/workspace/submodules', async ({ url }) => (
+    gitService.submodules(url.searchParams.get('path'))
+  ));
+
   router.post('/v1/workspace/repositories', async ({ body }) => {
     const paths = Array.isArray(body.paths) ? body.paths : [body.path].filter(Boolean);
     if (paths.length === 0) throw new Error('Choose at least one repository directory.');

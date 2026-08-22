@@ -25,6 +25,7 @@ const {
 } = require('../src/agent/services/prompt-service');
 const {
   buildAgentInstructions,
+  buildFollowUpPrompt,
   resolveTreeTaskRepositories,
   TaskService,
 } = require('../src/agent/services/task-service');
@@ -99,17 +100,30 @@ test('follow-up turns persist Ask/Agent state without rewriting the legacy answe
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-turns-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
+  const contextRepositoryPath = await createRepository(path.join(root, 'context'));
   const tasks = new TaskService(path.join(root, 'data'));
   await tasks.initialize();
-  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
   const task = await tasks.createTask({
     taskText: 'Answer a software question, then continue the task as needed.',
-    repositories: [repository],
+    repositories: [
+      { path: repositoryPath, access: 'edit' },
+      { path: contextRepositoryPath, access: 'context' },
+    ],
     answerOnly: true,
     autoApply: true,
   });
   const conversationId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
   const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  const manifestEditable = manifest.repositories.find((repository) => repository.access === 'edit');
+  const manifestContext = manifest.repositories.find((repository) => repository.access === 'context');
+  assert.equal(manifestEditable.readOnly, true, 'Ask packaging is effectively read-only');
+  assert.equal(manifestContext.readOnly, true, 'Context stays effectively read-only in Ask mode');
+  const agentPrompt = buildFollowUpPrompt(task, 'Implement the requested change now.', 'agent');
+  assert.match(agentPrompt, /manifest `access` is `context` remain read-only/i);
+  assert.match(agentPrompt, /only repositories with `access` `edit` may be changed/i);
+
   await tasks.updateTask(task.taskId, { conversationId, conversationUrl, state: 'completed' });
 
   const ask = await tasks.createFollowUp(task.taskId, {
@@ -143,7 +157,14 @@ test('follow-up turns persist Ask/Agent state without rewriting the legacy answe
   assert.equal(agent.turns[1].reasoningMode, 'high');
   assert.equal(agent.conversationId, conversationId);
   assert.equal(agent.conversationUrl, conversationUrl);
-  assert.equal(agent.repositories[0].readOnly, false, 'Agent follow-up promotes the existing task repository to writable');
+  const editableRepository = agent.repositories.find((repository) => (
+    path.resolve(repository.path) === path.resolve(repositoryPath)
+  ));
+  const contextRepository = agent.repositories.find((repository) => (
+    path.resolve(repository.path) === path.resolve(contextRepositoryPath)
+  ));
+  assert.equal(editableRepository.readOnly, false, 'Agent follow-up restores the configured Edit repository');
+  assert.equal(contextRepository.readOnly, true, 'Agent follow-up preserves the configured Context repository');
   assert.equal(agent.resultFilename, `chatgpt-ide-result-${task.taskId}.txt`);
 
   await assert.rejects(
@@ -153,7 +174,7 @@ test('follow-up turns persist Ask/Agent state without rewriting the legacy answe
 
   const fresh = await tasks.createTask({
     taskText: 'Prepare a task for a concurrent send race.',
-    repositories: [repository],
+    repositories: [{ path: repositoryPath }],
     answerOnly: true,
   });
   await tasks.updateTask(fresh.taskId, {
@@ -226,6 +247,23 @@ function plainTextResult(task, patch, commitMessage = 'fix(task): apply generate
       patchEncoding: 'base64',
       patch: Buffer.from(patch).toString('base64'),
     }],
+  })}\nPATCHWORK_RESULT_END`;
+}
+
+function plainTextMultiRepositoryResult(task, patches, commitMessage = 'feat(workspace): update repositories') {
+  return `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Implemented the requested multi-repository change.',
+    commitMessage,
+    repositories: task.repositories.map((repository) => ({
+      id: repository.id,
+      baseCommit: repository.baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patches.get(repository.id) || '').toString('base64'),
+    })),
   })}\nPATCHWORK_RESULT_END`;
 }
 
@@ -727,6 +765,148 @@ test('dirty repositories keep their full history and capture unstaged files as a
   ]);
   assert.match(suppliedDiff, /locally changed/);
   assert.match(suppliedDiff, /untracked\.txt/);
+});
+
+
+test('workspace submodules are discovered from Git metadata and resolved as ordinary task repositories', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-submodule-workspace-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const parentPath = await createRepository(path.join(root, 'parent'));
+  const childSourcePath = await createRepository(path.join(root, 'child-source'));
+  await runGit(parentPath, [
+    '-c', 'protocol.file.allow=always',
+    'submodule', 'add', childSourcePath, 'vendor/child',
+  ]);
+  await runGit(parentPath, ['commit', '-am', 'Add child submodule']);
+
+  const childPath = path.join(parentPath, 'vendor', 'child');
+  const { stdout: childHeadOutput } = await runGit(childPath, ['rev-parse', 'HEAD']);
+  const childHead = childHeadOutput.trim();
+  const git = new GitService(path.join(root, 'git-data'));
+
+  const discovery = await git.submodules(parentPath);
+  assert.equal(discovery.submodules.length, 1);
+  assert.equal(discovery.submodules[0].path, 'vendor/child');
+  assert.equal(discovery.submodules[0].recordedCommit, childHead);
+  assert.equal(discovery.submodules[0].available, true);
+  assert.equal(discovery.submodules[0].initialized, true);
+
+  const allAsContext = await git.resolveTaskRepositories([{ path: parentPath }], {
+    mode: 'all',
+    selections: {},
+  });
+  assert.equal(allAsContext.length, 2);
+  const contextChild = allAsContext.find((repository) => repository.origin === 'submodule');
+  assert.ok(contextChild);
+  assert.equal(contextChild.readOnly, true);
+  assert.equal(contextChild.relations[0].submodulePath, 'vendor/child');
+
+  const selectionKey = discovery.submodules[0].selectionKey;
+  const selectedEditable = await git.resolveTaskRepositories([
+    { path: parentPath, access: 'edit' },
+    { path: childPath, access: 'context' },
+  ], {
+    mode: 'select',
+    selections: {
+      [selectionKey]: { included: true, access: 'edit' },
+    },
+  });
+  assert.equal(selectedEditable.length, 2, 'manual and submodule selections are deduplicated by real path');
+  const editableChild = selectedEditable.find((repository) => (
+    path.resolve(repository.path) === path.resolve(childPath)
+  ));
+  assert.equal(editableChild.readOnly, false, 'Edit wins when the same repository is also Context');
+  assert.equal(editableChild.origin, 'manual');
+
+  const tasks = new TaskService(path.join(root, 'task-data'));
+  await tasks.initialize();
+  const task = await tasks.createTask({
+    taskText: 'Update the parent and its child repository.',
+    repositories: selectedEditable,
+  });
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  const taskChild = task.repositories.find((repository) => (
+    path.resolve(repository.path) === path.resolve(childPath)
+  ));
+  const manifestParent = manifest.repositories.find((repository) => repository.origin === 'manual'
+    && repository.name === path.basename(parentPath));
+  const manifestChild = manifest.repositories.find((repository) => repository.id === taskChild.id);
+  assert.ok(manifestParent);
+  assert.ok(manifestChild);
+  assert.equal(manifestChild.readOnly, false);
+  assert.equal(manifestChild.relations[0].type, 'submodule');
+  assert.equal(manifestChild.relations[0].parentRepositoryId, manifestParent.id);
+  assert.equal(manifestChild.relations[0].path, 'vendor/child');
+  assert.equal(manifestChild.relations[0].recordedCommit, childHead);
+  assert.equal(Object.hasOwn(manifestChild.relations[0], 'parentPath'), false);
+});
+
+test('coding tree repository resolution rejects more than one editable repository', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-tree-guard-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstPath = await createRepository(path.join(root, 'first'));
+  const secondPath = await createRepository(path.join(root, 'second'));
+
+  await assert.rejects(
+    () => resolveTreeTaskRepositories(
+      { path: firstPath, repositoryPath: firstPath },
+      [{ path: firstPath }, { path: secondPath }],
+    ),
+    /coding trees currently support one editable repository/i,
+  );
+});
+
+test('multi-repository apply preflights every repository before touching the first', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-atomic-multi-apply-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstPath = await createRepository(path.join(root, 'first'));
+  const secondPath = await createRepository(path.join(root, 'second'));
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const task = await tasks.createTask({
+    taskText: 'Change both greetings.',
+    repositories: [{ path: firstPath }, { path: secondPath }],
+  });
+
+  const patches = new Map();
+  for (const [repositoryPath, greeting] of [
+    [firstPath, 'hello from first result\n'],
+    [secondPath, 'hello from second result\n'],
+  ]) {
+    await fs.writeFile(path.join(repositoryPath, 'hello.txt'), greeting);
+    const { stdout: patchBody } = await runGit(repositoryPath, ['diff', '--binary', '--', 'hello.txt']);
+    const taskRepository = task.repositories.find(
+      (repository) => path.resolve(repository.path) === path.resolve(repositoryPath),
+    );
+    patches.set(taskRepository.id, patchBody);
+    await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'hello\n');
+  }
+
+  const results = new ResultService(tasks);
+  const ready = await ingestDownloadedText(
+    results,
+    tasks,
+    task,
+    plainTextMultiRepositoryResult(task, patches, 'feat(workspace): update both greetings'),
+  );
+  assert.equal(ready.state, 'ready');
+
+  await fs.writeFile(path.join(secondPath, 'hello.txt'), 'local work that must be preserved\n');
+  const conflicted = await results.apply(task.taskId);
+  assert.equal(conflicted.state, 'conflicted');
+  assert.equal(await fs.readFile(path.join(firstPath, 'hello.txt'), 'utf8'), 'hello\n');
+  assert.equal(
+    await fs.readFile(path.join(secondPath, 'hello.txt'), 'utf8'),
+    'local work that must be preserved\n',
+  );
+  assert.equal(conflicted.result.conflicts.length, 1);
+  assert.equal(
+    conflicted.result.conflicts[0].repositoryId,
+    task.repositories.find((repository) => (
+      path.resolve(repository.path) === path.resolve(secondPath)
+    )).id,
+  );
 });
 
 test('results apply and commit after the coding tree HEAD advances', async (context) => {

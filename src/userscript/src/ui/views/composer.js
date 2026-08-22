@@ -79,6 +79,24 @@ function composerTargetSummary(state) {
     target = 'No repository selected';
   }
 
+  if (!composer.treeSelection && composer.repositories.length > 0) {
+    const summary = composer.submodules?.summary;
+    const manualEditable = composer.repositories.filter(
+      (repository) => repository.access !== 'context' && repository.readOnly !== true,
+    ).length;
+    const manualContext = composer.repositories.length - manualEditable;
+    const workspaceTotal = Number.isInteger(summary?.workspaceTotal)
+      ? summary.workspaceTotal
+      : composer.repositories.length;
+    const editable = Number.isInteger(summary?.editable) ? summary.editable : manualEditable;
+    const context = Number.isInteger(summary?.context) ? summary.context : manualContext;
+    if (workspaceTotal !== composer.repositories.length || context > 0) {
+      target += composer.mode === 'ask'
+        ? ` · ${workspaceTotal} repos · Ask read-only`
+        : ` · ${workspaceTotal} repos · ${editable} editable · ${context} context`;
+    }
+  }
+
   if (composer.projectSelection === NEW_PROJECT_VALUE) {
     target += ` · New project${composer.newProjectName.trim() ? ` · ${composer.newProjectName.trim()}` : ''}`;
   } else if (composer.projectSelection) {

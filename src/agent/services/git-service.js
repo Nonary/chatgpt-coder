@@ -176,6 +176,37 @@ function workspaceId(repositoryPath) {
   return crypto.createHash('sha256').update(repositoryPath).digest('hex').slice(0, 12);
 }
 
+function normalizeSubmodulePath(value) {
+  return String(value || '').replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
+function submoduleSelectionKey(repositoryPath, relativePath) {
+  return JSON.stringify([repositoryPathKey(repositoryPath), normalizeSubmodulePath(relativePath)]);
+}
+
+function mergeRepositorySelection(target, candidate) {
+  if (!target) return {
+    ...candidate,
+    relations: Array.isArray(candidate.relations) ? [...candidate.relations] : [],
+  };
+  const relations = [...(target.relations || [])];
+  for (const relation of candidate.relations || []) {
+    if (!relations.some((item) => item.type === relation.type
+      && item.parentPath === relation.parentPath
+      && item.submodulePath === relation.submodulePath)) {
+      relations.push(relation);
+    }
+  }
+  const readOnly = Boolean(target.readOnly) && Boolean(candidate.readOnly);
+  return {
+    ...target,
+    readOnly,
+    access: readOnly ? 'context' : 'edit',
+    origin: target.origin === 'manual' || candidate.origin !== 'manual' ? target.origin : candidate.origin,
+    relations,
+  };
+}
+
 class GitService {
   constructor(dataRoot) {
     this.workspaceFile = path.join(dataRoot, 'workspace.json');
@@ -282,6 +313,163 @@ class GitService {
       }
     }
     return repositories;
+  }
+
+  async directSubmodules(repositoryPath) {
+    const repository = await inspectRepository(repositoryPath);
+    const gitmodulesPath = path.join(repository.path, '.gitmodules');
+    try {
+      await fs.access(gitmodulesPath);
+    } catch {
+      return [];
+    }
+
+    const configArgs = [
+      'config', '--file', '.gitmodules', '--get-regexp', '^submodule\\..*\\.path$',
+    ];
+    let output;
+    try {
+      ({ stdout: output } = await runGit(repository.path, configArgs));
+    } catch (error) {
+      const noMatchError = `Git command failed: git ${configArgs.join(' ')}`;
+      if (error.message === noMatchError) return [];
+      throw error;
+    }
+
+    const entries = [];
+    for (const line of output.split(/\r?\n/).filter(Boolean)) {
+      const match = line.match(/^(\S+)\s+(.+)$/);
+      if (!match) continue;
+      const key = match[1];
+      const relativePath = normalizeSubmodulePath(match[2]);
+      if (!relativePath || path.isAbsolute(relativePath)
+        || relativePath.split('/').some((segment) => segment === '..')) continue;
+      const moduleName = key.slice('submodule.'.length, -'.path'.length);
+      const candidatePath = path.resolve(repository.path, ...relativePath.split('/'));
+      let recordedCommit = null;
+      if (repository.hasHead) {
+        recordedCommit = await runGit(repository.path, ['rev-parse', `HEAD:${relativePath}`])
+          .then(({ stdout }) => stdout.trim() || null)
+          .catch(() => null);
+      }
+
+      let availableRepository = null;
+      try {
+        await fs.lstat(path.join(candidatePath, '.git'));
+        availableRepository = await inspectRepository(candidatePath);
+        if (repositoryPathKey(availableRepository.path) === repositoryPathKey(repository.path)) {
+          availableRepository = null;
+        }
+      } catch {
+        availableRepository = null;
+      }
+
+      entries.push({
+        name: path.basename(relativePath) || moduleName,
+        moduleName,
+        path: relativePath,
+        repositoryPath: availableRepository?.path || candidatePath,
+        recordedCommit,
+        initialized: Boolean(availableRepository),
+        available: Boolean(availableRepository),
+      });
+    }
+    return entries;
+  }
+
+  async submodules(repositoryPath) {
+    const root = await inspectRepository(repositoryPath);
+    const submodules = [];
+    const visited = new Set([repositoryPathKey(root.path)]);
+
+    const visit = async (repository, prefix = '', depth = 0) => {
+      const direct = await this.directSubmodules(repository.path);
+      for (const entry of direct) {
+        const relativePath = normalizeSubmodulePath(
+          prefix ? `${prefix}/${entry.path}` : entry.path,
+        );
+        submodules.push({
+          ...entry,
+          path: relativePath,
+          depth,
+          rootRepositoryPath: root.path,
+          selectionKey: submoduleSelectionKey(root.path, relativePath),
+        });
+        if (!entry.available) continue;
+        const key = repositoryPathKey(entry.repositoryPath);
+        if (visited.has(key)) continue;
+        visited.add(key);
+        const child = await inspectRepository(entry.repositoryPath);
+        await visit(child, relativePath, depth + 1);
+      }
+    };
+
+    await visit(root);
+    return { repository: root, submodules };
+  }
+
+  async resolveTaskRepositories(selectedRepositories, submoduleConfig = {}) {
+    if (!Array.isArray(selectedRepositories) || selectedRepositories.length === 0) return [];
+    const resolved = new Map();
+    const manual = new Map();
+
+    for (const entry of selectedRepositories) {
+      if (!entry?.path) continue;
+      const repository = await inspectRepository(entry.path);
+      const access = entry.access === 'context'
+        ? 'context'
+        : entry.access === 'edit'
+          ? 'edit'
+          : entry.readOnly === true
+            ? 'context'
+            : 'edit';
+      const selection = {
+        path: repository.path,
+        readOnly: access === 'context',
+        access,
+        origin: entry.origin || 'manual',
+        relations: Array.isArray(entry.relations) ? entry.relations : [],
+      };
+      const key = repositoryPathKey(repository.path);
+      resolved.set(key, mergeRepositorySelection(resolved.get(key), selection));
+      manual.set(key, repository);
+    }
+
+    const mode = ['none', 'all', 'select'].includes(submoduleConfig?.mode)
+      ? submoduleConfig.mode
+      : 'none';
+    if (mode === 'none') return [...resolved.values()];
+
+    const selections = submoduleConfig?.selections && typeof submoduleConfig.selections === 'object'
+      ? submoduleConfig.selections
+      : {};
+    for (const rootRepository of manual.values()) {
+      const discovery = await this.submodules(rootRepository.path);
+      for (const submodule of discovery.submodules) {
+        if (!submodule.available) continue;
+        const selected = selections[submodule.selectionKey] || {};
+        const included = mode === 'all' || (mode === 'select' && selected.included === true);
+        if (!included) continue;
+        const child = await inspectRepository(submodule.repositoryPath);
+        const candidate = {
+          path: child.path,
+          readOnly: selected.access !== 'edit',
+          access: selected.access === 'edit' ? 'edit' : 'context',
+          origin: 'submodule',
+          relations: [{
+            type: 'submodule',
+            parentPath: rootRepository.path,
+            submodulePath: submodule.path,
+            recordedCommit: submodule.recordedCommit,
+            depth: submodule.depth,
+          }],
+        };
+        const key = repositoryPathKey(child.path);
+        resolved.set(key, mergeRepositorySelection(resolved.get(key), candidate));
+      }
+    }
+
+    return [...resolved.values()];
   }
 
   async history(repositoryPath, limit = 20) {

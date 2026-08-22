@@ -773,7 +773,16 @@ test('composer mode maps Ask and Agent to the existing answer-only task contract
   const { createTaskInput } = require('../src/userscript/src/task-input');
   const composer = {
     taskText: 'Explain the parser.',
-    repositories: [{ path: 'C:/repo' }],
+    repositories: [
+      { path: 'C:/repo', access: 'edit' },
+      { path: 'C:/docs', access: 'context' },
+    ],
+    submodules: {
+      mode: 'select',
+      selections: {
+        '["c:/repo","vendor/helper"]': { included: true, access: 'context' },
+      },
+    },
     attachments: [],
     skillIds: [],
     promptIds: [],
@@ -785,7 +794,13 @@ test('composer mode maps Ask and Agent to the existing answer-only task contract
     mode: 'ask',
   };
 
-  assert.equal(createTaskInput(composer).answerOnly, true);
+  const askInput = createTaskInput(composer);
+  assert.equal(askInput.answerOnly, true);
+  assert.deepEqual(askInput.repositories, [
+    { path: 'C:/repo', access: 'edit', readOnly: false },
+    { path: 'C:/docs', access: 'context', readOnly: true },
+  ]);
+  assert.deepEqual(askInput.submodules, composer.submodules);
   assert.equal(createTaskInput({ ...composer, mode: 'agent' }).answerOnly, false);
 });
 
@@ -1092,9 +1107,32 @@ test('mixed Ask follow-ups keep Agent result actions available', () => {
 });
 
 test('ready task results name the repository or coding tree they will apply to', () => {
-  const { applyActionLabel, taskTargetValue } = require('../src/userscript/src/ui/views/task-detail');
+  const {
+    applyActionLabel,
+    patchMetrics,
+    rollbackActionLabel,
+    taskTargetValue,
+  } = require('../src/userscript/src/ui/views/task-detail');
 
   assert.equal(applyActionLabel({ treeId: null }), 'Apply to original repository');
+  const multiRepositoryTask = {
+    treeId: null,
+    repositories: [
+      { id: 'one', readOnly: false },
+      { id: 'two', readOnly: false },
+      { id: 'docs', readOnly: true },
+    ],
+    result: {
+      patches: [
+        { id: 'one', stat: '1 file changed', numstat: '8\t2\tsrc/one.js\n' },
+        { id: 'two', stat: '2 files changed', numstat: '3\t1\tsrc/two.js\n2\t0\ttest/two.test.js\n' },
+        { id: 'docs', stat: 'No changes', numstat: '' },
+      ],
+    },
+  };
+  assert.equal(applyActionLabel(multiRepositoryTask), 'Apply to 2 repositories');
+  assert.equal(rollbackActionLabel(multiRepositoryTask), 'Roll back 2 repositories');
+  assert.equal(patchMetrics(multiRepositoryTask.result.patches[1]), '2 files · +5 -1');
   assert.equal(
     applyActionLabel({ treeId: 'tree-123', treeName: 'Parser repair' }),
     'Apply to coding tree: Parser repair',

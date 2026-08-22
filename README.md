@@ -80,10 +80,13 @@ what the request is sent with.
 
 ## Workflow
 
-1. Open **Tasks** in the dock. Choose where the work lands: the current working
-   changes of one or more repositories, a new coding tree, or an existing tree.
-   The task target, model, reasoning mode, and ChatGPT project selection stay
-   sticky between tasks.
+1. Open **Tasks** in the dock. Configure the **Workspace** by adding repositories
+   as **Edit** or **Context**, then choose whether locally available Git submodules
+   are included with **None**, **All**, or **Select**. Submodule selection is
+   resolved again by the agent when the task is created, and missing/uninitialized
+   submodules are never cloned or fetched implicitly. Choose whether the work lands
+   in the current checkouts, a new coding tree, or an existing tree. The task target,
+   model, reasoning mode, and ChatGPT project selection stay sticky between tasks.
 2. Describe the task. Optionally add saved prompts, local skills, reference file
    attachments, or configured IaC context, and choose whether ChatGPT runs it in a
    plain new chat, an existing project, or a project Patchwork creates. Before
@@ -148,8 +151,13 @@ original attachments.
 
 Instead of a native file dialog — which a web page cannot open — repositories are
 chosen through an in-page directory browser backed by the agent, including a "scan
-for repositories" sweep. Attachments use an ordinary file input, and their bytes are
-staged by the agent before packaging.
+for repositories" sweep. Workspace repositories retain their Edit/Context access in
+the composer. Git submodules are discovered explicitly from `.gitmodules` and Git
+metadata rather than by making ordinary repository discovery recursive. Selected
+submodules are flattened into the same task repository list, deduplicated by their
+canonical path, and packaged with relative relationship metadata so local absolute
+paths are not exposed in `manifest.json`. Attachments use an ordinary file input,
+and their bytes are staged by the agent before packaging.
 
 ## Configuration
 
@@ -165,7 +173,10 @@ an allowlisted origin. The token is embedded in the userscript it serves.
 ## Safety boundaries
 
 - Coding trees can only be created from clean repositories with an existing `HEAD`.
-  Current-working-change tasks can package dirty repositories without a tree.
+  Current-working-change tasks can package dirty repositories without a tree. A
+  coding tree currently supports exactly one editable workspace repository; Patchwork
+  rejects multi-edit tree tasks instead of silently downgrading additional repositories
+  to read-only context.
 - Each follow-up task is pinned to its coding tree's current `HEAD`, and each result
   must name the original task and exact base commit.
 - Plain-text envelopes have strict markers, schemas, size limits, repository IDs, and

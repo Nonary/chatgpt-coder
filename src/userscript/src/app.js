@@ -65,6 +65,9 @@ class App {
 
   setRepositoryScope(paths, { reason = 'repository-scope' } = {}) {
     const repositoryByPath = new Map(this.store.state.repositories.map((repository) => [repository.path, repository]));
+    const composerRepositoryByPath = new Map(
+      this.store.state.composer.repositories.map((repository) => [repository.path, repository]),
+    );
     const normalized = [];
     const seen = new Set();
     for (const repositoryPath of paths || []) {
@@ -75,7 +78,11 @@ class App {
       normalized.push(repositoryPath);
     }
 
-    this.store.state.composer.repositories = normalized.map((repositoryPath) => repositoryByPath.get(repositoryPath));
+    this.store.state.composer.repositories = normalized.map((repositoryPath) => {
+      const repository = repositoryByPath.get(repositoryPath);
+      const current = composerRepositoryByPath.get(repositoryPath);
+      return current ? { ...repository, access: current.access || 'edit' } : { ...repository, access: 'edit' };
+    });
     const sourceStatuses = Object.fromEntries(
       Object.entries(this.store.state.sourceStatuses)
         .filter(([repositoryPath]) => normalized.includes(repositoryPath)),
@@ -593,6 +600,23 @@ class App {
           && !composer.treeSelection) {
           app.toast('Add at least one Git repository.', true);
           return null;
+        }
+        const existingTreeWithoutWorkspace = composer.treeSelection
+          && composer.treeSelection !== NEW_TREE_VALUE
+          && composer.repositories.length === 0;
+        if (composer.treeSelection && !existingTreeWithoutWorkspace) {
+          const editableCount = Number.isInteger(composer.submodules?.summary?.editable)
+            ? composer.submodules.summary.editable
+            : composer.repositories.filter(
+              (repository) => repository.access !== 'context' && repository.readOnly !== true,
+            ).length;
+          if (editableCount !== 1) {
+            app.toast(
+              'Coding trees currently support one editable repository. Use current checkouts or mark the other repositories as Context.',
+              true,
+            );
+            return null;
+          }
         }
 
         return app.run(async () => {

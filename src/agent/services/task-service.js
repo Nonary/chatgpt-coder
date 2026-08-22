@@ -90,7 +90,14 @@ function buildFollowUpPrompt(task, prompt, mode, skillIds = []) {
     : '';
   if (mode === 'ask') return `${text}${skillNote}`;
   const filename = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
-  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task. If that original package was created for Ask mode, this Agent follow-up supersedes that read-only instruction for this turn only. Do not create a second task identity. Recalculate the \`commitMessage\` from the complete cumulative changes and keep it as a detailed Conventional Commit message; this field is the authoritative commit message Patchwork will preserve and use when the result is applied.${skillNote}`;
+  const hasConfiguredAccess = (Array.isArray(task.repositories) ? task.repositories : [])
+    .some((repository) => repository.configuredAccess === 'edit' || repository.configuredAccess === 'context');
+  const askUpgradeNote = task.answerOnly
+    ? hasConfiguredAccess
+      ? ' The original package was created for Ask mode, so this Agent follow-up supersedes the task-wide read-only instruction for this turn only. Repository entries whose manifest `access` is `context` remain read-only; only repositories with `access` `edit` may be changed.'
+      : ' The original package was created for Ask mode, so this Agent follow-up supersedes its task-wide read-only instruction for this turn only.'
+    : '';
+  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task.${askUpgradeNote} Do not create a second task identity. Recalculate the \`commitMessage\` from the complete cumulative changes and keep it as a detailed Conventional Commit message; this field is the authoritative commit message Patchwork will preserve and use when the result is applied.${skillNote}`;
 }
 
 function buildAgentInstructions(taskId, skills = [], options = {}) {
@@ -125,6 +132,8 @@ You are answering a question supplied by the user through Patchwork IDE. The upl
 4. Inspect relevant source, history, and captured working changes. When \`workingChanges\` is true, read \`workingStatus\` and inspect \`git diff --binary <sourceHead> <baseCommit> -- .\` when \`sourceHead\` is present.${includeIac ? `
 5. Treat every bundled entry in \`manifest.json.iac_repos\` as read-only infrastructure context. Clone it from \`iac/<...>\`, check out its supplied \`baseCommit\`, and inspect it only when relevant.` : ''}
 
+Repository entries may include configured \`access\`, \`origin\`, and \`relations\`. \`access\` preserves whether the user selected a repository as \`edit\` or \`context\`; an Ask task is still globally read-only. A \`submodule\` relation identifies the parent repository by \`parentRepositoryId\`, gives its relative \`path\`, and records the parent's gitlink commit so you can reason about repository relationships without local absolute paths.
+
 ${skillInstructions}## Sandbox constraints
 
 Do not install or update dependencies, access package registries, or run builds, tests, linters, type checks, development servers, code generators, or packaging commands. You may search and inspect files and use read-only Git commands.
@@ -150,6 +159,8 @@ The uploaded ZIP is a self-contained task package containing Git bundles. Extrac
 5. Verify that \`git rev-parse HEAD\` exactly equals the supplied \`baseCommit\` before editing.
 6. The bundle contains the repository history reachable from the supplied task tip. Inspect relevant history before changing code.${includeIac ? `
 7. If \`manifest.json.iac_repos\` is present, treat every entry with a \`bundleFile\` as read-only infrastructure context. Clone each IaC bundle from \`iac/<...>\` into \`workspace/iac/<id>\`, check out its supplied \`baseCommit\`, and verify \`git rev-parse HEAD\`. Do not edit IaC repositories and never include IaC paths in returned result patches; entries without a bundle were skipped during packaging.` : ''}
+
+Repository entries may include configured \`access\`, \`origin\`, and \`relations\`. \`access\` preserves whether the user selected a repository as \`edit\` or \`context\`; an Ask task is still globally read-only. A \`submodule\` relation identifies the parent repository by \`parentRepositoryId\`, gives its relative \`path\`, and records the parent's gitlink commit so you can reason about repository relationships without local absolute paths.
 
 ## Inspect supplied working changes
 
@@ -266,14 +277,46 @@ function addStoredLocalFile(zip, localPath, archiveDirectory) {
 async function resolveTreeTaskRepositories(tree, selectedRepositories = []) {
   const treePath = await fs.realpath(tree.path);
   const sourcePath = await fs.realpath(tree.repositoryPath);
-  const repositories = [{ path: treePath }];
-  const seen = new Set([treePath, sourcePath]);
+  const resolved = [];
   for (const repository of selectedRepositories) {
     if (!repository?.path) continue;
-    const repositoryPath = await fs.realpath(repository.path);
+    resolved.push({ repository, path: await fs.realpath(repository.path) });
+  }
+  const writable = resolved.filter(({ repository }) => !repository.readOnly);
+  if (writable.length !== 1) {
+    throw new Error(
+      'Coding trees currently support one editable repository. Use the current checkouts for this multi-repository task, or mark the other repositories as Context.',
+    );
+  }
+  if (writable[0].path !== sourcePath) {
+    throw new Error('The selected coding tree must belong to the repository marked Edit.');
+  }
+
+  const remapRelations = (relations = []) => relations.map((relation) => ({
+    ...relation,
+    parentPath: relation.parentPath === sourcePath ? treePath : relation.parentPath,
+  }));
+  const repositories = [{
+    ...writable[0].repository,
+    path: treePath,
+    readOnly: false,
+    relations: remapRelations(writable[0].repository.relations),
+  }];
+  const seen = new Set([treePath, sourcePath]);
+  for (const { repository, path: repositoryPath } of resolved) {
     if (seen.has(repositoryPath)) continue;
+    if (!repository.readOnly) {
+      throw new Error(
+        'Coding trees currently support one editable repository. Use the current checkouts for this multi-repository task, or mark the other repositories as Context.',
+      );
+    }
     seen.add(repositoryPath);
-    repositories.push({ path: repositoryPath, readOnly: true });
+    repositories.push({
+      ...repository,
+      path: repositoryPath,
+      readOnly: true,
+      relations: remapRelations(repository.relations),
+    });
   }
   return repositories;
 }
@@ -488,10 +531,41 @@ class TaskService {
       ? input.skillRepositoryPaths
       : input.repositories.map((item) => item.path);
     const selectedSkills = await this.skillService.resolveSelectedSkillIds(input.skillIds, skillRepositoryPaths);
-    const requestedRepositories = new Map(await Promise.all(input.repositories.map(async (item) => [
-      await fs.realpath(item.path),
-      item,
-    ])));
+    const requestedRepositories = new Map();
+    for (const item of input.repositories) {
+      const repositoryPath = await fs.realpath(item.path);
+      const previous = requestedRepositories.get(repositoryPath);
+      const relations = [...(previous?.relations || [])];
+      for (const relation of Array.isArray(item.relations) ? item.relations : []) {
+        if (!relations.some((entry) => entry.type === relation.type
+          && entry.parentPath === relation.parentPath
+          && entry.submodulePath === relation.submodulePath)) {
+          relations.push(relation);
+        }
+      }
+      const itemAccess = item.access === 'context'
+        ? 'context'
+        : item.access === 'edit'
+          ? 'edit'
+          : item.readOnly === true
+            ? 'context'
+            : 'edit';
+      const itemReadOnly = itemAccess === 'context';
+      requestedRepositories.set(repositoryPath, {
+        ...previous,
+        ...item,
+        path: repositoryPath,
+        readOnly: previous
+          ? Boolean(previous.readOnly) && itemReadOnly
+          : itemReadOnly,
+        access: previous?.access === 'edit' || itemAccess === 'edit' ? 'edit' : 'context',
+        origin: previous?.origin === 'manual' || item.origin !== 'manual'
+          ? (previous?.origin || item.origin || 'manual')
+          : 'manual',
+        relations,
+      });
+    }
+    const repositoryIdsByPath = new Map(repositories.map((repository) => [repository.path, repository.id]));
     const taskId = crypto.randomUUID();
     const taskDir = this.taskDirectory(taskId);
     const bundlesDir = path.join(taskDir, 'repositories');
@@ -557,7 +631,18 @@ class TaskService {
     const publicRepositories = [];
     const taskRepositories = [];
     for (const repository of repositories) {
-      const readOnly = summaryOnly || answerOnly || Boolean(requestedRepositories.get(repository.path)?.readOnly);
+      const requested = requestedRepositories.get(repository.path) || {};
+      const readOnly = summaryOnly || answerOnly || Boolean(requested.readOnly);
+      const relations = (requested.relations || []).map((relation) => ({ ...relation }));
+      const publicRelations = relations
+        .filter((relation) => relation.type === 'submodule')
+        .map((relation) => ({
+          type: 'submodule',
+          parentRepositoryId: repositoryIdsByPath.get(relation.parentPath) || null,
+          path: relation.submodulePath,
+          recordedCommit: relation.recordedCommit || null,
+          depth: Number.isInteger(relation.depth) ? relation.depth : 0,
+        }));
       const bundleFile = `repositories/${repository.id}.bundle`;
       const bundlePath = path.join(taskDir, bundleFile);
       let taskRepository;
@@ -605,6 +690,10 @@ class TaskService {
         }
       }
       taskRepository.readOnly = readOnly;
+      taskRepository.access = readOnly ? 'context' : 'edit';
+      taskRepository.configuredAccess = requested.access === 'context' ? 'context' : 'edit';
+      taskRepository.origin = requested.origin || 'manual';
+      taskRepository.relations = relations;
       taskRepositories.push(taskRepository);
       publicRepositories.push({
         id: repository.id,
@@ -617,6 +706,9 @@ class TaskService {
         workingStatus: taskRepository.workingStatus,
         bundleFile,
         readOnly,
+        access: taskRepository.configuredAccess,
+        origin: taskRepository.origin,
+        relations: publicRelations,
       });
     }
 
@@ -815,10 +907,15 @@ class TaskService {
       let resultFilename = task.resultFilename;
       let resultTransport = task.resultTransport;
       if (mode === 'agent' && task.answerOnly) {
-        repositories = (Array.isArray(task.repositories) ? task.repositories : []).map((repository) => ({
-          ...repository,
-          readOnly: false,
-        }));
+        repositories = (Array.isArray(task.repositories) ? task.repositories : []).map((repository) => {
+          const configuredAccess = repository.configuredAccess || repository.access || 'edit';
+          const readOnly = configuredAccess === 'context';
+          return {
+            ...repository,
+            readOnly,
+            access: readOnly ? 'context' : 'edit',
+          };
+        });
         resultFilename = resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
         resultTransport = 'downloaded-text-file';
       }
@@ -961,7 +1058,7 @@ class TaskService {
     const writableRepositories = (Array.isArray(task.repositories) ? task.repositories : [])
       .filter((repository) => !repository.readOnly);
     if (writableRepositories.length !== 1) {
-      throw new Error('Worktree selection is only available for tasks with one writable repository.');
+      throw new Error('Coding trees currently support one editable repository for this task.');
     }
     const repositoryPath = String(target.repositoryPath || '').trim();
     if (!repositoryPath) throw new Error('Choose a valid task target.');

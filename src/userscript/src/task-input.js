@@ -1,7 +1,20 @@
 function createTaskInput(composer, chatgptProject = null) {
   const input = {
     taskText: composer.taskText,
-    repositories: composer.repositories.map((repository) => ({ path: repository.path })),
+    repositories: composer.repositories.map((repository) => {
+      const access = repository.access === 'context' || repository.readOnly === true
+        ? 'context'
+        : 'edit';
+      return {
+        path: repository.path,
+        access,
+        readOnly: access === 'context',
+      };
+    }),
+    submodules: {
+      mode: composer.submodules?.mode || 'none',
+      selections: composer.submodules?.selections || {},
+    },
     attachments: composer.attachments.map((attachment) => ({ path: attachment.path })),
     skillIds: composer.skillIds,
     promptIds: composer.promptIds,

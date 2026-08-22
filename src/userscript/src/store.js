@@ -58,6 +58,10 @@ class Store {
       historyState: 'all',
       composer: {
         repositories: [],
+        submodules: {
+          mode: 'none',
+          selections: {},
+        },
         attachments: [],
         skillIds: [],
         promptIds: [],
