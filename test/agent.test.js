@@ -413,6 +413,78 @@ test('answer-only tasks complete with the ChatGPT response and reject result upl
   assert.match(result.payload.error, /ask tasks do not accept/i);
 });
 
+test('Ask-first tasks can apply a result after an Agent follow-up has completed', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-follow-up-result-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const created = await agent.call('POST', '/v1/tasks', {
+    taskText: 'Explain hello.txt, then implement the requested refinement.',
+    repositories: [{ path: repositoryPath }],
+    answerOnly: true,
+    autoApply: true,
+  });
+  assert.equal(created.status, 200);
+  const task = created.payload.task;
+  const conversationId = '4b2d8e79-7f2c-4b9f-8f6f-1e4b6a8c2d44';
+  const conversationUrl = `https://chatgpt.com/c/${conversationId}`;
+  await agent.call('POST', `/v1/tasks/${task.taskId}/submitted`, {
+    conversationUrl,
+    conversationId,
+  });
+  await agent.call('POST', `/v1/tasks/${task.taskId}/chat-status`, { status: 'COMPLETED' });
+
+  const followUp = await agent.call('POST', `/v1/tasks/${task.taskId}/follow-ups`, {
+    mode: 'agent',
+    prompt: 'Implement the refinement.',
+    model: 'luna',
+    reasoningMode: 'medium',
+  });
+  assert.equal(followUp.status, 200);
+  assert.equal(followUp.payload.task.answerOnly, true);
+  assert.equal(followUp.payload.turn.mode, 'agent');
+  assert.equal(followUp.payload.task.repositories[0].readOnly, false);
+
+  await agent.context.taskService.completeFollowUpResult(
+    task.taskId,
+    followUp.payload.turn.id,
+    { id: 'file-follow-up-result-123456' },
+  );
+
+  const patch = [
+    'diff --git a/follow-up.txt b/follow-up.txt',
+    'new file mode 100644',
+    'index 0000000..48cad33',
+    '--- /dev/null',
+    '+++ b/follow-up.txt',
+    '@@ -0,0 +1 @@',
+    '+follow-up result',
+    '',
+  ].join('\n');
+  const envelope = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Added the follow-up result.',
+    commitMessage: 'feat(task): apply follow-up result',
+    repositories: [{
+      id: task.repositories[0].id,
+      baseCommit: task.repositories[0].baseCommit,
+      patchEncoding: 'base64',
+      patch: Buffer.from(patch).toString('base64'),
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+
+  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(applied.status, 200);
+  assert.equal(applied.payload.task.state, 'applied');
+  assert.equal(applied.payload.task.activeTurnId, null);
+  assert.equal(applied.payload.task.turns.at(-1).mode, 'agent');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'follow-up.txt'), 'utf8'), 'follow-up result\n');
+});
+
 test('a result envelope for a different task is refused before anything is applied', async (context) => {
   const agent = await startAgent(context);
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-mismatch-'));

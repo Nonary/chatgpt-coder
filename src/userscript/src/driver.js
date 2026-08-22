@@ -374,16 +374,14 @@ class Driver {
     this.stopConversationTitleWatch = null;
 
     const currentTitle = normalizeConversationTitle(task.conversationTitle);
-    if (currentTitle) return;
-
     this.stopConversationTitleWatch = observeConversationTitle(conversationId, {
-      onTitle: async (title, stop) => {
+      initialTitle: currentTitle,
+      onTitle: async (title) => {
         try {
           const { task: updated } = await this.api.taskTitle(task.taskId, {
             conversationId,
             title,
           });
-          stop();
           this.report({ type: 'task-renamed', task: updated });
           return true;
         } catch (error) {

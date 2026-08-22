@@ -15,6 +15,8 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.match(source, /taskChatStatus/);
   assert.match(source, /observeConversationTitle/);
   assert.match(source, /taskTitle/);
+  assert.match(source, /initialTitle: currentTitle/);
+  assert.doesNotMatch(source, /if \(currentTitle\) return;/);
   assert.match(source, /Reconcile once before attaching the DOM observer/);
   assert.match(source, /seenTaskResultFiles/);
   assert.match(source, /latestTaskResultFile/);

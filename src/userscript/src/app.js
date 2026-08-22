@@ -960,6 +960,11 @@ class App {
     this.store.subscribe((state, reason) => {
       if (reason === 'composer' || reason === 'silent') {
         const selection = state.activeTaskId ? state.followUp : state.composer;
+        const current = modelPicker.currentSelection();
+        if (current.model === selection.model && current.reasoningMode === selection.reasoningMode) return;
+        // Silent updates include every form-field keystroke. Do not repaint the
+        // picker inside ChatGPT's composer unless its actual selection changed;
+        // Safari can otherwise move focus back to the host composer on each DOM mutation.
         modelPicker.setSelection({
           model: selection.model,
           reasoningMode: selection.reasoningMode,

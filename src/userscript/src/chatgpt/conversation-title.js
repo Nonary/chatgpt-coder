@@ -50,13 +50,14 @@ function conversationTitleFromDom(conversationId, {
   return '';
 }
 
-function observeConversationTitle(conversationId, { onTitle } = {}) {
+function observeConversationTitle(conversationId, { initialTitle = '', onTitle } = {}) {
   if (typeof onTitle !== 'function' || typeof MutationObserver !== 'function') return () => {};
 
-  let lastTitle = '';
-  let pendingTitle = null;
+  let lastTitle = normalizeConversationTitle(initialTitle);
   let stopped = false;
   let scheduled = false;
+  let updating = false;
+  let changedWhileUpdating = false;
   const observer = new MutationObserver(() => scheduleCheck());
 
   function stop() {
@@ -69,18 +70,26 @@ function observeConversationTitle(conversationId, { onTitle } = {}) {
     scheduled = false;
     if (stopped) return;
     const title = conversationTitleFromDom(conversationId);
-    if (!title || title === lastTitle || title === pendingTitle) return;
-    pendingTitle = title;
-    Promise.resolve(onTitle(title, stop)).then((accepted) => {
+    if (!title || title === lastTitle) return;
+    updating = true;
+    changedWhileUpdating = false;
+    Promise.resolve().then(() => onTitle(title, stop)).then((accepted) => {
       if (accepted !== false) lastTitle = title;
-      if (pendingTitle === title) pendingTitle = null;
     }).catch(() => {
-      if (pendingTitle === title) pendingTitle = null;
+      // A later DOM mutation will retry the scrape without introducing polling.
+    }).finally(() => {
+      updating = false;
+      if (changedWhileUpdating) scheduleCheck();
     });
   }
 
   function scheduleCheck() {
-    if (stopped || scheduled) return;
+    if (stopped) return;
+    if (updating) {
+      changedWhileUpdating = true;
+      return;
+    }
+    if (scheduled) return;
     scheduled = true;
     queueMicrotask(check);
   }

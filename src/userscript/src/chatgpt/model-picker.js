@@ -153,6 +153,11 @@ function currentSelection() {
 // Lets the dock's model and reasoning controls drive the composer picker, so the
 // two never disagree about what the next send will use.
 function setSelection({ model, reasoningMode } = {}) {
+  const changed = Boolean(
+    (model && model !== selection.model)
+    || (reasoningMode && reasoningMode !== selection.reasoningMode),
+  );
+  if (!changed) return currentSelection();
   if (model) selection.model = model;
   if (reasoningMode) selection.reasoningMode = reasoningMode;
   const picker = document.getElementById(PICKER_ID);

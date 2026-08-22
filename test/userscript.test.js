@@ -213,6 +213,66 @@ test('conversation titles come from the matching ChatGPT DOM entry before fallin
   }), '');
 });
 
+test('conversation title observation waits for a rename and keeps following later DOM title changes', async () => {
+  const { observeConversationTitle } = require('../src/userscript/src/chatgpt/conversation-title');
+  const taskId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
+  const previous = {
+    document: global.document,
+    location: global.location,
+    MutationObserver: global.MutationObserver,
+  };
+  const observers = [];
+  let title = 'Initial task text - ChatGPT';
+  global.location = { href: `https://chatgpt.com/c/${taskId}` };
+  global.document = {
+    documentElement: {},
+    body: {},
+    get title() { return title; },
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+  global.MutationObserver = class MutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      observers.push(this);
+    }
+
+    observe() {}
+
+    disconnect() { this.disconnected = true; }
+  };
+  const seen = [];
+
+  try {
+    const stop = observeConversationTitle(taskId, {
+      initialTitle: 'Initial task text',
+      onTitle: async (nextTitle) => {
+        seen.push(nextTitle);
+        return true;
+      },
+    });
+    assert.deepEqual(seen, [], 'the title captured at submission is only the observer baseline');
+
+    title = 'ChatGPT generated title - ChatGPT';
+    observers[0].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(seen, ['ChatGPT generated title']);
+
+    title = 'ChatGPT final title - ChatGPT';
+    observers[0].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(seen, ['ChatGPT generated title', 'ChatGPT final title']);
+
+    stop();
+    assert.equal(observers[0].disconnected, true);
+  } finally {
+    global.document = previous.document;
+    global.location = previous.location;
+    global.MutationObserver = previous.MutationObserver;
+  }
+});
+
 test('stream status and conversation titles normalize the way the task timer expects', () => {
   assert.equal(normalizeConversationStreamStatus('IS_STREAMING'), 'streaming');
   assert.equal(normalizeConversationStreamStatus('FAILURE'), 'failed');
@@ -709,6 +769,28 @@ test('task text inputs keep typing events inside the Patchwork shadow root', () 
   for (const source of sources) {
     assert.match(source, /oninput: \(event\) => \{\s*event\.stopPropagation\(\);/);
     assert.match(source, /onkeydown: \(event\) => \{\s*event\.stopPropagation\(\);/);
+  }
+});
+
+test('unchanged model selection does not repaint ChatGPT while Patchwork form fields are edited', () => {
+  const modulePath = require.resolve('../src/userscript/src/chatgpt/model-picker');
+  const previousDocument = global.document;
+  let renders = 0;
+  const picker = { __patchworkRender: () => { renders += 1; } };
+  global.document = { getElementById: () => picker };
+  delete require.cache[modulePath];
+  const modelPicker = require(modulePath);
+
+  try {
+    modelPicker.setSelection({ model: 'sol', reasoningMode: 'default' });
+    assert.equal(renders, 1);
+    modelPicker.setSelection({ model: 'sol', reasoningMode: 'default' });
+    assert.equal(renders, 1, 'typing-only store notifications must not touch the host composer DOM');
+    modelPicker.setSelection({ model: 'sol', reasoningMode: 'high' });
+    assert.equal(renders, 2, 'real picker changes still repaint the selector');
+  } finally {
+    global.document = previousDocument;
+    delete require.cache[modulePath];
   }
 });
 

@@ -300,7 +300,11 @@ function register(router, context) {
   router.post('/v1/tasks/:taskId/result', async ({ params, body, rawBody }) => {
     const current = await taskService.getTask(params.taskId);
     const activeTurn = followUpTurn(current);
-    if (activeTurn?.mode === 'ask' || (!activeTurn && current.answerOnly)) {
+    // Ask-first tasks retain answerOnly for task identity, so after an Agent
+    // follow-up completes the historical turn is the remaining result authority.
+    const hasAgentFollowUp = Array.isArray(current.turns)
+      && current.turns.some((turn) => turn?.mode === 'agent');
+    if (activeTurn?.mode === 'ask' || (!activeTurn && current.answerOnly && !hasAgentFollowUp)) {
       throw new Error('Ask tasks do not accept Patchwork result files.');
     }
     const text = typeof body?.text === 'string' ? body.text : rawBody?.toString('utf8');
