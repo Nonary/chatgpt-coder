@@ -190,7 +190,8 @@ function renderComposer(ctx) {
     placeholder: 'Ask a question, describe a task, or type / for commands…',
     value: composer.taskText,
     spellcheck: 'true',
-    oninput: () => {
+    oninput: (event) => {
+      event.stopPropagation();
       ctx.store.setComposer({ taskText: taskText.value }, 'silent');
       const token = findSlashCommand(taskText.value, taskText.selectionStart);
       if (!token) {
@@ -201,6 +202,7 @@ function renderComposer(ctx) {
       else commandPickerController = openCommandPicker();
     },
     onkeydown: (event) => {
+      event.stopPropagation();
       if (event.isComposing) return;
 
       if (commandPickerController?.isOpen()) {

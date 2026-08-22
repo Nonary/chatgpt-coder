@@ -154,7 +154,8 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
     placeholder: 'Continue this task, ask a question, or type / for commands…',
     value: followUp.taskText,
     spellcheck: 'true',
-    oninput: () => {
+    oninput: (event) => {
+      event.stopPropagation();
       ctx.store.setFollowUp({ taskText: taskText.value }, 'silent');
       const token = findSlashCommand(taskText.value, taskText.selectionStart);
       if (!token || Boolean(activeTurn(taskRef)) || Boolean(taskRef.applyInProgress)) {
@@ -165,6 +166,7 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
       else commandPickerController = openCommandPicker();
     },
     onkeydown: (event) => {
+      event.stopPropagation();
       if (Boolean(activeTurn(taskRef)) || Boolean(taskRef.applyInProgress) || event.isComposing) return;
       if (commandPickerController?.isOpen()) {
         if (event.key === 'ArrowDown') {

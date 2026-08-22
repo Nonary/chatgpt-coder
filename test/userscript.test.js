@@ -661,6 +661,24 @@ test('composer mode maps Ask and Agent to the existing answer-only task contract
   assert.equal(createTaskInput({ ...composer, mode: 'agent' }).answerOnly, false);
 });
 
+test('task text inputs keep typing events inside the Patchwork shadow root', () => {
+  const sources = [
+    fs.readFileSync(
+      path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'composer.js'),
+      'utf8',
+    ),
+    fs.readFileSync(
+      path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'task-follow-up.js'),
+      'utf8',
+    ),
+  ];
+
+  for (const source of sources) {
+    assert.match(source, /oninput: \(event\) => \{\s*event\.stopPropagation\(\);/);
+    assert.match(source, /onkeydown: \(event\) => \{\s*event\.stopPropagation\(\);/);
+  }
+});
+
 test('composer command state stays ID-backed for skills and saved prompts', () => {
   const {
     appendPromptId,
