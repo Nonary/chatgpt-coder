@@ -1042,7 +1042,7 @@ test('follow-up composer is unavailable while the original task is still generat
   assert.equal(canFollowUp({ taskId: 'ready', state: 'ready', conversationId: 'conversation-1' }), true);
 });
 
-test('typing a follow-up immediately refreshes the send-button state', () => {
+test('typing a follow-up uses the same composer refresh path as model and mode changes', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'task-follow-up.js'),
     'utf8',
@@ -1051,8 +1051,26 @@ test('typing a follow-up immediately refreshes the send-button state', () => {
   const inputEnd = source.indexOf('onkeydown: (event) => {', inputStart);
   const inputSource = source.slice(inputStart, inputEnd);
 
-  assert.match(inputSource, /setFollowUp\(\{ taskText: taskText\.value \}, 'silent'\);\s*syncSendButton\(\);/);
-  assert.match(source, /function syncSendButton\(\)[\s\S]*sendButton\.disabled = !canSendFollowUp\(taskRef, ctx\.store\.state\.followUp\);/);
+  assert.match(inputSource, /setFollowUp\(\{ taskText: taskText\.value \}, 'silent'\);\s*refreshTaskFollowUp\(\);/);
+  assert.doesNotMatch(source, /function syncSendButton\(/);
+});
+
+test('follow-up send state ignores stale active-turn references instead of treating the latest completed turn as running', () => {
+  const { canSendFollowUp } = require('../src/userscript/src/ui/views/task-follow-up');
+  const task = {
+    taskId: 'ready',
+    state: 'ready',
+    conversationId: 'conversation-1',
+    activeTurnId: 'missing-turn',
+    turns: [{ id: 'completed-turn', mode: 'ask', state: 'completed' }],
+  };
+
+  assert.equal(canSendFollowUp(task, { taskText: 'continue' }), true);
+  assert.equal(canSendFollowUp({
+    ...task,
+    activeTurnId: 'running-turn',
+    turns: [...task.turns, { id: 'running-turn', mode: 'ask', state: 'submitted' }],
+  }, { taskText: 'continue' }), false);
 });
 
 test('task mode follows the active or last durable turn before legacy answerOnly', () => {
