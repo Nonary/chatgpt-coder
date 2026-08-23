@@ -39,7 +39,7 @@ function slugify(value) {
   return slug || 'repository';
 }
 
-async function inspectRepository(selectedPath) {
+async function inspectRepository(selectedPath, { includeStatus = true } = {}) {
   const candidate = await fs.realpath(selectedPath);
   const { stdout: rootOutput } = await runGit(candidate, ['rev-parse', '--show-toplevel']);
   const root = await fs.realpath(rootOutput.trim());
@@ -50,9 +50,12 @@ async function inspectRepository(selectedPath) {
   } catch (error) {
     if (!/single revision|unknown revision|bad revision|Needed a single revision/i.test(error.message)) throw error;
   }
+  const statusPromise = includeStatus
+    ? runGit(root, ['status', '--porcelain=v1', '--untracked-files=all'])
+    : Promise.resolve({ stdout: '' });
   const [{ stdout: branchOutput }, { stdout: statusOutput }] = await Promise.all([
     runGit(root, ['symbolic-ref', '--short', '-q', 'HEAD']).catch(() => ({ stdout: '' })),
-    runGit(root, ['status', '--porcelain=v1', '--untracked-files=all']),
+    statusPromise,
   ]);
 
   const name = path.basename(root);

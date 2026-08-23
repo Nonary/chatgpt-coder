@@ -1878,6 +1878,38 @@ test('source control stages, diffs, commits, and records history', async (contex
   assert.equal(diff.rows[0].afterType, 'unchanged');
 });
 
+test('adding a repository does not re-inspect existing workspace repositories', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-add-repository-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(root);
+  const secondRepositoryPath = await createRepository(path.join(root, 'other'));
+  const git = new GitService(path.join(root, 'data'));
+  await git.initialize();
+
+  await git.addRepositories([firstRepositoryPath]);
+  await fs.rename(firstRepositoryPath, `${firstRepositoryPath}-offline`);
+
+  const added = await git.addRepositories([secondRepositoryPath]);
+  assert.deepEqual(added.map((repository) => repository.path), [await fs.realpath(secondRepositoryPath)]);
+
+  await fs.rename(`${firstRepositoryPath}-offline`, firstRepositoryPath);
+});
+
+test('source control status does not repeat repository discovery for history', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-status-discovery-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const git = new GitService(path.join(root, 'data'));
+  await git.initialize();
+
+  git.history = async () => {
+    throw new Error('status should use its existing repository inspection');
+  };
+  const status = await git.status(repositoryPath);
+  assert.equal(status.repository.isClean, true);
+  assert.equal(status.history[0].subject, 'Initial commit');
+});
+
 test('source control keeps removed and discovered repositories in a durable picker catalog', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-known-repositories-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

@@ -21,6 +21,7 @@ const { closeComposerPopover } = require('./ui/composer-controls');
 const { reportLayout } = require('./ui/layout-report');
 const { conversationIdFromRouteUrl, taskRequestConfiguration } = require('../../shared/chatgpt');
 const { createTaskInput } = require('./task-input');
+const { repositoryPathKey } = require('../../shared/repository-paths');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
 const UPDATE_CHECK_INTERVAL_MILLISECONDS = 30 * 60 * 1_000;
@@ -266,6 +267,19 @@ class App {
     return repositories;
   }
 
+  mergeRepositories(repositories, reason = 'repositories') {
+    const merged = new Map(
+      this.store.state.repositories.map((repository) => [repositoryPathKey(repository.path), repository]),
+    );
+    for (const repository of repositories || []) {
+      if (!repository?.path) continue;
+      merged.set(repositoryPathKey(repository.path), repository);
+    }
+    const next = [...merged.values()];
+    this.store.set({ repositories: next }, reason);
+    return next;
+  }
+
   async refreshPrompts() {
     const { prompts } = await this.api.prompts();
     this.store.set({ prompts }, 'prompts');
@@ -278,15 +292,12 @@ class App {
     return iac;
   }
 
-  async refreshSource(repositoryPath = null) {
-    const paths = repositoryPath ? [repositoryPath] : this.store.state.repositoryScopePaths;
-    if (paths.length === 0) {
-      this.store.set({ sourceStatuses: {} }, 'source');
-      return repositoryPath ? null : {};
-    }
+  async refreshSourcePaths(paths) {
+    const uniquePaths = [...new Set((paths || []).filter(Boolean))];
+    if (uniquePaths.length === 0) return { ...this.store.state.sourceStatuses };
 
     const next = { ...this.store.state.sourceStatuses };
-    await Promise.all(paths.map(async (path) => {
+    await Promise.all(uniquePaths.map(async (path) => {
       try {
         const summaryTask = latestGitSummaryTask(this.store.state.tasks, path);
         next[path] = await this.api.gitStatus(path, { fingerprint: Boolean(summaryTask) });
@@ -296,6 +307,17 @@ class App {
       }
     }));
     this.store.set({ sourceStatuses: next }, 'source');
+    return next;
+  }
+
+  async refreshSource(repositoryPath = null) {
+    const paths = repositoryPath ? [repositoryPath] : this.store.state.repositoryScopePaths;
+    if (paths.length === 0) {
+      this.store.set({ sourceStatuses: {} }, 'source');
+      return repositoryPath ? null : {};
+    }
+
+    const next = await this.refreshSourcePaths(paths);
     return repositoryPath ? next[repositoryPath] || null : next;
   }
 
@@ -458,13 +480,16 @@ class App {
           confirmLabel: 'Done',
           onChoose: async (paths) => {
             await app.run(async () => {
-              let repositories = app.store.state.repositories;
+              const previousScope = new Set(app.store.state.repositoryScopePaths);
               if (paths.length > 0) {
-                ({ repositories } = await app.api.addRepositories(paths));
-                app.store.set({ repositories }, 'silent');
+                const { repositories } = await app.api.addRepositories(paths);
+                app.mergeRepositories(repositories, 'silent');
               }
               app.setRepositoryScope(paths, { reason: 'repository-scope' });
-              await app.refreshSource();
+              const pathsToRefresh = paths.filter((path) => (
+                !previousScope.has(path) || !app.store.state.sourceStatuses[path]
+              ));
+              await app.refreshSourcePaths(pathsToRefresh);
               app.renderActiveView();
               onDone?.();
             }, { success: 'Repository scope updated.' });
@@ -762,7 +787,7 @@ class App {
           if (!existing?.summaryOnly || !repositoryPath) throw new Error('This Git Summary is not associated with a repository.');
           if (!app.store.state.repositories.some((repository) => repository.path === repositoryPath)) {
             const { repositories } = await app.api.addRepositories([repositoryPath]);
-            app.store.set({ repositories }, 'silent');
+            app.mergeRepositories(repositories, 'silent');
           }
           if (!app.store.state.repositoryScopePaths.includes(repositoryPath)) {
             app.setRepositoryScope([...app.store.state.repositoryScopePaths, repositoryPath], { reason: 'silent' });
@@ -788,7 +813,7 @@ class App {
           }
           if (!app.store.state.repositories.some((repository) => repository.path === repositoryPath)) {
             const { repositories } = await app.api.addRepositories([repositoryPath]);
-            app.store.set({ repositories }, 'silent');
+            app.mergeRepositories(repositories, 'silent');
           }
           if (!app.store.state.repositoryScopePaths.includes(repositoryPath)) {
             app.setRepositoryScope([...app.store.state.repositoryScopePaths, repositoryPath], { reason: 'silent' });
@@ -808,7 +833,7 @@ class App {
             .map((repository) => repository.path);
           if (repositoryPaths.length === 0) throw new Error('This task has no writable repositories to inspect.');
           const { repositories } = await app.api.addRepositories(repositoryPaths);
-          app.store.set({ repositories }, 'silent');
+          app.mergeRepositories(repositories, 'silent');
           app.setRepositoryScope(repositoryPaths, { reason: 'repository-scope' });
           await app.refreshSource();
           app.shell.show('source');
@@ -964,7 +989,7 @@ class App {
       inspectTreeInSource(tree) {
         return app.run(async () => {
           const { repositories } = await app.api.addRepositories([tree.path]);
-          app.store.set({ repositories }, 'silent');
+          app.mergeRepositories(repositories, 'silent');
           app.setRepositoryScope([tree.path], { reason: 'repository-scope' });
           await app.refreshSource(tree.path);
           app.shell.show('source');

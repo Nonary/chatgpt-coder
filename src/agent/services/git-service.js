@@ -265,35 +265,14 @@ class GitService {
 
   async addRepositories(selectedPaths) {
     const inspected = await Promise.all(selectedPaths.map(inspectRepository));
-    const state = await this.mutateWorkspace((workspace) => {
+    await this.mutateWorkspace((workspace) => {
       workspace.repositories = [...new Set([
         ...workspace.repositories,
         ...inspected.map((repository) => repository.path),
       ])];
       workspace.knownRepositories = mergeKnownRepositories(inspected, workspace.knownRepositories);
-      return workspace;
     });
-    const addedByPath = new Map(inspected.map((repository) => [repository.path, repository]));
-    const repositories = [];
-    for (const repositoryPath of state.repositories) {
-      const added = addedByPath.get(repositoryPath);
-      if (added) {
-        repositories.push(added);
-        continue;
-      }
-      try {
-        repositories.push(await inspectRepository(repositoryPath));
-      } catch (error) {
-        repositories.push({
-          id: workspaceId(repositoryPath),
-          name: path.basename(repositoryPath),
-          path: repositoryPath,
-          unavailable: true,
-          error: error.message,
-        });
-      }
-    }
-    return repositories;
+    return inspected;
   }
 
   async removeRepository(repositoryPath) {
@@ -483,8 +462,7 @@ class GitService {
     return [...resolved.values()];
   }
 
-  async history(repositoryPath, limit = 20) {
-    const repository = await inspectRepository(repositoryPath);
+  async historyForRepository(repository, limit = 20) {
     if (!repository.hasHead) return [];
     const { stdout } = await runGit(repository.path, [
       'log', '-n', String(Math.min(Math.max(limit, 1), 100)),
@@ -500,18 +478,37 @@ class GitService {
       });
   }
 
+  async history(repositoryPath, limit = 20) {
+    const repository = await inspectRepository(repositoryPath, { includeStatus: false });
+    return this.historyForRepository(repository, limit);
+  }
+
   async status(repositoryPath, { includeFingerprint = false } = {}) {
-    const repository = await inspectRepository(repositoryPath);
-    const { stdout } = await runGit(repository.path, [
-      'status', '--porcelain=v1', '-z', '--untracked-files=all',
+    const repository = await inspectRepository(repositoryPath, { includeStatus: false });
+    const [{ stdout }, history] = await Promise.all([
+      runGit(repository.path, [
+        'status', '--porcelain=v1', '-z', '--untracked-files=all',
+      ]),
+      this.historyForRepository(repository, 15),
     ]);
     const changes = parsePorcelainStatus(stdout);
     const result = {
-      repository,
+      repository: {
+        ...repository,
+        isClean: changes.length === 0,
+        statusSummary: changes
+          .map((change) => {
+            const pathSummary = change.originalPath
+              ? `${change.originalPath} -> ${change.path}`
+              : change.path;
+            return `${change.indexStatus}${change.worktreeStatus} ${pathSummary}`;
+          })
+          .join('\n'),
+      },
       changes,
       stagedCount: changes.filter((change) => change.staged).length,
       unstagedCount: changes.filter((change) => change.unstaged).length,
-      history: await this.history(repository.path, 15),
+      history,
     };
     if (includeFingerprint) result.changeFingerprint = await fingerprintRepository(repository.path);
     return result;

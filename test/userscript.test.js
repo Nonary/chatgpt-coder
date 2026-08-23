@@ -718,6 +718,28 @@ test('an applied task permanently supersedes an older Git Summary, even when tha
   assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask, regeneratedSummary], '/repo/a')?.taskId, 'summary-new');
 });
 
+test('repository additions merge into the existing workspace catalog', () => {
+  const { App } = require('../src/userscript/src/app');
+  const store = {
+    state: {
+      repositories: [{ path: 'C:/existing', name: 'existing', branch: 'main' }],
+    },
+    set(patch) { Object.assign(this.state, patch); },
+  };
+  const app = Object.create(App.prototype);
+  app.store = store;
+
+  app.mergeRepositories([{ path: 'C:/new', name: 'new', branch: 'main' }], 'silent');
+
+  assert.deepEqual(store.state.repositories.map((repository) => repository.path), ['C:/existing', 'C:/new']);
+  assert.equal(store.state.repositories[0].branch, 'main');
+
+  app.mergeRepositories([{ path: 'C:/existing', name: 'existing', branch: 'feature' }], 'silent');
+
+  assert.deepEqual(store.state.repositories.map((repository) => repository.path), ['C:/existing', 'C:/new']);
+  assert.equal(store.state.repositories[0].branch, 'feature');
+});
+
 test('applying a task does not automatically launch a redundant Git Summary task', () => {
   const source = fs.readFileSync(
     path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'),
