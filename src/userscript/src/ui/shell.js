@@ -4,6 +4,7 @@ const {
 } = require('./dom');
 const { installEventBoundary } = require('./event-boundary');
 const { observeTheme } = require('./theme');
+const { readStorage, writeStorage } = require('./storage');
 
 const HOST_ID = 'patchwork-root';
 const WIDTH_KEY = 'patchwork.dock-width';
@@ -50,23 +51,6 @@ const ICONS = {
   refresh: 'M3 12a9 9 0 0 1 15-6.7L21 8M21 12a9 9 0 0 1-15 6.7L3 16M21 3v5h-5M3 21v-5h5',
   layout: 'M3 5h18v14H3zM15 5v14',
 };
-
-function readStorage(key, fallback) {
-  try {
-    const value = localStorage.getItem(key);
-    return value == null ? fallback : value;
-  } catch {
-    return fallback;
-  }
-}
-
-function writeStorage(key, value) {
-  try {
-    localStorage.setItem(key, String(value));
-  } catch {
-    // A blocked localStorage only costs the remembered dock geometry.
-  }
-}
 
 // Everything the panel renders lives in a shadow root, and its stylesheet is
 // adopted through CSSOM rather than a <style> tag so the page's style-src CSP

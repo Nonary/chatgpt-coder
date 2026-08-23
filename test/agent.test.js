@@ -663,6 +663,12 @@ test('the filesystem service opens the Windows folder picker and returns its sel
   assert.equal(calls[0][0], 'powershell.exe');
   assert.ok(calls[0][1].includes('-STA'), 'the Windows dialog runs in a single-threaded apartment');
   assert.equal(calls[0][2].env.PATCHWORK_PICKER_INITIAL_DIRECTORY, root);
+  const pickerScript = calls[0][1].at(-1);
+  assert.match(pickerScript, /FolderPickerWindow\]::Show/);
+  assert.match(pickerScript, /IFileOpenDialog/);
+  assert.match(pickerScript, /SetThreadDpiAwarenessContext/);
+  assert.match(pickerScript, /workWidth \* 92 \/ 100/);
+  assert.doesNotMatch(pickerScript, /FolderBrowserDialog/);
 });
 
 test('canceling the native folder picker returns no directory', async () => {

@@ -32,8 +32,12 @@ function fileIdNear(element) {
 }
 
 function isGenerating() {
-  const stop = document.querySelector('[data-testid="stop-button"]');
-  return Boolean(stop && !stop.disabled && stop.getAttribute('aria-disabled') !== 'true');
+  return deepQueryAll('button, [role="button"]').some((item) => {
+    const label = [item.getAttribute('data-testid'), item.getAttribute('aria-label'), item.getAttribute('title')]
+      .filter(Boolean).join(' ');
+    return /stop-button|stop generating|stop response/i.test(label)
+      && !item.disabled && item.getAttribute('aria-disabled') !== 'true';
+  });
 }
 
 // A fallback for `GET /backend-api/conversation/:id`: the generated file is also

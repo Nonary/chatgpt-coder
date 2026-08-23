@@ -4,6 +4,7 @@ const navigate = require('./chatgpt/navigate');
 const modelPicker = require('./chatgpt/model-picker');
 const notices = require('./chatgpt/notices');
 const resultScan = require('./chatgpt/result-scan');
+const socketUpdates = require('./chatgpt/websocket');
 const { conversationTitleFromDom, observeConversationTitle } = require('./chatgpt/conversation-title');
 const { beginEnforcement } = require('./chatgpt/intercept');
 const {
@@ -16,6 +17,7 @@ const {
 } = require('../../shared/chatgpt');
 
 const MAX_SUBMISSION_RETRIES = 2;
+const COMPLETION_RETRY_DELAYS = [500, 1500, 4000, 10000];
 
 function toFile(buffer, name, type) {
   return new File([buffer], name, { type: type || 'application/octet-stream' });
@@ -59,6 +61,8 @@ class Driver {
     this.watchGeneration = 0;
     this.stopDomWatch = null;
     this.stopConversationTitleWatch = null;
+    this.stopSocketWatch = null;
+    this.reconcileRetryTimer = null;
     this.seenTaskResultFiles = new Map();
   }
 
@@ -68,6 +72,10 @@ class Driver {
     this.stopDomWatch = null;
     this.stopConversationTitleWatch?.();
     this.stopConversationTitleWatch = null;
+    this.stopSocketWatch?.();
+    this.stopSocketWatch = null;
+    clearTimeout(this.reconcileRetryTimer);
+    this.reconcileRetryTimer = null;
   }
 
   forgetTask(taskId) {
@@ -491,10 +499,12 @@ class Driver {
     }
     if (turn?.mode === 'agent') {
       if (status !== 'completed') return statusTask;
-      return this.ingestTaskResult(statusTask, conversationId, conversationRecord).catch((error) => {
-        this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
-        return this.api.task(task.taskId).then((result) => result.task).catch(() => null);
-      });
+      return this.ingestTaskResult(statusTask, conversationId, conversationRecord)
+        .then((updated) => updated || statusTask)
+        .catch((error) => {
+          this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
+          return this.api.task(task.taskId).then((result) => result.task).catch(() => statusTask);
+        });
     }
     if (statusTask.answerOnly) {
       if (!status) return null;
@@ -502,10 +512,12 @@ class Driver {
       return statusTask;
     }
     if (status !== 'completed') return statusTask;
-    return this.ingestTaskResult(statusTask, conversationId, conversationRecord).catch((error) => {
-      this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
-      return this.api.task(task.taskId).then((result) => result.task).catch(() => null);
-    });
+    return this.ingestTaskResult(statusTask, conversationId, conversationRecord)
+      .then((updated) => updated || statusTask)
+      .catch((error) => {
+        this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
+        return this.api.task(task.taskId).then((result) => result.task).catch(() => statusTask);
+      });
   }
 
   async refreshTask(task) {
@@ -590,9 +602,23 @@ class Driver {
     this.watchConversationTitle(task);
     const generation = this.watchGeneration;
     const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
+    const conversationId = this.conversationIdFor(task);
     let currentTask = task;
     let reconciling = false;
+    let completionRetryIndex = 0;
     this.rememberResultFile(task.taskId, task.result?.sourceFile);
+
+    const stopWatching = () => {
+      this.stopDomWatch?.();
+      this.stopDomWatch = null;
+      this.stopConversationTitleWatch?.();
+      this.stopConversationTitleWatch = null;
+      this.stopSocketWatch?.();
+      this.stopSocketWatch = null;
+      clearTimeout(this.reconcileRetryTimer);
+      this.reconcileRetryTimer = null;
+      this.activeTaskId = null;
+    };
 
     const arm = () => {
       const turn = activeFollowUp(currentTask);
@@ -613,27 +639,44 @@ class Driver {
       });
     };
 
-    const finish = async () => {
+    const scheduleCompletionRetry = () => {
+      if (this.reconcileRetryTimer || completionRetryIndex >= COMPLETION_RETRY_DELAYS.length
+        || generation !== this.watchGeneration || !this.canWatchTask(currentTask)) return;
+      clearTimeout(this.reconcileRetryTimer);
+      const delay = COMPLETION_RETRY_DELAYS[completionRetryIndex];
+      completionRetryIndex += 1;
+      this.reconcileRetryTimer = setTimeout(() => {
+        this.reconcileRetryTimer = null;
+        reconcile({ knownStatus: 'completed' });
+      }, delay);
+    };
+
+    const reconcile = async ({ knownStatus = null, rearmDom = false } = {}) => {
       if (reconciling || generation !== this.watchGeneration) return;
       reconciling = true;
-      this.stopDomWatch?.();
-      this.stopDomWatch = null;
+      if (rearmDom) {
+        this.stopDomWatch?.();
+        this.stopDomWatch = null;
+      }
       try {
-        const updated = await this.reconcileTask(currentTask, { knownStatus: 'completed' });
+        const updated = await this.reconcileTask(currentTask, { knownStatus });
         if (updated) currentTask = updated;
         if (!this.canWatchTask(currentTask)) {
-          this.stopConversationTitleWatch?.();
-          this.stopConversationTitleWatch = null;
-          this.activeTaskId = null;
+          stopWatching();
           return;
+        }
+        if (currentTask.chatStatus === 'completed' || knownStatus === 'completed') {
+          scheduleCompletionRetry();
         }
       } catch (error) {
         this.report({ type: 'task-result-error', taskId: currentTask.taskId, message: error.message });
       } finally {
         reconciling = false;
       }
-      if (generation === this.watchGeneration) arm();
+      if (rearmDom && generation === this.watchGeneration && this.canWatchTask(currentTask)) arm();
     };
+
+    const finish = () => reconcile({ knownStatus: 'completed', rearmDom: true });
 
     const handleResult = async (file) => {
       if (generation !== this.watchGeneration) return;
@@ -647,25 +690,30 @@ class Driver {
         if (latest) currentTask = latest;
       }
       if (generation === this.watchGeneration && this.canWatchTask(currentTask)) arm();
-      else if (!this.canWatchTask(currentTask)) {
-        this.stopConversationTitleWatch?.();
-        this.stopConversationTitleWatch = null;
-      }
+      else if (!this.canWatchTask(currentTask)) stopWatching();
     };
+
+    // ChatGPT's own WebSocket is a push invalidation channel. Messages for the
+    // open task are trailing-debounced, so a burst of streamed updates causes one
+    // authoritative conversation read after activity settles instead of polling.
+    this.stopSocketWatch = socketUpdates.observeConversationUpdates(conversationId, () => {
+      reconcile();
+    });
 
     if (responseComplete) Promise.resolve(responseComplete).then((complete) => {
       if (complete) finish();
     });
     if (recovery) {
-      // Reconcile once before attaching the DOM observer. This establishes the
-      // newest result as the baseline and avoids re-ingesting older transcript
-      // files when a completed task is reopened.
+      // Reconcile once before attaching the DOM observer. WebSocket invalidations
+      // and bounded completion retries then keep the task converging without a
+      // recurring ChatGPT API poll loop.
       this.reconcileTask(currentTask).then((updated) => {
         if (updated) currentTask = updated;
         if (!this.canWatchTask(currentTask)) {
-          this.activeTaskId = null;
+          stopWatching();
           return;
         }
+        if (currentTask.chatStatus === 'completed') scheduleCompletionRetry();
         if (generation === this.watchGeneration) arm();
       }).catch((error) => {
         this.report({ type: 'task-result-error', taskId: currentTask.taskId, message: error.message });
@@ -701,6 +749,8 @@ class Driver {
     if (!file) return null;
     const treeId = this.activeMerge.treeId;
     this.activeMerge = null;
+    this.stopSocketWatch?.();
+    this.stopSocketWatch = null;
     const text = await chatgpt.downloadFileText(file, conversationId);
     await this.api.treeMergeResult(treeId, text);
     return true;
@@ -711,6 +761,10 @@ class Driver {
     this.stop();
     const generation = this.watchGeneration;
     const expectedName = this.activeMerge.resultFilename;
+    const conversationId = this.activeMerge.conversationId || conversationIdFromRouteUrl(location.href);
+    this.stopSocketWatch = socketUpdates.observeConversationUpdates(conversationId, () => {
+      this.reconcileMerge().catch(() => {});
+    });
     this.stopDomWatch = resultScan.observeConversation({
       expectedName,
       onFinished: () => this.reconcileMerge().catch(() => {}),
@@ -718,6 +772,8 @@ class Driver {
         if (generation !== this.watchGeneration || !this.activeMerge) return;
         const treeId = this.activeMerge.treeId;
         this.activeMerge = null;
+        this.stopSocketWatch?.();
+        this.stopSocketWatch = null;
         chatgpt.downloadFileText(file)
           .then((text) => this.api.treeMergeResult(treeId, text))
           .catch(() => {});

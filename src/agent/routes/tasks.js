@@ -230,23 +230,10 @@ function register(router, context) {
   });
 
   router.post('/v1/tasks/:taskId/submitted', async ({ params, body }) => {
-    const task = await taskService.getTask(params.taskId);
     if (!isChatGPTConversationUrl(body.conversationUrl)) {
       throw new Error('A submitted task needs a real ChatGPT conversation URL.');
     }
-    const submitted = await taskService.updateTask(task.taskId, {
-      state: 'submitted',
-      submittedAt: new Date().toISOString(),
-      conversationUrl: body.conversationUrl,
-      conversationId: body.conversationId || null,
-      conversationTitle: body.conversationTitle || task.conversationTitle || null,
-      chatStatus: 'streaming',
-      chatStatusRaw: 'IS_STREAMING',
-      chatFinishedAt: null,
-      model: body.model || task.model,
-      reasoningMode: body.reasoningMode || task.reasoningMode,
-      error: null,
-    });
+    const submitted = await taskService.markSubmitted(params.taskId, body);
     emit({
       type: 'task-submitted',
       task: submitted,
@@ -258,41 +245,15 @@ function register(router, context) {
   });
 
   router.post('/v1/tasks/:taskId/chat-status', async ({ params, body }) => {
-    const task = await taskService.getTask(params.taskId);
     const chatStatus = normalizeConversationStreamStatus(body.status);
-    const activeTurn = followUpTurn(task);
-    if (activeTurn) {
-      const message = chatStatus === 'failed'
-        ? 'ChatGPT stopped before completing the follow-up.'
-        : null;
-      const saved = await taskService.updateFollowUpChatStatus(
-        task.taskId,
-        chatStatus,
-        body.conversationId || task.conversationId || null,
-        message,
-      );
-      emit({
-        type: 'task-chat-status',
-        task: saved,
-        taskId: saved.taskId,
-        chatStatus,
-        chatStatusRaw: saved.chatStatusRaw,
-      });
-      return { task: saved };
-    }
-    if (task.chatStatus === chatStatus && task.chatStatusRaw === body.status) return { task };
-    const saved = await taskService.updateTask(task.taskId, {
-      state: task.answerOnly
-        ? (chatStatus === 'completed' ? 'completed' : chatStatus === 'failed' ? 'failed' : task.state)
-        : task.state,
-      conversationId: body.conversationId || task.conversationId || null,
+    const message = chatStatus === 'failed' ? 'ChatGPT stopped before completing the response.' : null;
+    const saved = await taskService.updateChatStatus(
+      params.taskId,
       chatStatus,
-      chatStatusRaw: body.status || null,
-      chatFinishedAt: chatStatus === 'streaming' ? null : task.chatFinishedAt || new Date().toISOString(),
-      error: task.answerOnly && chatStatus === 'failed'
-        ? 'ChatGPT stopped before completing the answer.'
-        : task.error || null,
-    });
+      body.status || null,
+      body.conversationId || null,
+      message,
+    );
     emit({
       type: 'task-chat-status',
       task: saved,
@@ -305,7 +266,7 @@ function register(router, context) {
 
   router.post('/v1/tasks/:taskId/failed', async ({ params, body }) => {
     const message = String(body.message || 'The task failed in the ChatGPT page.');
-    const task = await taskService.updateTask(params.taskId, { state: 'failed', error: message });
+    const task = await taskService.markFailed(params.taskId, message);
     emit({ type: 'task-failed', task, message });
     return { task };
   });
@@ -371,10 +332,10 @@ function register(router, context) {
     validateCommitMessage(task.result.commitMessage);
     const completed = task.state === 'completed'
       ? task
-      : await taskService.updateTask(task.taskId, {
+      : await taskService.transitionTask(task.taskId, ['ready'], {
         state: 'completed',
         completedAt: new Date().toISOString(),
-      });
+      }, 'use its Git Summary');
     emit({
       type: 'git-summary-applied',
       task: completed,

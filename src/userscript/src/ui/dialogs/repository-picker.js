@@ -1,26 +1,13 @@
 const { h, replace } = require('../dom');
+const { mergeRepositoryCatalog: mergeSharedRepositoryCatalog, repositoryPathKey } = require('../../../../shared/repository-paths');
 
 const MAX_VISIBLE_REPOSITORIES = 100;
 
-function repositoryPathKey(repositoryPath) {
-  const value = String(repositoryPath || '').replace(/\\/g, '/').replace(/\/+$/, '');
-  return /^[a-z]:\//i.test(value) || value.startsWith('//') ? value.toLowerCase() : value;
-}
-
 function mergeRepositoryCatalog(...groups) {
-  const merged = [];
-  const seen = new Set();
-  for (const repository of groups.flat()) {
-    if (!repository?.path) continue;
-    const key = repositoryPathKey(repository.path);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    merged.push({
+  return mergeSharedRepositoryCatalog(...groups).map((repository) => ({
       ...repository,
       name: repository.name || String(repository.path).split(/[\\/]/).filter(Boolean).pop() || repository.path,
-    });
-  }
-  return merged;
+  }));
 }
 
 function repositorySearchScore(repository, query) {

@@ -179,17 +179,21 @@ Everything that can be an API call is an API call:
 - **Submission confirmation** — the send request answers with an event stream whose
   opening events carry `conversation_id`, so the wrapper reads it from a clone of
   that stream instead of waiting for the SPA route to change.
-- **Progress** — the cloned Send response stream closes when ChatGPT finishes
-  generating; a DOM observer provides the fallback when the page used a transport
-  the fetch wrapper could not inspect.
-- **Result** — read `GET /backend-api/conversation/:id` once after generation for an
+- **Progress** — the installed userscript starts at `document-start` and wraps
+  ChatGPT's `wss://ws.chatgpt.com` connection before the application boots. Socket
+  messages are treated as push invalidations, not as an alternate state model: for
+  the open task they are trailing-debounced into one authoritative conversation
+  read after activity settles, while background notifications are filtered by
+  conversation id. The cloned Send response stream and DOM generation observer
+  remain independent fallbacks.
+- **Result** — reconciliation reads `GET /backend-api/conversation/:id` for an
   assistant message carrying `chatgpt-ide-result-<taskId>.txt`, then
-  `GET /backend-api/files/:id/download` and post the text to the agent for
-  validation and apply. If that record is unavailable or its file metadata is late,
-  the rendered transcript is observed for the same file id as a fallback — unlike
-  v2 this never clicks the download control, because a browser download would land
-  in the filesystem instead of in the page. Reload recovery performs one
-  reconciliation read and then observes the open page without recurring API calls.
+  `GET /backend-api/files/:id/download` and posts the text to the agent for
+  validation and apply. If completion is known before ChatGPT's result metadata is
+  durable, four bounded backoff reads cover that propagation window. The rendered
+  transcript is still observed for the same file id as a fallback, unlike v2 this
+  never clicks the download control because a browser download would land in the
+  filesystem instead of in the page. There is no recurring ChatGPT status poll.
 ## Events
 
 The agent keeps an append-only event log. The page long-polls

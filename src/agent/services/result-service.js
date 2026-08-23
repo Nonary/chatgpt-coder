@@ -110,6 +110,7 @@ class ResultService {
   constructor(taskService, onEvent = () => {}) {
     this.taskService = taskService;
     this.onEvent = onEvent;
+    this.activeTaskMutations = new Set();
   }
 
   async ingestTextFile(taskId, downloadedPath) {
@@ -173,7 +174,7 @@ class ResultService {
       if (!task.appliedResult && task.state === 'applied' && task.result) {
         update.appliedResult = task.result;
       }
-      readyTask = await this.taskService.updateTask(taskId, update);
+      readyTask = await this.taskService.transitionTask(taskId, [task.state], update, 'accept its result');
       await this.onEvent({ type: 'result-ready', task: readyTask });
     } catch (error) {
       if (activeTurn?.mode === 'agent') {
@@ -184,9 +185,14 @@ class ResultService {
         );
         await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
       } else {
-        const failedTask = await this.taskService.updateTask(taskId, task.result
-          ? { state: task.state, error: `Follow-up result ignored: ${error.message}` }
-          : { state: 'failed', error: error.message });
+        const failedTask = task.result
+          ? await this.taskService.updateTask(taskId, { error: `Follow-up result ignored: ${error.message}` })
+          : await this.taskService.transitionTask(
+            taskId,
+            [task.state],
+            { state: 'failed', error: error.message },
+            'reject its invalid result',
+          );
         await this.onEvent({ type: 'task-failed', task: failedTask, message: error.message });
       }
       throw error;
@@ -497,13 +503,22 @@ class ResultService {
   }
 
   async apply(taskId) {
-    const current = await this.taskService.getTask(taskId);
-    if (current.applyInProgress) throw new Error('This task result is already being applied.');
-    await this.taskService.updateTask(taskId, { applyInProgress: true });
+    if (this.activeTaskMutations.has(taskId)) {
+      throw new Error('This task result is already being changed.');
+    }
+    this.activeTaskMutations.add(taskId);
+    let markedInProgress = false;
     try {
+      const current = await this.taskService.getTask(taskId);
+      if (current.applyInProgress) throw new Error('This task result is already being applied.');
+      await this.taskService.updateTask(taskId, { applyInProgress: true });
+      markedInProgress = true;
       return await this._applyTask(taskId);
     } finally {
-      await this.taskService.updateTask(taskId, { applyInProgress: false }).catch(() => {});
+      if (markedInProgress) {
+        await this.taskService.updateTask(taskId, { applyInProgress: false }).catch(() => {});
+      }
+      this.activeTaskMutations.delete(taskId);
     }
   }
 
@@ -681,7 +696,12 @@ class ResultService {
         );
       }
 
-      task = await this.taskService.updateTask(taskId, { state: 'failed', error: error.message });
+      task = await this.taskService.transitionTask(
+        taskId,
+        ['ready', 'failed', 'conflicted'],
+        { state: 'failed', error: error.message },
+        'record its apply failure',
+      );
       await this.onEvent({ type: 'task-failed', task, message: error.message });
       throw error;
     }
@@ -693,7 +713,7 @@ class ResultService {
       message,
     }));
     const appliedAt = new Date().toISOString();
-    task = await this.taskService.updateTask(taskId, {
+    task = await this.taskService.transitionTask(taskId, ['ready', 'failed', 'conflicted'], {
       state: 'applied',
       appliedAt,
       error: null,
@@ -703,19 +723,19 @@ class ResultService {
         commits: [...previousCommits, ...newCommits],
         appliedRepositories,
       },
-    });
+    }, 'mark its result applied');
     await this.onEvent({ type: 'task-applied', task });
 
     if (task.resolvesTaskId) {
       try {
         const originalTask = await this.taskService.getTask(task.resolvesTaskId);
         if (originalTask.state === 'conflicted') {
-          const resolvedTask = await this.taskService.updateTask(originalTask.taskId, {
+          const resolvedTask = await this.taskService.transitionTask(originalTask.taskId, ['conflicted'], {
             state: 'resolved',
             error: null,
             resolvedAt: appliedAt,
             resolutionTaskId: task.taskId,
-          });
+          }, 'mark its conflict resolved');
           await this.onEvent({
             type: 'task-resolved',
             task: resolvedTask,
@@ -757,7 +777,7 @@ class ResultService {
     const recovery = files.length > 0 || applyAttempted
       ? 'Clean up the target and retry the saved result, or resubmit a conflict-resolution task to preserve both versions.'
       : 'The workspace was left unchanged. Retry the saved result after updating the target, or use conflict resolution to preserve both versions.';
-    const conflictedTask = await this.taskService.updateTask(task.taskId, {
+    const conflictedTask = await this.taskService.transitionTask(task.taskId, ['ready', 'failed', 'conflicted'], {
       state: 'conflicted',
       error: `${message} ${recovery}`,
       result: {
@@ -770,57 +790,65 @@ class ResultService {
           applyAttempted: Boolean(applyAttempted),
         }],
       },
-    });
+    }, 'record its apply conflict');
     await this.onEvent({ type: 'task-conflicted', task: conflictedTask, message });
     return conflictedTask;
   }
 
   async rollback(taskId) {
-    let task = await this.taskService.getTask(taskId);
-    if (task.state !== 'applied' || !task.result) throw new Error('This task has not been applied.');
+    if (this.activeTaskMutations.has(taskId)) {
+      throw new Error('This task result is already being changed.');
+    }
+    this.activeTaskMutations.add(taskId);
+    try {
+      let task = await this.taskService.getTask(taskId);
+      if (task.state !== 'applied' || !task.result) throw new Error('This task has not been applied.');
 
-    const reverts = [];
-    if (task.result.commits?.length) {
-      const latestCommits = new Map();
-      for (const item of task.result.commits) latestCommits.set(item.repositoryId, item.commit);
-      const appliedStates = new Map((task.result.appliedRepositories || [])
-        .map((item) => [item.repositoryId, item]));
-      for (const [repositoryId, latestCommit] of latestCommits) {
-        const repository = task.repositories.find((entry) => entry.id === repositoryId);
-        const current = await inspectRepository(repository.path);
-        const appliedState = appliedStates.get(repositoryId);
-        const fingerprintMatches = !appliedState?.fingerprintAfter
-          || await fingerprintRepository(repository.path) === appliedState.fingerprintAfter;
-        if (!current.isClean || current.baseCommit !== latestCommit || !fingerprintMatches) {
-          throw new Error('The task target changed after this task was applied; revert it from Source Control instead.');
+      const reverts = [];
+      if (task.result.commits?.length) {
+        const latestCommits = new Map();
+        for (const item of task.result.commits) latestCommits.set(item.repositoryId, item.commit);
+        const appliedStates = new Map((task.result.appliedRepositories || [])
+          .map((item) => [item.repositoryId, item]));
+        for (const [repositoryId, latestCommit] of latestCommits) {
+          const repository = task.repositories.find((entry) => entry.id === repositoryId);
+          const current = await inspectRepository(repository.path);
+          const appliedState = appliedStates.get(repositoryId);
+          const fingerprintMatches = !appliedState?.fingerprintAfter
+            || await fingerprintRepository(repository.path) === appliedState.fingerprintAfter;
+          if (!current.isClean || current.baseCommit !== latestCommit || !fingerprintMatches) {
+            throw new Error('The task target changed after this task was applied; revert it from Source Control instead.');
+          }
+        }
+        for (const item of [...task.result.commits].reverse()) {
+          const repository = task.repositories.find((entry) => entry.id === item.repositoryId);
+          await runGit(repository.path, ['revert', '--no-edit', item.commit]);
+          const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);
+          reverts.push({ repositoryId: repository.id, commit: stdout.trim() });
+        }
+      } else {
+        const appliedStates = new Map((task.result.appliedRepositories || [])
+          .map((item) => [item.repositoryId, item]));
+        for (const patch of [...task.result.patches].reverse()) {
+          const repository = task.repositories.find((item) => item.id === patch.id);
+          const body = await fs.readFile(patch.localPath);
+          if (body.length === 0) continue;
+          await applyPatch(repository.path, patch.localPath, {
+            reverse: true,
+            index: Boolean(appliedStates.get(repository.id)?.indexApplied),
+          });
         }
       }
-      for (const item of [...task.result.commits].reverse()) {
-        const repository = task.repositories.find((entry) => entry.id === item.repositoryId);
-        await runGit(repository.path, ['revert', '--no-edit', item.commit]);
-        const { stdout } = await runGit(repository.path, ['rev-parse', 'HEAD']);
-        reverts.push({ repositoryId: repository.id, commit: stdout.trim() });
-      }
-    } else {
-      const appliedStates = new Map((task.result.appliedRepositories || [])
-        .map((item) => [item.repositoryId, item]));
-      for (const patch of [...task.result.patches].reverse()) {
-        const repository = task.repositories.find((item) => item.id === patch.id);
-        const body = await fs.readFile(patch.localPath);
-        if (body.length === 0) continue;
-        await applyPatch(repository.path, patch.localPath, {
-          reverse: true,
-          index: Boolean(appliedStates.get(repository.id)?.indexApplied),
-        });
-      }
+      task = await this.taskService.transitionTask(taskId, ['applied'], {
+        state: 'rolled-back',
+        rolledBackAt: new Date().toISOString(),
+        result: { ...task.result, reverts },
+      }, 'roll it back');
+      await this.onEvent({ type: 'task-rolled-back', task });
+      return task;
+    } finally {
+      this.activeTaskMutations.delete(taskId);
     }
-    task = await this.taskService.updateTask(taskId, {
-      state: 'rolled-back',
-      rolledBackAt: new Date().toISOString(),
-      result: { ...task.result, reverts },
-    });
-    await this.onEvent({ type: 'task-rolled-back', task });
-    return task;
   }
 }
 

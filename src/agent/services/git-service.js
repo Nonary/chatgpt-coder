@@ -2,6 +2,10 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { fingerprintRepository, inspectRepository, runGit } = require('./git');
+const {
+  mergeRepositoryCatalog: mergeSharedRepositoryCatalog,
+  repositoryPathKey: sharedRepositoryPathKey,
+} = require('../../shared/repository-paths');
 
 const STATUS_LABELS = {
   M: 'Modified',
@@ -20,27 +24,21 @@ const MAX_COMPARE_ROWS = 20_000;
 const MAX_KNOWN_REPOSITORIES = 500;
 
 function repositoryPathKey(repositoryPath) {
-  const value = path.resolve(String(repositoryPath || ''));
-  return process.platform === 'win32' ? value.toLowerCase() : value;
+  return sharedRepositoryPathKey(path.resolve(String(repositoryPath || '')));
 }
 
 function mergeKnownRepositories(...groups) {
-  const merged = [];
-  const seen = new Set();
+  const entries = [];
   for (const entry of groups.flat()) {
     const repositoryPath = typeof entry === 'string' ? entry : entry?.path;
     if (!repositoryPath) continue;
     const resolved = path.resolve(repositoryPath);
-    const key = repositoryPathKey(resolved);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push({
+    entries.push({
       name: String(entry?.name || path.basename(resolved) || resolved),
       path: resolved,
     });
-    if (merged.length >= MAX_KNOWN_REPOSITORIES) break;
   }
-  return merged;
+  return mergeSharedRepositoryCatalog(entries).slice(0, MAX_KNOWN_REPOSITORIES);
 }
 
 function splitLines(value) {
@@ -210,6 +208,7 @@ function mergeRepositorySelection(target, candidate) {
 class GitService {
   constructor(dataRoot) {
     this.workspaceFile = path.join(dataRoot, 'workspace.json');
+    this.workspaceMutation = Promise.resolve();
   }
 
   async initialize() {
@@ -246,22 +245,34 @@ class GitService {
     await fs.writeFile(this.workspaceFile, `${JSON.stringify(value, null, 2)}\n`);
   }
 
+  async mutateWorkspace(mutator) {
+    const operation = this.workspaceMutation.catch(() => {}).then(async () => {
+      const state = await this.readWorkspaceState();
+      const result = await mutator(state);
+      await this.writeWorkspaceState(state);
+      return result === undefined ? state : result;
+    });
+    this.workspaceMutation = operation.catch(() => {});
+    return operation;
+  }
+
   async rememberRepositories(repositories) {
-    const state = await this.readWorkspaceState();
-    state.knownRepositories = mergeKnownRepositories(repositories, state.knownRepositories);
-    await this.writeWorkspaceState(state);
-    return state.knownRepositories;
+    return this.mutateWorkspace((state) => {
+      state.knownRepositories = mergeKnownRepositories(repositories, state.knownRepositories);
+      return state.knownRepositories;
+    });
   }
 
   async addRepositories(selectedPaths) {
     const inspected = await Promise.all(selectedPaths.map(inspectRepository));
-    const state = await this.readWorkspaceState();
-    state.repositories = [...new Set([
-      ...state.repositories,
-      ...inspected.map((repository) => repository.path),
-    ])];
-    state.knownRepositories = mergeKnownRepositories(inspected, state.knownRepositories);
-    await this.writeWorkspaceState(state);
+    const state = await this.mutateWorkspace((workspace) => {
+      workspace.repositories = [...new Set([
+        ...workspace.repositories,
+        ...inspected.map((repository) => repository.path),
+      ])];
+      workspace.knownRepositories = mergeKnownRepositories(inspected, workspace.knownRepositories);
+      return workspace;
+    });
     const addedByPath = new Map(inspected.map((repository) => [repository.path, repository]));
     const repositories = [];
     for (const repositoryPath of state.repositories) {
@@ -286,9 +297,9 @@ class GitService {
   }
 
   async removeRepository(repositoryPath) {
-    const state = await this.readWorkspaceState();
-    state.repositories = state.repositories.filter((item) => item !== repositoryPath);
-    await this.writeWorkspaceState(state);
+    await this.mutateWorkspace((state) => {
+      state.repositories = state.repositories.filter((item) => item !== repositoryPath);
+    });
     return this.listRepositories();
   }
 

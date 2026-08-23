@@ -1,12 +1,8 @@
 const PREFERENCE_PREFIX = 'patchwork.';
+const { readStorage, writeStorage } = require('./ui/storage');
 
 function readPreference(key, fallback = '') {
-  try {
-    const value = localStorage.getItem(PREFERENCE_PREFIX + key);
-    return value == null ? fallback : value;
-  } catch {
-    return fallback;
-  }
+  return readStorage(PREFERENCE_PREFIX + key, fallback);
 }
 
 function readJsonPreference(key, fallback) {
@@ -27,12 +23,7 @@ function initialRepositoryScope() {
 }
 
 function writePreference(key, value) {
-  try {
-    if (value == null || value === '') localStorage.removeItem(PREFERENCE_PREFIX + key);
-    else localStorage.setItem(PREFERENCE_PREFIX + key, String(value));
-  } catch {
-    // Sticky selections are a convenience; a blocked localStorage is not fatal.
-  }
+  writeStorage(PREFERENCE_PREFIX + key, value);
 }
 
 class Store {
@@ -102,6 +93,41 @@ class Store {
     this.notify(reason);
   }
 
+  setRepositoryScope(paths, reason = 'repository-scope') {
+    const repositoryByPath = new Map(this.state.repositories.map((repository) => [repository.path, repository]));
+    const composerRepositoryByPath = new Map(
+      this.state.composer.repositories.map((repository) => [repository.path, repository]),
+    );
+    const normalized = [];
+    const seen = new Set();
+    for (const repositoryPath of paths || []) {
+      if (seen.has(repositoryPath)) continue;
+      const repository = repositoryByPath.get(repositoryPath);
+      if (!repository || repository.unavailable) continue;
+      seen.add(repositoryPath);
+      normalized.push(repositoryPath);
+    }
+
+    const sourceStatuses = Object.fromEntries(
+      Object.entries(this.state.sourceStatuses)
+        .filter(([repositoryPath]) => normalized.includes(repositoryPath)),
+    );
+    const sourceExpandedPaths = this.state.sourceExpandedPaths
+      .filter((repositoryPath) => normalized.includes(repositoryPath));
+    if (normalized.length > 0 && sourceExpandedPaths.length === 0) sourceExpandedPaths.push(normalized[0]);
+
+    this.state.repositoryScopePaths = normalized;
+    this.state.composer.repositories = normalized.map((repositoryPath) => {
+      const repository = repositoryByPath.get(repositoryPath);
+      const current = composerRepositoryByPath.get(repositoryPath);
+      return current ? { ...repository, access: current.access || 'edit' } : { ...repository, access: 'edit' };
+    });
+    this.state.sourceStatuses = sourceStatuses;
+    this.state.sourceExpandedPaths = sourceExpandedPaths;
+    this.notify(reason);
+    return normalized;
+  }
+
   setComposer(patch, reason = 'composer') {
     Object.assign(this.state.composer, patch);
     this.notify(reason);
@@ -110,6 +136,19 @@ class Store {
   setFollowUp(patch, reason = 'follow-up') {
     Object.assign(this.state.followUp, patch);
     this.notify(reason);
+  }
+
+  activeComposerSelection() {
+    return this.state.activeTaskId ? this.state.followUp : this.state.composer;
+  }
+
+  setActiveComposerSelection(patch, reason = 'silent') {
+    if (this.state.activeTaskId) {
+      this.setFollowUp(patch, reason);
+      return 'follow-up';
+    }
+    this.setComposer(patch, reason);
+    return 'composer';
   }
 
   resetFollowUp(task, reason = 'follow-up') {
@@ -137,7 +176,15 @@ class Store {
     if (!task?.taskId) return;
     const index = this.state.tasks.findIndex((item) => item.taskId === task.taskId);
     if (index < 0) this.state.tasks = [task, ...this.state.tasks];
-    else this.state.tasks = this.state.tasks.map((item) => (item.taskId === task.taskId ? task : item));
+    else {
+      const current = this.state.tasks[index];
+      const bothRevisioned = Number.isSafeInteger(current.revision) && Number.isSafeInteger(task.revision);
+      const olderRevision = bothRevisioned && task.revision < current.revision;
+      const currentUpdatedAt = Date.parse(current.updatedAt || current.createdAt || '') || 0;
+      const incomingUpdatedAt = Date.parse(task.updatedAt || task.createdAt || '') || 0;
+      if (olderRevision || (!bothRevisioned && incomingUpdatedAt < currentUpdatedAt)) return;
+      this.state.tasks = this.state.tasks.map((item) => (item.taskId === task.taskId ? task : item));
+    }
     this.notify('tasks');
   }
 

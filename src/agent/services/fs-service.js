@@ -9,6 +9,180 @@ const execFileAsync = promisify(execFile);
 const MAX_ENTRIES = 500;
 const MAX_DISCOVERY_DEPTH = 4;
 const MAX_DISCOVERY_RESULTS = 200;
+const WINDOWS_PICKER_WINDOW_HELPER = String.raw`
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace Patchwork {
+  public static class FolderPickerWindow {
+    private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
+
+    [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem {
+      void BindToHandler(IntPtr bindContext, ref Guid handlerId, ref Guid interfaceId, out IntPtr result);
+      void GetParent(out IShellItem parent);
+      void GetDisplayName(uint displayNameType, out IntPtr name);
+      void GetAttributes(uint mask, out uint attributes);
+      void Compare(IShellItem item, uint hint, out int order);
+    }
+
+    [ComImport, Guid("d57c7288-d4ad-4768-be02-9d969532d960"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileOpenDialog {
+      [PreserveSig] int Show(IntPtr owner);
+      void SetFileTypes(uint count, IntPtr filters);
+      void SetFileTypeIndex(uint index);
+      void GetFileTypeIndex(out uint index);
+      void Advise(IntPtr events, out uint cookie);
+      void Unadvise(uint cookie);
+      void SetOptions(uint options);
+      void GetOptions(out uint options);
+      void SetDefaultFolder(IShellItem folder);
+      void SetFolder(IShellItem folder);
+      void GetFolder(out IShellItem folder);
+      void GetCurrentSelection(out IShellItem item);
+      void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+      void GetFileName(out IntPtr name);
+      void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+      void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+      void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string label);
+      void GetResult(out IShellItem item);
+      void AddPlace(IShellItem item, uint position);
+      void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string extension);
+      void Close(int result);
+      void SetClientGuid(ref Guid guid);
+      void ClearClientData();
+      void SetFilter(IntPtr filter);
+      void GetResults(out IntPtr items);
+      void GetSelectedItems(out IntPtr items);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo {
+      public int Size;
+      public Rect Monitor;
+      public Rect Work;
+      public int Flags;
+    }
+
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll")] private static extern int GetClassName(IntPtr window, StringBuilder className, int capacity);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+    [DllImport("user32.dll")] private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+    private static extern int SHCreateItemFromParsingName(string path, IntPtr bindContext, ref Guid interfaceId, out IShellItem item);
+
+    private static void FocusNextDialog() {
+      uint processId = (uint) Process.GetCurrentProcess().Id;
+      HashSet<IntPtr> existing = new HashSet<IntPtr>();
+      EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+        uint owner;
+        GetWindowThreadProcessId(window, out owner);
+        if (owner == processId) existing.Add(window);
+        return true;
+      }, IntPtr.Zero);
+
+      Thread worker = new Thread(delegate() {
+        Stopwatch elapsed = Stopwatch.StartNew();
+        while (elapsed.ElapsedMilliseconds < 10000) {
+          IntPtr dialog = IntPtr.Zero;
+          EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            uint owner;
+            GetWindowThreadProcessId(window, out owner);
+            StringBuilder className = new StringBuilder(64);
+            GetClassName(window, className, className.Capacity);
+            if (owner == processId && !existing.Contains(window) && IsWindowVisible(window) && className.ToString() == "#32770") {
+              dialog = window;
+              return false;
+            }
+            return true;
+          }, IntPtr.Zero);
+
+          if (dialog != IntPtr.Zero) {
+            ShowWindow(dialog, 9);
+            IntPtr monitor = MonitorFromWindow(dialog, 2);
+            MonitorInfo info = new MonitorInfo();
+            info.Size = Marshal.SizeOf(info);
+            if (GetMonitorInfo(monitor, ref info)) {
+              int workWidth = info.Work.Right - info.Work.Left;
+              int workHeight = info.Work.Bottom - info.Work.Top;
+              int width = workWidth * 92 / 100;
+              int height = workHeight * 92 / 100;
+              int x = info.Work.Left + (workWidth - width) / 2;
+              int y = info.Work.Top + (workHeight - height) / 2;
+              SetWindowPos(dialog, new IntPtr(-1), x, y, width, height, 0x0040);
+            }
+            SetForegroundWindow(dialog);
+            SetWindowPos(dialog, new IntPtr(-2), 0, 0, 0, 0, 0x0013);
+            return;
+          }
+          Thread.Sleep(25);
+        }
+      });
+      worker.IsBackground = true;
+      worker.Start();
+    }
+
+    public static string Show(string initialDirectory) {
+      IntPtr previousDpiContext = IntPtr.Zero;
+      try {
+        try { previousDpiContext = SetThreadDpiAwarenessContext(new IntPtr(-4)); }
+        catch (EntryPointNotFoundException) { }
+
+        Type dialogType = Type.GetTypeFromCLSID(new Guid("dc1c5a9c-e88a-4dde-a5a1-60f82a20aef7"));
+        IFileOpenDialog dialog = (IFileOpenDialog) Activator.CreateInstance(dialogType);
+        try {
+          uint options;
+          dialog.GetOptions(out options);
+          dialog.SetOptions(options | 0x00000020 | 0x00000040 | 0x00000800 | 0x02000000);
+          dialog.SetTitle("Select a Git repository folder");
+
+          if (Directory.Exists(initialDirectory)) {
+            Guid shellItemId = new Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe");
+            IShellItem initialFolder;
+            if (SHCreateItemFromParsingName(initialDirectory, IntPtr.Zero, ref shellItemId, out initialFolder) == 0) {
+              try { dialog.SetFolder(initialFolder); }
+              finally { Marshal.FinalReleaseComObject(initialFolder); }
+            }
+          }
+
+          FocusNextDialog();
+          int result = dialog.Show(IntPtr.Zero);
+          if (result == unchecked((int) 0x800704C7)) return null;
+          if (result < 0) Marshal.ThrowExceptionForHR(result);
+
+          IShellItem selectedFolder;
+          dialog.GetResult(out selectedFolder);
+          try {
+            IntPtr selectedPath;
+            selectedFolder.GetDisplayName(0x80058000, out selectedPath);
+            try { return Marshal.PtrToStringUni(selectedPath); }
+            finally { Marshal.FreeCoTaskMem(selectedPath); }
+          } finally {
+            Marshal.FinalReleaseComObject(selectedFolder);
+          }
+        } finally {
+          Marshal.FinalReleaseComObject(dialog);
+        }
+      } finally {
+        if (previousDpiContext != IntPtr.Zero) SetThreadDpiAwarenessContext(previousDpiContext);
+      }
+    }
+  }
+}`;
 const SKIPPED_DIRECTORIES = new Set([
   'node_modules', '.git', '.hg', '.svn', 'dist', 'build', 'out', 'target',
   '.venv', 'venv', '__pycache__', '.cache', '.next', '.nuxt', 'vendor',
@@ -41,16 +215,11 @@ class FsService {
         '-NoLogo', '-NoProfile', '-STA', '-NonInteractive', '-Command',
         [
           '$ErrorActionPreference = \'Stop\'',
-          'Add-Type -AssemblyName System.Windows.Forms',
-          '[System.Windows.Forms.Application]::EnableVisualStyles()',
+          `Add-Type -TypeDefinition '${WINDOWS_PICKER_WINDOW_HELPER.replaceAll("'", "''")}'`,
           '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
-          '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
-          "$dialog.Description = 'Select a Git repository folder'",
-          '$dialog.ShowNewFolderButton = $true',
-          '$dialog.TopMost = $true',
-          '$dialog.SelectedPath = $env:PATCHWORK_PICKER_INITIAL_DIRECTORY',
-          'if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {',
-          '  [Console]::Out.Write($dialog.SelectedPath)',
+          '$selectedPath = [Patchwork.FolderPickerWindow]::Show($env:PATCHWORK_PICKER_INITIAL_DIRECTORY)',
+          'if ($selectedPath) {',
+          '  [Console]::Out.Write($selectedPath)',
           '}',
         ].join('; '),
       ];

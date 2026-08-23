@@ -11,6 +11,8 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.doesNotMatch(source, /CONVERSATION_SWEEP_MILLISECONDS/);
   assert.match(source, /responseComplete/);
   assert.match(source, /observeConversation/);
+  assert.match(source, /observeConversationUpdates/);
+  assert.match(source, /COMPLETION_RETRY_DELAYS/);
   assert.match(source, /knownStatus: 'completed'/);
   assert.match(source, /taskChatStatus/);
   assert.match(source, /observeConversationTitle/);
@@ -18,6 +20,7 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.match(source, /initialTitle: currentTitle/);
   assert.doesNotMatch(source, /if \(currentTitle\) return;/);
   assert.match(source, /Reconcile once before attaching the DOM observer/);
+  assert.match(source, /push invalidation channel/);
   assert.match(source, /seenTaskResultFiles/);
   assert.match(source, /latestTaskResultFile/);
   assert.match(source, /if \(generation === this\.watchGeneration\) arm\(\)/);
@@ -34,6 +37,37 @@ test('the userscript monitors generation without recurring ChatGPT API polling',
   assert.doesNotMatch(apiSource, /stream_status/);
   assert.match(apiSource, /interpreter\/download/);
   assert.match(apiSource, /sandbox_path/);
+});
+
+
+test('ChatGPT WebSocket messages invalidate only the relevant conversation', async () => {
+  const previousLocation = global.location;
+  const conversationId = '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33';
+  const otherConversationId = '5b4d9f80-8f3c-4c9f-9f70-2f5c7b9d3e44';
+  global.location = { href: `https://chatgpt.com/c/${conversationId}` };
+  const {
+    isChatGptSocketUrl,
+    messageTargetsConversation,
+  } = require('../src/userscript/src/chatgpt/websocket');
+
+  try {
+    assert.equal(isChatGptSocketUrl('wss://ws.chatgpt.com/ws'), true);
+    assert.equal(isChatGptSocketUrl('wss://example.com/ws'), false);
+    assert.equal(await messageTargetsConversation('unstructured update', conversationId), true,
+      'socket activity on the open task conversation is an invalidation signal');
+    assert.equal(await messageTargetsConversation(
+      JSON.stringify({ conversation_id: otherConversationId }),
+      otherConversationId,
+      'https://chatgpt.com/c/unrelated',
+    ), true, 'background notifications can target a task by conversation id');
+    assert.equal(await messageTargetsConversation(
+      JSON.stringify({ conversation_id: otherConversationId }),
+      conversationId,
+      'https://chatgpt.com/c/unrelated',
+    ), false, 'unrelated background notifications do not trigger reconciliation');
+  } finally {
+    global.location = previousLocation;
+  }
 });
 
 test('the model picker reacts to real DOM changes without a periodic remount guard', () => {
@@ -88,6 +122,37 @@ test('conversation recovery recognizes terminal records without polling stream s
   assert.equal(conversationCompletionStatus({ current_node: 'answer', mapping: {
     answer: { message: { status: 'in_progress' } },
   } }), null);
+});
+
+
+test('completed tasks remain watchable while result metadata is still propagating', async () => {
+  const { Driver } = require('../src/userscript/src/driver');
+  const conversationId = '4a3c8e79-7e2b-4b8f-8e6f-1e4b6a8c2d33';
+  const task = {
+    taskId: 'metadata-lag',
+    state: 'submitted',
+    answerOnly: false,
+    conversationId,
+    conversationUrl: `https://chatgpt.com/c/${conversationId}`,
+    chatStatus: 'streaming',
+  };
+  const completed = { ...task, chatStatus: 'completed' };
+  const driver = new Driver({
+    api: {
+      taskChatStatus: async () => ({ task: completed }),
+    },
+  });
+  driver.ingestTaskResult = async () => null;
+
+  const updated = await driver.reconcileTask(task, {
+    record: {
+      current_node: 'answer',
+      mapping: { answer: { message: { status: 'finished_successfully', end_turn: true } } },
+    },
+  });
+
+  assert.equal(updated, completed, 'the completed status must survive until a later bounded retry finds the file');
+  assert.equal(driver.canWatchTask(updated), true);
 });
 
 test('follow-up result freshness is anchored to the saved turn timestamp', () => {

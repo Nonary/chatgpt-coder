@@ -64,38 +64,7 @@ class App {
   }
 
   setRepositoryScope(paths, { reason = 'repository-scope' } = {}) {
-    const repositoryByPath = new Map(this.store.state.repositories.map((repository) => [repository.path, repository]));
-    const composerRepositoryByPath = new Map(
-      this.store.state.composer.repositories.map((repository) => [repository.path, repository]),
-    );
-    const normalized = [];
-    const seen = new Set();
-    for (const repositoryPath of paths || []) {
-      if (seen.has(repositoryPath)) continue;
-      const repository = repositoryByPath.get(repositoryPath);
-      if (!repository || repository.unavailable) continue;
-      seen.add(repositoryPath);
-      normalized.push(repositoryPath);
-    }
-
-    this.store.state.composer.repositories = normalized.map((repositoryPath) => {
-      const repository = repositoryByPath.get(repositoryPath);
-      const current = composerRepositoryByPath.get(repositoryPath);
-      return current ? { ...repository, access: current.access || 'edit' } : { ...repository, access: 'edit' };
-    });
-    const sourceStatuses = Object.fromEntries(
-      Object.entries(this.store.state.sourceStatuses)
-        .filter(([repositoryPath]) => normalized.includes(repositoryPath)),
-    );
-    const sourceExpandedPaths = this.store.state.sourceExpandedPaths
-      .filter((repositoryPath) => normalized.includes(repositoryPath));
-    if (normalized.length > 0 && sourceExpandedPaths.length === 0) sourceExpandedPaths.push(normalized[0]);
-
-    this.store.set({
-      repositoryScopePaths: normalized,
-      sourceStatuses,
-      sourceExpandedPaths,
-    }, reason);
+    const normalized = this.store.setRepositoryScope(paths, reason);
     this.persist('repository-scope', JSON.stringify(normalized));
     this.persist('source-repository', '');
     return normalized;
@@ -1055,9 +1024,11 @@ class App {
       model: composer.model,
       reasoningMode: composer.reasoningMode,
       onChange: (selection) => {
-        this.store.setComposer(selection, 'silent');
-        this.persist('task-model', selection.model);
-        this.persist('task-reasoning', selection.reasoningMode);
+        const target = this.store.setActiveComposerSelection(selection, 'silent');
+        if (target === 'composer') {
+          this.persist('task-model', selection.model);
+          this.persist('task-reasoning', selection.reasoningMode);
+        }
         this.store.addActivity(`Model set to ${selection.model} · ${selection.reasoningMode} from the composer.`);
         this.renderActiveView();
       },
@@ -1077,9 +1048,9 @@ class App {
     });
 
     // Keep ChatGPT's composer in step when the choice is made in the dock instead.
-    this.store.subscribe((state, reason) => {
+    this.store.subscribe((_state, reason) => {
       if (reason === 'composer' || reason === 'silent') {
-        const selection = state.activeTaskId ? state.followUp : state.composer;
+        const selection = this.store.activeComposerSelection();
         const current = modelPicker.currentSelection();
         if (current.model === selection.model && current.reasoningMode === selection.reasoningMode) return;
         // Silent updates include every form-field keystroke. Do not repaint the

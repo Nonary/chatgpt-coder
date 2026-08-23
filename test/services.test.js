@@ -632,6 +632,78 @@ test('task model and reasoning selections are persisted with the task', async (c
   );
 });
 
+test('task mutations serialize updates and reject terminal lifecycle regressions', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-state-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const task = await tasks.createTask({
+    taskText: 'Exercise task state ownership.',
+    repositories: [{ path: repositoryPath }],
+    answerOnly: true,
+  });
+
+  await Promise.all([
+    tasks.updateTask(task.taskId, { conversationTitle: 'Durable title' }),
+    tasks.updateTask(task.taskId, { conversationId: 'conversation-1' }),
+  ]);
+  let current = await tasks.getTask(task.taskId);
+  assert.equal(current.conversationTitle, 'Durable title');
+  assert.equal(current.conversationId, 'conversation-1');
+  assert.equal(current.revision, 2);
+
+  current = await tasks.markSubmitted(task.taskId, {
+    conversationUrl: 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+  });
+  current = await tasks.updateChatStatus(task.taskId, 'completed', 'COMPLETED');
+  assert.equal(current.state, 'completed');
+  const unchanged = await tasks.updateChatStatus(task.taskId, 'failed', 'FAILURE');
+  assert.equal(unchanged.state, 'completed', 'late terminal callbacks cannot reverse the first terminal outcome');
+  await tasks.updateTask(task.taskId, { state: 'ready' });
+  await tasks.updateTask(task.taskId, { state: 'applied' });
+  await assert.rejects(
+    tasks.markSubmitted(task.taskId, { conversationUrl: 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22' }),
+    /cannot mark it submitted while the task is applied/i,
+  );
+  await assert.rejects(tasks.markFailed(task.taskId, 'late failure'), /cannot mark it failed while the task is applied/i);
+  await assert.rejects(
+    tasks.updateTask(task.taskId, { state: 'failed' }),
+    /invalid task state transition: applied -> failed/i,
+  );
+});
+
+test('result application and rollback share one task mutation owner', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-result-state-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const task = await tasks.createTask({
+    taskText: 'Exercise result mutation ownership.',
+    repositories: [{ path: repositoryPath }],
+    autoApply: false,
+  });
+  await tasks.updateTask(task.taskId, { state: 'ready', result: { patches: [] } });
+  const results = new ResultService(tasks);
+  let releaseApply;
+  const applying = new Promise((resolve) => { releaseApply = resolve; });
+  let enteredApply;
+  const entered = new Promise((resolve) => { enteredApply = resolve; });
+  results._applyTask = async () => {
+    enteredApply();
+    await applying;
+    return tasks.updateTask(task.taskId, { state: 'applied' });
+  };
+
+  const first = results.apply(task.taskId);
+  await entered;
+  await assert.rejects(results.apply(task.taskId), /already being changed/i);
+  await assert.rejects(results.rollback(task.taskId), /already being changed/i);
+  releaseApply();
+  assert.equal((await first).state, 'applied');
+});
+
 test('submitted tasks can change their apply target without rebuilding the task package', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-target-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -1835,6 +1907,35 @@ test('source control keeps removed and discovered repositories in a durable pick
   assert.deepEqual(await migrated.listKnownRepositories(), [
     { name: 'sample-repository', path: firstRepositoryPath },
   ], 'repositories from the old workspace format remain remembered after removal');
+});
+
+test('workspace catalog mutations serialize whole-document persistence', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-workspace-state-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const firstRepositoryPath = await createRepository(root);
+  const secondRepositoryPath = await createRepository(path.join(root, 'other'));
+  const git = new GitService(path.join(root, 'data'));
+  await git.initialize();
+
+  const writeWorkspaceState = git.writeWorkspaceState.bind(git);
+  let firstWrite = true;
+  git.writeWorkspaceState = async (state) => {
+    if (firstWrite) {
+      firstWrite = false;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+    return writeWorkspaceState(state);
+  };
+
+  await Promise.all([
+    git.addRepositories([firstRepositoryPath]),
+    git.rememberRepositories([{ name: 'other-repository', path: secondRepositoryPath }]),
+  ]);
+  assert.deepEqual((await git.listRepositories()).map((repository) => repository.path), [firstRepositoryPath]);
+  assert.deepEqual((await git.listKnownRepositories()).sort((left, right) => left.path.localeCompare(right.path)), [
+    { name: 'other-repository', path: secondRepositoryPath },
+    { name: 'sample-repository', path: firstRepositoryPath },
+  ].sort((left, right) => left.path.localeCompare(right.path)));
 });
 
 test('source control can unstage and create the first commit', async (context) => {

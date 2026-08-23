@@ -55,7 +55,7 @@ function header() {
 // @author       Patchwork
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
@@ -99,12 +99,85 @@ ${entries}
 `;
 }
 
+
+function webSocketBootstrap() {
+  return `(function () {
+  var EVENT_NAME = 'patchwork-chatgpt-websocket-message';
+  var WRAPPED_FLAG = '__patchworkChatgptWebSocketWrapped';
+  var NativeWebSocket = window.WebSocket;
+  if (typeof NativeWebSocket !== 'function' || NativeWebSocket[WRAPPED_FLAG]) return;
+
+  function isChatGptSocketUrl(value) {
+    try {
+      var url = new URL(String(value || ''), location.href);
+      return url.protocol === 'wss:'
+        && (url.hostname === 'ws.chatgpt.com' || url.hostname.endsWith('.chatgpt.com'));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function PatchworkWebSocket(url, protocols) {
+    var socket = arguments.length > 1
+      ? new NativeWebSocket(url, protocols)
+      : new NativeWebSocket(url);
+    if (isChatGptSocketUrl(url)) {
+      socket.addEventListener('message', function (event) {
+        window.dispatchEvent(new CustomEvent(EVENT_NAME, {
+          detail: { url: String(url || ''), data: event.data },
+        }));
+      });
+    }
+    return socket;
+  }
+
+  Object.setPrototypeOf(PatchworkWebSocket, NativeWebSocket);
+  PatchworkWebSocket.prototype = NativeWebSocket.prototype;
+  Object.defineProperty(PatchworkWebSocket, WRAPPED_FLAG, { value: true });
+  Object.defineProperty(PatchworkWebSocket, '__patchworkNativeWebSocket', { value: NativeWebSocket });
+  window.WebSocket = PatchworkWebSocket;
+})();`;
+}
+
 function loader() {
   return `${header()}
 (function () {
   'use strict';
   var token = '__PATCHWORK_TOKEN__';
   var origin = '__PATCHWORK_ORIGIN__';
+  var socketBootstrapUrl = URL.createObjectURL(new Blob([${JSON.stringify(webSocketBootstrap())}], { type: 'text/javascript' }));
+  var socketBootstrap = document.createElement('script');
+  socketBootstrap.src = socketBootstrapUrl;
+  socketBootstrap.async = false;
+  socketBootstrap.addEventListener('load', function () {
+    URL.revokeObjectURL(socketBootstrapUrl);
+    socketBootstrap.remove();
+  });
+  socketBootstrap.addEventListener('error', function () {
+    URL.revokeObjectURL(socketBootstrapUrl);
+    socketBootstrap.remove();
+  });
+  var socketRoot = document.documentElement || document.head || document.body;
+  if (socketRoot) socketRoot.append(socketBootstrap);
+  else {
+    document.addEventListener('readystatechange', function installSocketBootstrap() {
+      var root = document.documentElement || document.head || document.body;
+      if (root) root.append(socketBootstrap);
+    }, { once: true });
+  }
+
+  function injectRuntime(source) {
+    window.__patchworkBootstrap = { origin: origin, token: token, transport: 'gm' };
+    var element = document.createElement('script');
+    element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    element.addEventListener('load', function () { URL.revokeObjectURL(element.src); });
+    element.addEventListener('error', function () {
+      URL.revokeObjectURL(element.src);
+      console.error('[patchwork] ChatGPT blocked the local Patchwork runtime.');
+    });
+    document.documentElement.append(element);
+  }
+
   var request = typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'
     ? GM.xmlHttpRequest.bind(GM)
     : (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null);
@@ -121,15 +194,12 @@ function loader() {
         console.error('[patchwork] The local agent refused the runtime request (' + response.status + ').');
         return;
       }
-      window.__patchworkBootstrap = { origin: origin, token: token, transport: 'gm' };
-      var element = document.createElement('script');
-      element.src = URL.createObjectURL(new Blob([response.responseText], { type: 'text/javascript' }));
-      element.addEventListener('load', function () { URL.revokeObjectURL(element.src); });
-      element.addEventListener('error', function () {
-        URL.revokeObjectURL(element.src);
-        console.error('[patchwork] ChatGPT blocked the local Patchwork runtime.');
-      });
-      document.documentElement.append(element);
+      var source = response.responseText;
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () { injectRuntime(source); }, { once: true });
+      } else {
+        injectRuntime(source);
+      }
     },
     onerror: function () {
       console.error('[patchwork] The local Patchwork agent is not reachable at ' + origin + '.');
@@ -163,5 +233,5 @@ if (require.main === module) {
 }
 
 module.exports = {
-  ENTRY, OUTPUT, RUNTIME_OUTPUT, build, bundle, collect, loader, resolveModule,
+  ENTRY, OUTPUT, RUNTIME_OUTPUT, build, bundle, collect, loader, resolveModule, webSocketBootstrap,
 };

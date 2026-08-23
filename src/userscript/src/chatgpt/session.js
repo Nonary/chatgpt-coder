@@ -1,15 +1,8 @@
 const SESSION_TTL_MILLISECONDS = 4 * 60 * 1000;
+const { readStorage } = require('../ui/storage');
 
 let cached = null;
 let cachedAt = 0;
-
-function readStorage(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
 
 function deviceId() {
   return readStorage('oai-device-id')

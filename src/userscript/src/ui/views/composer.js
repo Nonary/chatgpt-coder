@@ -5,8 +5,6 @@ const {
   appendPromptId,
   appendSkillId,
   closeComposerPopover,
-  createComposerPopover,
-  filterComposerCommands,
   findSlashCommand,
   promptCommandName,
   removePromptId,
@@ -14,51 +12,30 @@ const {
   removeSkillId,
   skillCommandName,
 } = require('../composer-controls');
-const { MODEL_LABELS, REASONING_LABELS, TASK_MODE_LABELS } = require('../labels');
-const { taskModelSupportsReasoning } = require('../../../../shared/chatgpt');
+const { TASK_MODE_LABELS } = require('../labels');
 const { openComposerSettings } = require('../dialogs/composer-settings');
+const {
+  MODE_OPTIONS: SHARED_MODE_OPTIONS,
+  compactModelLabel,
+  compactReasoningLabel,
+  configurationLabel,
+  openAttachmentMenu: openSharedAttachmentMenu,
+  openCommandPicker: openSharedCommandPicker,
+  openModelMenu: openSharedModelMenu,
+  openModeMenu: openSharedModeMenu,
+  promptDescription,
+} = require('../composer-common');
 
 const NEW_TREE_VALUE = '__new__';
 const NEW_PROJECT_VALUE = '__new__';
 const SKILL_CACHE_TTL_MILLISECONDS = 60_000;
 
-const MODE_OPTIONS = [
-  {
-    value: 'ask',
-    label: TASK_MODE_LABELS.ask,
-    description: 'Answer questions and explore the codebase without making changes.',
-  },
-  {
-    value: 'agent',
-    label: TASK_MODE_LABELS.agent,
-    description: 'Implement the requested changes and return the task result.',
-  },
-];
+const MODE_OPTIONS = SHARED_MODE_OPTIONS;
 
 const skillCatalogCache = new Map();
 
-function moveActiveIndex(current, delta, length) {
-  if (length <= 0) return 0;
-  return (current + delta + length) % length;
-}
-
-function compactModelLabel(model) {
-  return MODEL_LABELS[model] || MODEL_LABELS.default;
-}
-
-function compactReasoningLabel(reasoningMode) {
-  return reasoningMode === 'default'
-    ? 'Auto'
-    : REASONING_LABELS[reasoningMode] || 'Auto';
-}
-
 function composerConfigurationLabel(composer) {
-  return `${compactModelLabel(composer.model)} · ${compactReasoningLabel(composer.reasoningMode)}`;
-}
-
-function promptDescription(prompt) {
-  const description = String(prompt?.description || prompt?.content || '').replace(/\s+/g, ' ').trim();
-  return description ? description.slice(0, 180) : 'Saved instructions.';
+  return configurationLabel(composer);
 }
 
 function composerTargetSummary(state) {
@@ -155,30 +132,6 @@ function refreshSkillCatalog(ctx, repositoryPaths) {
   });
   skillCatalogCache.set(repositoryKey, entry);
   return entry;
-}
-
-function renderCommandGroup(label, commands, activeIndex, onSelect, onHover, selectedIds) {
-  if (!commands.length) return [];
-  const children = [h('div', { class: 'composer-command-group-label' }, label)];
-  children.push(...commands.map((command) => h(
-    'button',
-    {
-      class: `composer-command-item${command.index === activeIndex ? ' active' : ''}`,
-      type: 'button',
-      role: 'menuitem',
-      'aria-selected': String(selectedIds.has(command.id)),
-      onclick: () => onSelect(command),
-      onmouseenter: () => onHover(command.index),
-    },
-    h('span', { class: 'composer-command-check', 'aria-hidden': 'true' }, selectedIds.has(command.id) ? '✓' : ''),
-    h(
-      'span',
-      { class: 'composer-command-copy' },
-      h('span', { class: 'composer-command-name' }, `/${command.name}`),
-      h('span', { class: 'composer-command-description' }, command.description),
-    ),
-  )));
-  return children;
 }
 
 function renderComposer(ctx) {
@@ -494,414 +447,72 @@ function renderComposer(ctx) {
   }
 
   function openCommandPicker() {
-    const initialToken = findSlashCommand(taskText.value, taskText.selectionStart);
-    if (!initialToken) return null;
-
     const repositoryPaths = ctx.store.state.composer.repositories.map((repository) => repository.path);
     const cacheEntry = refreshSkillCatalog(ctx, repositoryPaths);
     let skills = cacheEntry.skills;
-    let activeIndex = 0;
-    let controller;
-    controller = createComposerPopover({
+    const footer = h('div', { class: 'composer-popover-footer' },
+      h('button', { class: 'composer-popover-browse', type: 'button', onclick: () => { if (skills.length) ctx.store.set({ skills }, 'silent'); commandPickerController?.close(); ctx.actions.openSkillDrawer(); } }, 'Browse all skills'),
+      h('button', { class: 'composer-popover-browse', type: 'button', onclick: () => { commandPickerController?.close(); ctx.actions.openPromptManager(); } }, 'Manage saved prompts'));
+    const controller = openSharedCommandPicker({
       anchor: taskText,
-      placement: 'above',
-      width: 'min(380px, calc(100vw - 16px))',
-      onClose: () => {
-        if (commandPickerController === controller) commandPickerController = null;
+      buildCommands: () => buildCommands(skills),
+      selectedIds: () => new Set([...ctx.store.state.composer.skillIds, ...ctx.store.state.composer.promptIds]),
+      selectCommand: (command, picker) => {
+        const token = findSlashCommand(taskText.value, taskText.selectionStart);
+        if (!token) { picker.close(); return false; }
+        const removal = removeSlashCommandToken(taskText.value, token);
+        const patch = command.type === 'skill'
+          ? { skillIds: appendSkillId(ctx.store.state.composer.skillIds, command.id), taskText: removal.text }
+          : { promptIds: appendPromptId(ctx.store.state.composer.promptIds, command.id), taskText: removal.text };
+        ctx.store.setComposer(patch, 'silent'); picker.close(); refreshComposer(); restoreComposerFocus(ctx, removal.cursor); return true;
       },
+      emptyText: (token) => token.query ? `No commands match /${token.query}.` : 'No commands are available for this context.',
+      footer,
+      onClose: () => { if (commandPickerController === controller) commandPickerController = null; },
     });
     commandPickerController = controller;
-
-    const header = h(
-      'div',
-      { class: 'composer-popover-header' },
-      h('span', { class: 'composer-popover-title' }, 'Commands'),
-      h('span', { class: 'composer-popover-hint' }, '↑ ↓ Enter · Tab'),
-    );
-    const list = h('div', { class: 'composer-command-list' });
-    const browse = h('button', {
-      class: 'composer-popover-browse',
-      type: 'button',
-      onclick: () => {
-        if (skills.length) ctx.store.set({ skills }, 'silent');
-        controller.close();
-        ctx.actions.openSkillDrawer();
-      },
-    }, 'Browse all skills');
-    const manage = h('button', {
-      class: 'composer-popover-browse',
-      type: 'button',
-      onclick: () => {
-        controller.close();
-        ctx.actions.openPromptManager();
-      },
-    }, 'Manage saved prompts');
-    replace(controller.popover, header, list, h('div', { class: 'composer-popover-footer' }, browse, manage));
-
-    function matchingCommands(token) {
-      return filterComposerCommands(buildCommands(skills), token.query);
-    }
-
-    function selectCommand(command) {
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      if (!token) {
-        controller.close();
-        return false;
-      }
-      const removal = removeSlashCommandToken(taskText.value, token);
-      if (command.type === 'skill') {
-        ctx.store.setComposer({
-          skillIds: appendSkillId(ctx.store.state.composer.skillIds, command.id),
-          taskText: removal.text,
-        }, 'silent');
-      } else {
-        ctx.store.setComposer({
-          promptIds: appendPromptId(ctx.store.state.composer.promptIds, command.id),
-          taskText: removal.text,
-        }, 'silent');
-      }
-      controller.close();
-      refreshComposer();
-      restoreComposerFocus(ctx, removal.cursor);
-      return true;
-    }
-
-    function renderCommandList() {
-      if (!controller.isOpen()) return;
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      if (!token) {
-        controller.close();
-        return;
-      }
-
-      const matches = matchingCommands(token).map((command, index) => ({ ...command, index }));
-      activeIndex = Math.min(activeIndex, Math.max(0, matches.length - 1));
-      const selectedSkillIds = new Set(ctx.store.state.composer.skillIds);
-      const selectedPromptIds = new Set(ctx.store.state.composer.promptIds);
-      const selectedIds = new Set([...selectedSkillIds, ...selectedPromptIds]);
-      const skillMatches = matches.filter((command) => command.type === 'skill');
-      const promptMatches = matches.filter((command) => command.type === 'prompt');
-      const children = [];
-
-      if (cacheEntry.status === 'loading' && skillMatches.length === 0 && !token.query) {
-        children.push(h('div', { class: 'composer-empty' }, 'Loading skills…'));
-      }
-
-      children.push(...renderCommandGroup(
-        'Skills',
-        skillMatches,
-        activeIndex,
-        selectCommand,
-        (index) => {
-          activeIndex = index;
-          list.querySelectorAll('.composer-command-item').forEach((item, itemIndex) => item.classList.toggle('active', itemIndex === activeIndex));
-        },
-        selectedIds,
-      ));
-      children.push(...renderCommandGroup(
-        'Prompts',
-        promptMatches,
-        activeIndex,
-        selectCommand,
-        (index) => {
-          activeIndex = index;
-          list.querySelectorAll('.composer-command-item').forEach((item, itemIndex) => item.classList.toggle('active', itemIndex === activeIndex));
-        },
-        selectedIds,
-      ));
-
-      if (children.length === 0) {
-        children.push(h(
-          'div',
-          { class: 'composer-empty' },
-          token.query ? `No commands match /${token.query}.` : 'No commands are available for this context.',
-        ));
-      }
-
-      replace(list, ...children);
-      controller.reposition();
-    }
-
-    controller.refresh = renderCommandList;
-    controller.move = (delta) => {
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      if (!token) {
-        controller.close();
-        return;
-      }
-      const matches = matchingCommands(token);
-      if (!matches.length) return;
-      activeIndex = moveActiveIndex(activeIndex, delta, matches.length);
-      renderCommandList();
-      const activeButton = list.querySelectorAll('.composer-command-item')[activeIndex];
-      activeButton?.scrollIntoView({ block: 'nearest' });
-    };
-    controller.selectActive = () => {
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      const matches = token ? matchingCommands(token) : [];
-      return matches.length ? selectCommand(matches[activeIndex]) : false;
-    };
-
-    controller.popover.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        controller.move(1);
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        controller.move(-1);
-      } else if (event.key === 'Enter' || event.key === 'Tab' || event.key === ' ') {
-        event.preventDefault();
-        controller.selectActive();
-      }
-    });
-
-    renderCommandList();
-    if (cacheEntry.status === 'loading') {
-      cacheEntry.promise.then((loadedSkills) => {
-        skills = loadedSkills;
-        renderCommandList();
-      }).catch((error) => {
-        if (!controller.isOpen()) return;
-        replace(list, h('div', { class: 'composer-empty error' }, error.message));
-        controller.reposition();
-      });
-    }
-
+    if (cacheEntry.status === 'loading') cacheEntry.promise.then((loaded) => { skills = loaded; controller?.refresh(); }).catch((error) => { if (controller?.isOpen()) replace(controller.popover, h('div', { class: 'composer-empty error' }, error.message)); });
     return controller;
   }
 
   function openModelMenu() {
-    const currentComposer = ctx.store.state.composer;
-    const modelChoices = Object.entries(MODEL_LABELS).map(([value, label]) => ({
-      kind: 'model', value, label,
-    }));
-    const reasoningChoices = Object.entries(REASONING_LABELS)
-      .filter(([value]) => taskModelSupportsReasoning(currentComposer.model, value))
-      .map(([value, label]) => ({ kind: 'reasoning', value, label }));
-    const choices = [...modelChoices, ...reasoningChoices];
-    const groups = [
-      { label: 'Model', choices: modelChoices },
-      { label: 'Reasoning', choices: reasoningChoices },
-    ];
-    let activeIndex = Math.max(0, choices.findIndex((choice) => (
-      choice.kind === 'model'
-        ? currentComposer.model === choice.value
-        : currentComposer.reasoningMode === choice.value
-    )));
     let controller;
-    controller = createComposerPopover({
+    controller = openSharedModelMenu({
       anchor: modelButton,
-      align: 'end',
-      placement: 'above',
-      width: 'min(280px, calc(100vw - 16px))',
-      onClose: () => {
-        modelButton.setAttribute('aria-expanded', 'false');
-        if (modelController === controller) modelController = null;
+      getConfiguration: () => ctx.store.state.composer,
+      setConfiguration: (patch) => {
+        const next = { ...ctx.store.state.composer, ...patch };
+        ctx.store.setComposer(patch, 'silent');
+        if ('model' in patch) ctx.persist('task-model', next.model);
+        ctx.persist('task-reasoning', next.reasoningMode);
       },
+      onRefresh: refreshComposer,
+      onClose: () => { if (modelController === controller) modelController = null; },
     });
     modelController = controller;
-    modelButton.setAttribute('aria-expanded', 'true');
-
-    const list = h('div', { class: 'composer-command-list' });
-    replace(controller.popover, list);
-
-    const isChecked = (choice) => choice.kind === 'model'
-      ? ctx.store.state.composer.model === choice.value
-      : ctx.store.state.composer.reasoningMode === choice.value;
-
-    const selectChoice = (choice) => {
-      if (choice.kind === 'model') {
-        const reasoningMode = taskModelSupportsReasoning(choice.value, ctx.store.state.composer.reasoningMode)
-          ? ctx.store.state.composer.reasoningMode
-          : 'default';
-        ctx.store.setComposer({ model: choice.value, reasoningMode }, 'silent');
-        ctx.persist('task-model', choice.value);
-        ctx.persist('task-reasoning', reasoningMode);
-      } else {
-        ctx.store.setComposer({ reasoningMode: choice.value }, 'silent');
-        ctx.persist('task-reasoning', choice.value);
-      }
-      controller.close();
-      refreshComposer();
-    };
-
-    const renderChoices = () => {
-      const children = [];
-      for (const group of groups) {
-        children.push(h('div', { class: 'composer-command-group-label' }, group.label));
-        for (const choice of group.choices) {
-          const index = choices.indexOf(choice);
-          children.push(h(
-            'button',
-            {
-              class: `composer-command-item composer-choice-item${index === activeIndex ? ' active' : ''}`,
-              type: 'button',
-              role: 'menuitemradio',
-              'aria-checked': String(isChecked(choice)),
-              onclick: () => selectChoice(choice),
-            },
-            h('span', { class: 'composer-command-check', 'aria-hidden': 'true' }, isChecked(choice) ? '✓' : ''),
-            h('span', { class: 'composer-command-copy' }, h('span', { class: 'composer-command-name' }, choice.label)),
-          ));
-        }
-      }
-      replace(list, ...children);
-      controller.reposition();
-    };
-
-    const syncActiveChoice = () => {
-      list.querySelectorAll('.composer-command-item').forEach((item, index) => {
-        item.classList.toggle('active', index === activeIndex);
-      });
-    };
-
-    controller.move = (delta) => {
-      activeIndex = moveActiveIndex(activeIndex, delta, choices.length);
-      syncActiveChoice();
-      list.querySelectorAll('.composer-command-item')[activeIndex]?.scrollIntoView({ block: 'nearest' });
-    };
-    controller.selectActive = () => selectChoice(choices[activeIndex]);
-    controller.popover.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        controller.move(1);
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        controller.move(-1);
-      } else if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        controller.selectActive();
-      }
-    });
-
-    renderChoices();
-    list.querySelectorAll('.composer-command-item').forEach((item, index) => {
-      item.onmouseenter = () => {
-        activeIndex = index;
-        syncActiveChoice();
-      };
-    });
-    syncActiveChoice();
-    controller.focusFirst();
     return controller;
   }
 
   function openModeMenu() {
-    const currentComposer = ctx.store.state.composer;
-    const currentMode = MODE_OPTIONS.some((item) => item.value === currentComposer.mode) ? currentComposer.mode : 'ask';
-    let activeIndex = Math.max(0, MODE_OPTIONS.findIndex((item) => item.value === currentMode));
     let controller;
-    controller = createComposerPopover({
+    controller = openSharedModeMenu({
       anchor: modeButton,
-      align: 'end',
-      placement: 'above',
-      width: 'min(320px, calc(100vw - 16px))',
-      onClose: () => {
-        modeButton.setAttribute('aria-expanded', 'false');
-        if (modeController === controller) modeController = null;
-      },
+      getMode: () => ctx.store.state.composer.mode,
+      setMode: (mode) => ctx.store.setComposer({ mode }, 'silent'),
+      onRefresh: refreshComposer,
+      onClose: () => { if (modeController === controller) modeController = null; },
     });
     modeController = controller;
-    modeButton.setAttribute('aria-expanded', 'true');
-
-    const list = h('div', { class: 'composer-command-list' });
-    replace(controller.popover, list);
-
-    const renderModes = () => {
-      replace(
-        list,
-        ...MODE_OPTIONS.map((mode, index) => h(
-          'button',
-          {
-            class: `composer-command-item composer-mode-item${index === activeIndex ? ' active' : ''}`,
-            type: 'button',
-            role: 'menuitemradio',
-            'aria-checked': String(ctx.store.state.composer.mode === mode.value),
-            onclick: () => selectMode(mode.value),
-          },
-          h('span', { class: 'composer-command-check', 'aria-hidden': 'true' }, ctx.store.state.composer.mode === mode.value ? '✓' : ''),
-          h(
-            'span',
-            { class: 'composer-command-copy' },
-            h('span', { class: 'composer-command-name' }, mode.label),
-            h('span', { class: 'composer-command-description' }, mode.description),
-          ),
-        )),
-      );
-      controller.reposition();
-    };
-
-    const selectMode = (value) => {
-      ctx.store.setComposer({ mode: value }, 'silent');
-      controller.close();
-      refreshComposer();
-    };
-
-    const syncActiveMode = () => {
-      list.querySelectorAll('.composer-command-item').forEach((item, index) => item.classList.toggle('active', index === activeIndex));
-    };
-
-    controller.move = (delta) => {
-      activeIndex = moveActiveIndex(activeIndex, delta, MODE_OPTIONS.length);
-      syncActiveMode();
-      list.querySelectorAll('.composer-command-item')[activeIndex]?.scrollIntoView({ block: 'nearest' });
-    };
-    controller.selectActive = () => selectMode(MODE_OPTIONS[activeIndex].value);
-    controller.popover.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown') {
-        event.preventDefault();
-        controller.move(1);
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault();
-        controller.move(-1);
-      } else if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        controller.selectActive();
-      }
-    });
-
-    renderModes();
-    list.querySelectorAll('.composer-command-item').forEach((item, index) => {
-      item.onmouseenter = () => {
-        activeIndex = index;
-        syncActiveMode();
-      };
-    });
-    syncActiveMode();
-    controller.focusFirst();
     return controller;
   }
 
   function openPlusMenu() {
     let controller;
-    controller = createComposerPopover({
-      anchor: plusButton,
-      align: 'start',
-      placement: 'above',
-      width: 'min(240px, calc(100vw - 16px))',
-      onClose: () => {
-        plusButton.setAttribute('aria-expanded', 'false');
-        if (plusController === controller) plusController = null;
-      },
+    controller = openSharedAttachmentMenu({
+      anchor: plusButton, input: attachmentInput, title: 'Add to prompt',
+      onClose: () => { if (plusController === controller) plusController = null; },
     });
     plusController = controller;
-    plusButton.setAttribute('aria-expanded', 'true');
-
-    const title = h('div', { class: 'composer-popover-header' }, h('span', { class: 'composer-popover-title' }, 'Add to prompt'));
-    const upload = h('button', {
-      class: 'composer-command-item',
-      type: 'button',
-      role: 'menuitem',
-      onclick: () => {
-        controller.close();
-        attachmentInput.click();
-      },
-    },
-    h('span', { class: 'composer-command-check', 'aria-hidden': 'true' }, ''),
-    h('span', { class: 'composer-command-copy' }, h('span', { class: 'composer-command-name' }, 'Upload files')),
-    );
-    replace(controller.popover, title, h('div', { class: 'composer-command-list' }, upload));
-    controller.focusFirst();
     return controller;
   }
 

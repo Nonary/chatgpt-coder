@@ -17,7 +17,7 @@ async function recoverUnconfirmedSubmissions(taskService) {
   const tasks = await taskService.listTasks();
   return Promise.all(tasks.map((task) => {
     if (task.state !== 'submitted' || isChatGPTConversationUrl(task.conversationUrl)) return task;
-    return taskService.updateTask(task.taskId, {
+    return taskService.transitionTask(task.taskId, ['submitted'], {
       state: 'prepared',
       submittedAt: null,
       conversationUrl: null,
@@ -26,7 +26,7 @@ async function recoverUnconfirmedSubmissions(taskService) {
       chatStatus: null,
       chatStatusRaw: null,
       chatFinishedAt: null,
-    });
+    }, 'recover it as prepared');
   }));
 }
 

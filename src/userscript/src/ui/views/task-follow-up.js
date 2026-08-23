@@ -3,8 +3,6 @@ const {
   appendPromptId,
   appendSkillId,
   closeComposerPopover,
-  createComposerPopover,
-  filterComposerCommands,
   findSlashCommand,
   promptCommandName,
   removePromptId,
@@ -12,25 +10,19 @@ const {
   removeSkillId,
   skillCommandName,
 } = require('../composer-controls');
-const { MODEL_LABELS, REASONING_LABELS, TASK_MODE_LABELS } = require('../labels');
-const { taskModelSupportsReasoning } = require('../../../../shared/chatgpt');
-const { MODE_OPTIONS } = require('./composer');
-
-function promptDescription(prompt) {
-  const description = String(prompt?.description || prompt?.content || '').replace(/\s+/g, ' ').trim();
-  return description ? description.slice(0, 180) : 'Saved instructions.';
-}
-
-function compactModelLabel(model) {
-  return MODEL_LABELS[model] || MODEL_LABELS.default;
-}
-
-function compactReasoningLabel(reasoningMode) {
-  return reasoningMode === 'default' ? 'Auto' : REASONING_LABELS[reasoningMode] || 'Auto';
-}
+const { TASK_MODE_LABELS } = require('../labels');
+const {
+  compactModelLabel,
+  compactReasoningLabel,
+  configurationLabel,
+  openAttachmentMenu: openSharedAttachmentMenu,
+  openCommandPicker: openSharedCommandPicker,
+  openModeMenu: openSharedModeMenu,
+  promptDescription,
+} = require('../composer-common');
 
 function followUpConfigurationLabel(followUp) {
-  return `${compactModelLabel(followUp.model)} · ${compactReasoningLabel(followUp.reasoningMode)}`;
+  return configurationLabel(followUp);
 }
 
 function canFollowUp(task) {
@@ -50,11 +42,6 @@ function canSendFollowUp(task, followUp) {
   return canFollowUp(task)
     && !activeTurn(task)
     && Boolean(String(followUp?.taskText || '').trim());
-}
-
-function moveActiveIndex(current, delta, length) {
-  if (length <= 0) return 0;
-  return (current + delta + length) % length;
 }
 
 function renderTurnState(turn) {
@@ -96,31 +83,6 @@ function restoreFocus(ctx, cursor) {
     const position = Math.min(Number(cursor) || 0, input.value.length);
     input.setSelectionRange(position, position);
   });
-}
-
-function renderCommandGroup(label, commands, activeIndex, onSelect, onHover, selectedIds) {
-  if (!commands.length) return [];
-  return [
-    h('div', { class: 'composer-command-group-label' }, label),
-    ...commands.map((command) => h(
-      'button',
-      {
-        class: `composer-command-item${command.index === activeIndex ? ' active' : ''}`,
-        type: 'button',
-        role: 'menuitem',
-        'aria-selected': String(selectedIds.has(command.id)),
-        onclick: () => onSelect(command),
-        onmouseenter: () => onHover(command.index),
-      },
-      h('span', { class: 'composer-command-check', 'aria-hidden': 'true' }, selectedIds.has(command.id) ? '✓' : ''),
-      h(
-        'span',
-        { class: 'composer-command-copy' },
-        h('span', { class: 'composer-command-name' }, `/${command.name}`),
-        h('span', { class: 'composer-command-description' }, command.description),
-      ),
-    )),
-  ];
 }
 
 function renderTaskFollowUpComposer(ctx, task, existing = null) {
@@ -401,220 +363,59 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
   }
 
   function openCommandPicker() {
-    const initialToken = findSlashCommand(taskText.value, taskText.selectionStart);
-    if (!initialToken || Boolean(activeTurn(taskRef)) || Boolean(taskRef.applyInProgress)) return null;
-    let activeIndex = 0;
-    let controller;
-    controller = createComposerPopover({
+    const controller = openSharedCommandPicker({
       anchor: taskText,
-      placement: 'above',
-      width: 'min(380px, calc(100vw - 16px))',
-      onClose: () => {
-        if (commandPickerController === controller) commandPickerController = null;
+      buildCommands,
+      selectedIds: () => new Set([...ctx.store.state.followUp.skillIds, ...ctx.store.state.followUp.promptIds]),
+      selectCommand: (command, picker) => {
+        const token = findSlashCommand(taskText.value, taskText.selectionStart);
+        if (!token) { picker.close(); return false; }
+        const removal = removeSlashCommandToken(taskText.value, token);
+        const patch = command.type === 'skill'
+          ? { skillIds: appendSkillId(ctx.store.state.followUp.skillIds, command.id), taskText: removal.text }
+          : { promptIds: appendPromptId(ctx.store.state.followUp.promptIds, command.id), taskText: removal.text };
+        ctx.store.setFollowUp(patch, 'silent'); picker.close(); refreshTaskFollowUp(); restoreFocus(ctx, removal.cursor); return true;
       },
+      emptyText: (token) => token.query ? `No commands match /${token.query}.` : 'No commands are available for this task.',
+      onClose: () => { if (commandPickerController === controller) commandPickerController = null; },
     });
     commandPickerController = controller;
-    const header = h('div', { class: 'composer-popover-header' }, h('span', { class: 'composer-popover-title' }, 'Commands'), h('span', { class: 'composer-popover-hint' }, '↑ ↓ Enter · Tab'));
-    const list = h('div', { class: 'composer-command-list' });
-    replace(controller.popover, header, list);
-
-    function matchingCommands(token) {
-      return filterComposerCommands(buildCommands(), token.query);
-    }
-
-    function selectCommand(command) {
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      if (!token) {
-        controller.close();
-        return false;
-      }
-      const removal = removeSlashCommandToken(taskText.value, token);
-      const next = command.type === 'skill'
-        ? { skillIds: appendSkillId(ctx.store.state.followUp.skillIds, command.id), taskText: removal.text }
-        : { promptIds: appendPromptId(ctx.store.state.followUp.promptIds, command.id), taskText: removal.text };
-      ctx.store.setFollowUp(next, 'silent');
-      controller.close();
-      refreshTaskFollowUp();
-      restoreFocus(ctx, removal.cursor);
-      return true;
-    }
-
-    function renderCommandList() {
-      if (!controller.isOpen()) return;
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      if (!token) {
-        controller.close();
-        return;
-      }
-      const matches = matchingCommands(token).map((command, index) => ({ ...command, index }));
-      activeIndex = Math.min(activeIndex, Math.max(0, matches.length - 1));
-      const selectedIds = new Set([...ctx.store.state.followUp.skillIds, ...ctx.store.state.followUp.promptIds]);
-      const setActiveCommand = (index) => {
-        activeIndex = index;
-        list.querySelectorAll('.composer-command-item').forEach((item, itemIndex) => {
-          item.classList.toggle('active', itemIndex === activeIndex);
-        });
-      };
-      const children = [
-        ...renderCommandGroup('Skills', matches.filter((command) => command.type === 'skill'), activeIndex, selectCommand, setActiveCommand, selectedIds),
-        ...renderCommandGroup('Prompts', matches.filter((command) => command.type === 'prompt'), activeIndex, selectCommand, setActiveCommand, selectedIds),
-      ];
-      if (children.length === 0) children.push(h('div', { class: 'composer-empty' }, token.query ? `No commands match /${token.query}.` : 'No commands are available for this task.'));
-      replace(list, ...children);
-      controller.reposition();
-    }
-
-    controller.refresh = renderCommandList;
-    controller.move = (delta) => {
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      const matches = token ? matchingCommands(token) : [];
-      if (!matches.length) return;
-      activeIndex = moveActiveIndex(activeIndex, delta, matches.length);
-      renderCommandList();
-      list.querySelectorAll('.composer-command-item')[activeIndex]?.scrollIntoView({ block: 'nearest' });
-    };
-    controller.selectActive = () => {
-      const token = findSlashCommand(taskText.value, taskText.selectionStart);
-      const matches = token ? matchingCommands(token) : [];
-      return matches.length ? selectCommand(matches[activeIndex]) : false;
-    };
-    controller.popover.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown') { event.preventDefault(); controller.move(1); }
-      else if (event.key === 'ArrowUp') { event.preventDefault(); controller.move(-1); }
-      else if (event.key === 'Enter' || event.key === 'Tab' || event.key === ' ') { event.preventDefault(); controller.selectActive(); }
-    });
-    renderCommandList();
     return controller;
   }
 
   function openModelMenu() {
-    const currentFollowUp = ctx.store.state.followUp;
-    const modelChoices = Object.entries(MODEL_LABELS).map(([value, label]) => ({ kind: 'model', value, label }));
-    const reasoningChoices = Object.entries(REASONING_LABELS)
-      .filter(([value]) => taskModelSupportsReasoning(currentFollowUp.model, value))
-      .map(([value, label]) => ({ kind: 'reasoning', value, label }));
-    const choices = [...modelChoices, ...reasoningChoices];
-    let activeIndex = Math.max(0, choices.findIndex((choice) => choice.kind === 'model'
-      ? currentFollowUp.model === choice.value
-      : currentFollowUp.reasoningMode === choice.value));
     let controller;
-    controller = createComposerPopover({
+    controller = openSharedModelMenu({
       anchor: modelButton,
-      align: 'end',
-      placement: 'above',
-      width: 'min(280px, calc(100vw - 16px))',
-      onClose: () => { modelButton.setAttribute('aria-expanded', 'false'); if (modelController === controller) modelController = null; },
+      getConfiguration: () => ctx.store.state.followUp,
+      setConfiguration: (patch) => ctx.store.setFollowUp(patch, 'silent'),
+      onRefresh: refreshTaskFollowUp,
+      onClose: () => { if (modelController === controller) modelController = null; },
     });
     modelController = controller;
-    modelButton.setAttribute('aria-expanded', 'true');
-    const list = h('div', { class: 'composer-command-list' });
-    replace(controller.popover, list);
-    const isChecked = (choice) => choice.kind === 'model'
-      ? ctx.store.state.followUp.model === choice.value
-      : ctx.store.state.followUp.reasoningMode === choice.value;
-    const selectChoice = (choice) => {
-      if (choice.kind === 'model') {
-        const reasoningMode = taskModelSupportsReasoning(choice.value, ctx.store.state.followUp.reasoningMode)
-          ? ctx.store.state.followUp.reasoningMode
-          : 'default';
-        ctx.store.setFollowUp({ model: choice.value, reasoningMode }, 'silent');
-      } else {
-        ctx.store.setFollowUp({ reasoningMode: choice.value }, 'silent');
-      }
-      controller.close();
-      refreshTaskFollowUp();
-    };
-    const renderChoices = () => {
-      replace(list,
-        h('div', { class: 'composer-command-group-label' }, 'Model'),
-        ...modelChoices.map((choice) => h('button', { class: 'composer-command-item', type: 'button', role: 'menuitemradio', 'aria-checked': String(isChecked(choice)), onclick: () => selectChoice(choice) },
-          h('span', { class: 'composer-command-check' }, isChecked(choice) ? '✓' : ''), h('span', { class: 'composer-command-copy' }, h('span', { class: 'composer-command-name' }, choice.label)))),
-        h('div', { class: 'composer-command-group-label' }, 'Reasoning'),
-        ...reasoningChoices.map((choice) => h('button', { class: 'composer-command-item', type: 'button', role: 'menuitemradio', 'aria-checked': String(isChecked(choice)), onclick: () => selectChoice(choice) },
-          h('span', { class: 'composer-command-check' }, isChecked(choice) ? '✓' : ''), h('span', { class: 'composer-command-copy' }, h('span', { class: 'composer-command-name' }, choice.label)))));
-      controller.reposition();
-    };
-    const syncActiveChoice = () => {
-      list.querySelectorAll('.composer-command-item').forEach((item, index) => {
-        item.classList.toggle('active', index === activeIndex);
-      });
-    };
-    renderChoices();
-    list.querySelectorAll('.composer-command-item').forEach((item, index) => {
-      item.onmouseenter = () => {
-        activeIndex = index;
-        syncActiveChoice();
-      };
-    });
-    controller.move = (delta) => {
-      activeIndex = moveActiveIndex(activeIndex, delta, choices.length);
-      syncActiveChoice();
-      list.querySelectorAll('.composer-command-item')[activeIndex]?.scrollIntoView({ block: 'nearest' });
-    };
-    controller.selectActive = () => selectChoice(choices[activeIndex]);
     return controller;
   }
 
   function openModeMenu() {
-    const currentFollowUp = ctx.store.state.followUp;
-    let activeIndex = Math.max(0, MODE_OPTIONS.findIndex((mode) => mode.value === currentFollowUp.mode));
     let controller;
-    controller = createComposerPopover({
+    controller = openSharedModeMenu({
       anchor: modeButton,
-      align: 'end',
-      placement: 'above',
-      width: 'min(320px, calc(100vw - 16px))',
-      onClose: () => { modeButton.setAttribute('aria-expanded', 'false'); if (modeController === controller) modeController = null; },
+      getMode: () => ctx.store.state.followUp.mode,
+      setMode: (mode) => ctx.store.setFollowUp({ mode }, 'silent'),
+      onRefresh: refreshTaskFollowUp,
+      onClose: () => { if (modeController === controller) modeController = null; },
     });
     modeController = controller;
-    modeButton.setAttribute('aria-expanded', 'true');
-    const list = h('div', { class: 'composer-command-list' });
-    replace(controller.popover, list);
-    const selectMode = (mode) => {
-      ctx.store.setFollowUp({ mode }, 'silent');
-      controller.close();
-      refreshTaskFollowUp();
-    };
-    replace(list, ...MODE_OPTIONS.map((mode) => h('button', { class: 'composer-command-item', type: 'button', role: 'menuitemradio', 'aria-checked': String(currentFollowUp.mode === mode.value), onclick: () => selectMode(mode.value) },
-        h('span', { class: 'composer-command-check' }, currentFollowUp.mode === mode.value ? '✓' : ''),
-        h('span', { class: 'composer-command-copy' }, h('span', { class: 'composer-command-name' }, mode.label), h('span', { class: 'composer-command-description' }, mode.description)))));
-    controller.reposition();
-    const syncActiveMode = () => {
-      list.querySelectorAll('.composer-command-item').forEach((item, index) => item.classList.toggle('active', index === activeIndex));
-    };
-    list.querySelectorAll('.composer-command-item').forEach((item, index) => {
-      item.onmouseenter = () => {
-        activeIndex = index;
-        syncActiveMode();
-      };
-    });
-    controller.move = (delta) => {
-      activeIndex = moveActiveIndex(activeIndex, delta, MODE_OPTIONS.length);
-      syncActiveMode();
-      list.querySelectorAll('.composer-command-item')[activeIndex]?.scrollIntoView({ block: 'nearest' });
-    };
-    controller.selectActive = () => selectMode(MODE_OPTIONS[activeIndex].value);
-    syncActiveMode();
     return controller;
   }
 
   function openPlusMenu() {
     let controller;
-    controller = createComposerPopover({
-      anchor: plusButton,
-      align: 'start',
-      placement: 'above',
-      width: 'min(240px, calc(100vw - 16px))',
-      onClose: () => { plusButton.setAttribute('aria-expanded', 'false'); if (plusController === controller) plusController = null; },
+    controller = openSharedAttachmentMenu({
+      anchor: plusButton, input: attachmentInput, title: 'Add to follow-up',
+      onClose: () => { if (plusController === controller) plusController = null; },
     });
     plusController = controller;
-    plusButton.setAttribute('aria-expanded', 'true');
-    replace(controller.popover,
-      h('div', { class: 'composer-popover-header' }, h('span', { class: 'composer-popover-title' }, 'Add to follow-up')),
-      h('div', { class: 'composer-command-list' }, h('button', { class: 'composer-command-item', type: 'button', onclick: () => { controller.close(); attachmentInput.click(); } },
-        h('span', { class: 'composer-command-check' }, ''), h('span', { class: 'composer-command-copy' }, h('span', { class: 'composer-command-name' }, 'Upload files')))),
-    );
-    controller.focusFirst();
     return controller;
   }
 

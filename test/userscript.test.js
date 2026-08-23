@@ -1007,11 +1007,13 @@ test('new task composers default to Ask mode', () => {
 
 test('repository scope is shared by New Task and multi-repository Source Control', () => {
   const appSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'), 'utf8');
+  const storeSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'store.js'), 'utf8');
   const sourceView = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'source.js'), 'utf8');
   const pickerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'dialogs', 'repository-picker.js'), 'utf8');
 
   assert.match(appSource, /setRepositoryScope\(paths/);
-  assert.match(appSource, /composer\.repositories = normalized\.map/);
+  assert.match(appSource, /store\.setRepositoryScope\(paths, reason\)/);
+  assert.match(storeSource, /composer\.repositories = normalized\.map/);
   assert.match(appSource, /repositoryScopePaths/);
   assert.doesNotMatch(appSource, /selectSourceRepository\(/);
   assert.match(sourceView, /sourceStatuses\[repositoryPath\]/);
@@ -1050,6 +1052,40 @@ test('follow-up composer state stays separate from the new-task composer', () =>
   assert.equal(store.state.followUp.mode, 'agent');
   assert.equal(store.state.followUp.model, 'sol');
   assert.equal(store.state.followUp.reasoningMode, 'medium');
+});
+
+test('the active composer selection owner routes picker changes to the visible draft', () => {
+  const { Store } = require('../src/userscript/src/store');
+  const store = new Store();
+  store.setComposer({ model: 'sol', reasoningMode: 'low' }, 'test');
+  store.resetFollowUp({ taskId: 'task-1', model: 'luna', reasoningMode: 'medium' }, 'test');
+  store.set({ activeTaskId: 'task-1' }, 'test');
+
+  assert.equal(store.setActiveComposerSelection({ model: 'sol', reasoningMode: 'high' }), 'follow-up');
+  assert.deepEqual(
+    { model: store.state.followUp.model, reasoningMode: store.state.followUp.reasoningMode },
+    { model: 'sol', reasoningMode: 'high' },
+  );
+  assert.deepEqual(
+    { model: store.state.composer.model, reasoningMode: store.state.composer.reasoningMode },
+    { model: 'sol', reasoningMode: 'low' },
+  );
+
+  store.set({ activeTaskId: null }, 'test');
+  assert.equal(store.setActiveComposerSelection({ model: 'luna', reasoningMode: 'extra-high' }), 'composer');
+  assert.deepEqual(
+    { model: store.state.composer.model, reasoningMode: store.state.composer.reasoningMode },
+    { model: 'luna', reasoningMode: 'extra-high' },
+  );
+});
+
+test('task store ignores stale event snapshots', () => {
+  const { Store } = require('../src/userscript/src/store');
+  const store = new Store();
+  store.upsertTask({ taskId: 'task-1', state: 'applied', revision: 4, updatedAt: '2026-08-23T12:00:04.000Z' });
+  store.upsertTask({ taskId: 'task-1', state: 'ready', revision: 3, updatedAt: '2026-08-23T12:00:03.000Z' });
+  assert.equal(store.task('task-1').state, 'applied');
+  assert.equal(store.task('task-1').revision, 4);
 });
 
 test('follow-up composer is unavailable while the original task is still generating', () => {
@@ -1211,6 +1247,9 @@ test('the userscript bundles every module it requires and keeps its install plac
   assert.match(loader, /@match\s+https:\/\/chatgpt\.com\/\*/);
   assert.match(loader, /@grant\s+GM_xmlhttpRequest/);
   assert.match(loader, /@connect\s+127\.0\.0\.1/);
+  assert.match(loader, /@run-at\s+document-start/);
+  assert.match(loader, /patchwork-chatgpt-websocket-message/);
+  assert.match(loader, /__patchworkChatgptWebSocketWrapped/);
   assert.match(loader, /patchwork\.runtime\.js/);
   assert.ok(loader.includes('__PATCHWORK_TOKEN__'), 'the agent injects the token at download time');
   assert.ok(loader.includes('__PATCHWORK_ORIGIN__'), 'the agent injects its own origin at download time');

@@ -24,6 +24,18 @@ const TASK_MODELS = new Set(['default', 'sol', 'luna']);
 const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high', 'pro']);
 const FOLLOW_UP_MODES = new Set(['ask', 'agent']);
 const FOLLOW_UP_ACTIVE_STATES = new Set(['created', 'submitted', 'awaiting-result']);
+const TERMINAL_TASK_STATES = new Set(['applied', 'rolled-back', 'resolved']);
+const TASK_STATE_TRANSITIONS = new Map([
+  ['prepared', new Set(['submitted', 'completed', 'ready', 'failed', 'conflicted'])],
+  ['submitted', new Set(['prepared', 'completed', 'ready', 'failed', 'conflicted'])],
+  ['completed', new Set(['ready', 'failed', 'conflicted'])],
+  ['ready', new Set(['completed', 'applied', 'failed', 'conflicted'])],
+  ['failed', new Set(['ready', 'applied', 'conflicted'])],
+  ['conflicted', new Set(['applied', 'failed', 'resolved'])],
+  ['applied', new Set(['ready', 'rolled-back'])],
+  ['rolled-back', new Set()],
+  ['resolved', new Set()],
+]);
 
 const DETAILED_COMMIT_MESSAGE_REQUIREMENTS = `Review the final cumulative changes and produce one accurate, detailed Conventional Commit message for the result.
 
@@ -362,6 +374,7 @@ class TaskService {
     this.skillService = skillService;
     this.iacService = iacService;
     this.followUpCreationLocks = new Set();
+    this.taskMutationQueues = new Map();
   }
 
   async initialize() {
@@ -812,6 +825,7 @@ class TaskService {
       }),
       repositories: taskRepositories,
       state: 'prepared',
+      revision: 0,
       result: null,
       turns: [],
       activeTurnId: null,
@@ -832,10 +846,95 @@ class TaskService {
   }
 
   async updateTask(taskId, update) {
-    const task = await this.getTask(taskId);
-    const next = { ...task, ...update, updatedAt: new Date().toISOString() };
-    await this.saveTask(next);
-    return next;
+    return this.mutateTask(taskId, () => update);
+  }
+
+  async queueTaskMutation(taskId, work) {
+    const previous = this.taskMutationQueues.get(taskId) || Promise.resolve();
+    const operation = previous.catch(() => {}).then(work);
+    this.taskMutationQueues.set(taskId, operation);
+    operation.finally(() => {
+      if (this.taskMutationQueues.get(taskId) === operation) this.taskMutationQueues.delete(taskId);
+    }).catch(() => {});
+    return operation;
+  }
+
+  async mutateTask(taskId, mutate) {
+    return this.queueTaskMutation(taskId, async () => {
+      const task = await this.getTask(taskId);
+      const update = await mutate(task);
+      if (!update) return task;
+      if (update.state && update.state !== task.state
+        && !TASK_STATE_TRANSITIONS.get(task.state)?.has(update.state)) {
+        throw new Error(`Invalid task state transition: ${task.state} -> ${update.state}.`);
+      }
+      const next = {
+        ...task,
+        ...update,
+        revision: Number.isSafeInteger(task.revision) ? task.revision + 1 : 1,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.saveTask(next);
+      return next;
+    });
+  }
+
+  async transitionTask(taskId, allowedStates, update, action = 'change state') {
+    const allowed = new Set(allowedStates);
+    return this.mutateTask(taskId, (task) => {
+      if (!allowed.has(task.state)) {
+        throw new Error(`Cannot ${action} while the task is ${task.state}.`);
+      }
+      return typeof update === 'function' ? update(task) : update;
+    });
+  }
+
+  async markSubmitted(taskId, input = {}) {
+    return this.transitionTask(taskId, ['prepared', 'submitted'], (task) => ({
+      state: 'submitted',
+      submittedAt: task.submittedAt || new Date().toISOString(),
+      conversationUrl: input.conversationUrl,
+      conversationId: input.conversationId || task.conversationId || null,
+      conversationTitle: input.conversationTitle || task.conversationTitle || null,
+      chatStatus: 'streaming',
+      chatStatusRaw: 'IS_STREAMING',
+      chatFinishedAt: null,
+      model: input.model || task.model,
+      reasoningMode: input.reasoningMode || task.reasoningMode,
+      error: null,
+    }), 'mark it submitted');
+  }
+
+  async markFailed(taskId, message) {
+    return this.transitionTask(taskId, ['prepared', 'submitted', 'failed'], {
+      state: 'failed',
+      error: message,
+    }, 'mark it failed');
+  }
+
+  async updateChatStatus(taskId, status, rawStatus = null, conversationId = null, message = null) {
+    return this.mutateTask(taskId, (task) => {
+      const turn = followUpTurn(task);
+      if (turn) {
+        if (turn.state === 'awaiting-result') return null;
+        return this.followUpChatStatusUpdate(task, turn, status, conversationId, message);
+      }
+
+      if (TERMINAL_TASK_STATES.has(task.state)) return null;
+      if (['completed', 'failed'].includes(task.chatStatus)) return null;
+
+      const finished = status !== 'streaming';
+      return {
+        state: task.answerOnly && finished ? status : task.state,
+        conversationId: conversationId || task.conversationId || null,
+        chatStatus: status,
+        chatStatusRaw: rawStatus || (status === 'streaming' ? 'IS_STREAMING' : status === 'failed' ? 'FAILURE' : 'COMPLETED'),
+        chatFinishedAt: finished ? task.chatFinishedAt || new Date().toISOString() : null,
+        error: task.answerOnly && status === 'failed'
+          ? (message || 'ChatGPT stopped before completing the answer.')
+          : task.error || null,
+      };
+    });
   }
 
   async updateConversationTitle(taskId, title) {
@@ -912,34 +1011,46 @@ class TaskService {
         resumeChatStatus: task.chatStatus || null,
       };
 
-      let repositories = task.repositories;
-      let resultFilename = task.resultFilename;
-      let resultTransport = task.resultTransport;
-      if (mode === 'agent' && task.answerOnly) {
-        repositories = (Array.isArray(task.repositories) ? task.repositories : []).map((repository) => {
-          const configuredAccess = repository.configuredAccess || repository.access || 'edit';
-          const readOnly = configuredAccess === 'context';
-          return {
-            ...repository,
-            readOnly,
-            access: readOnly ? 'context' : 'edit',
-          };
-        });
-        resultFilename = resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
-        resultTransport = 'downloaded-text-file';
-      }
+      return this.mutateTask(taskId, (current) => {
+        if (current.state === 'conflicted') throw new Error('Resolve the task conflict before starting a normal follow-up.');
+        if (current.state === 'failed') throw new Error('This task is in a failed state and cannot accept another follow-up.');
+        if (current.state === 'submitted') throw new Error('The task is still generating its current response. Wait for it to finish before starting a follow-up.');
+        if (current.applyInProgress) throw new Error('The task result is being applied. Wait for the apply operation to finish.');
+        if (followUpTurn(current)) throw new Error('Another follow-up turn is already active for this task.');
 
-      return this.updateTask(taskId, {
-        repositories,
-        resultFilename,
-        resultTransport,
-        conversationId,
-        turns: [...(Array.isArray(task.turns) ? task.turns : []), turn],
-        activeTurnId: turn.id,
-        chatStatus: 'streaming',
-        chatStatusRaw: 'IS_STREAMING',
-        chatFinishedAt: null,
-        error: null,
+        let currentRepositories = current.repositories;
+        let currentResultFilename = current.resultFilename;
+        let currentResultTransport = current.resultTransport;
+        if (mode === 'agent' && current.answerOnly) {
+          currentRepositories = (Array.isArray(current.repositories) ? current.repositories : []).map((repository) => {
+            const configuredAccess = repository.configuredAccess || repository.access || 'edit';
+            const readOnly = configuredAccess === 'context';
+            return {
+              ...repository,
+              readOnly,
+              access: readOnly ? 'context' : 'edit',
+            };
+          });
+          currentResultFilename = currentResultFilename || `chatgpt-ide-result-${current.taskId}.txt`;
+          currentResultTransport = 'downloaded-text-file';
+        }
+        const currentTurn = {
+          ...turn,
+          resumeState: current.state,
+          resumeChatStatus: current.chatStatus || null,
+        };
+        return {
+          repositories: currentRepositories,
+          resultFilename: currentResultFilename,
+          resultTransport: currentResultTransport,
+          conversationId: current.conversationId || conversationId,
+          turns: [...(Array.isArray(current.turns) ? current.turns : []), currentTurn],
+          activeTurnId: currentTurn.id,
+          chatStatus: 'streaming',
+          chatStatusRaw: 'IS_STREAMING',
+          chatFinishedAt: null,
+          error: null,
+        };
       });
     } finally {
       this.followUpCreationLocks.delete(taskId);
@@ -947,43 +1058,34 @@ class TaskService {
   }
 
   async markFollowUpSubmitted(taskId, turnId, input = {}) {
-    const task = await this.getTask(taskId);
-    const turn = followUpTurn(task);
-    if (!turn || turn.id !== turnId) throw new Error('The follow-up turn is no longer active.');
-    if (!['created', 'submitted'].includes(turn.state)) throw new Error('The follow-up turn is no longer waiting to be submitted.');
-    const submittedAt = turn.submittedAt || new Date().toISOString();
-    const turns = (task.turns || []).map((item) => (item.id === turnId
-      ? {
-        ...item,
-        state: 'submitted',
-        submittedAt,
-        conversationId: input.conversationId || item.conversationId || task.conversationId || null,
-        model: input.model || item.model,
-        reasoningMode: input.reasoningMode || item.reasoningMode,
+    return this.mutateTask(taskId, (task) => {
+      const turn = followUpTurn(task);
+      if (!turn || turn.id !== turnId) throw new Error('The follow-up turn is no longer active.');
+      if (!['created', 'submitted'].includes(turn.state)) throw new Error('The follow-up turn is no longer waiting to be submitted.');
+      const submittedAt = turn.submittedAt || new Date().toISOString();
+      const turns = (task.turns || []).map((item) => (item.id === turnId
+        ? {
+          ...item,
+          state: 'submitted',
+          submittedAt,
+          conversationId: input.conversationId || item.conversationId || task.conversationId || null,
+          model: input.model || item.model,
+          reasoningMode: input.reasoningMode || item.reasoningMode,
+          error: null,
+        }
+        : item));
+      return {
+        turns,
+        conversationId: input.conversationId || task.conversationId || turn.conversationId || null,
+        chatStatus: 'streaming',
+        chatStatusRaw: 'IS_STREAMING',
+        chatFinishedAt: null,
         error: null,
-      }
-      : item));
-    return this.updateTask(taskId, {
-      turns,
-      conversationId: input.conversationId || task.conversationId || turn.conversationId || null,
-      chatStatus: 'streaming',
-      chatStatusRaw: 'IS_STREAMING',
-      chatFinishedAt: null,
-      error: null,
+      };
     });
   }
 
-  async updateFollowUpChatStatus(taskId, status, conversationId = null, message = null) {
-    const task = await this.getTask(taskId);
-    const turn = followUpTurn(task);
-    if (!turn) {
-      return this.updateTask(taskId, {
-        conversationId: conversationId || task.conversationId || null,
-        chatStatus: status,
-        chatStatusRaw: status === 'streaming' ? 'IS_STREAMING' : status === 'failed' ? 'FAILURE' : 'COMPLETED',
-        chatFinishedAt: status === 'streaming' ? null : task.chatFinishedAt || new Date().toISOString(),
-      });
-    }
+  followUpChatStatusUpdate(task, turn, status, conversationId = null, message = null) {
     const now = new Date().toISOString();
     const turns = (task.turns || []).map((item) => {
       if (item.id !== turn.id) return item;
@@ -1013,7 +1115,7 @@ class TaskService {
     const nextState = completed && !task.result && ['prepared', 'submitted'].includes(task.state)
       ? 'completed'
       : task.state;
-    return this.updateTask(taskId, {
+    return {
       state: failed ? task.state : nextState,
       conversationId: conversationId || task.conversationId || turn.conversationId || null,
       chatStatus: status,
@@ -1022,40 +1124,48 @@ class TaskService {
       turns,
       activeTurnId: completed || failed ? null : turn.id,
       error: failed ? (message || 'ChatGPT stopped before completing the follow-up.') : null,
+    };
+  }
+
+  async updateFollowUpChatStatus(taskId, status, conversationId = null, message = null, expectedTurnId = null) {
+    return this.mutateTask(taskId, (task) => {
+      const turn = followUpTurn(task);
+      if (!turn) return null;
+      if (expectedTurnId && turn.id !== expectedTurnId) {
+        throw new Error('The follow-up turn is no longer active.');
+      }
+      return this.followUpChatStatusUpdate(task, turn, status, conversationId, message);
     });
   }
 
   async failFollowUp(taskId, turnId, message) {
-    const task = await this.getTask(taskId);
-    const turn = followUpTurn(task);
-    if (!turn || turn.id !== turnId) throw new Error('The follow-up turn is no longer active.');
-    return this.updateFollowUpChatStatus(taskId, 'failed', null, message);
+    return this.updateFollowUpChatStatus(taskId, 'failed', null, message, turnId);
   }
 
   async completeFollowUpResult(taskId, turnId, resultSourceFile, taskState = null) {
-    const task = await this.getTask(taskId);
-    const turn = followUpTurn(task);
-    if (!turn || turn.id !== turnId) return task;
-    const now = new Date().toISOString();
-    const turns = (task.turns || []).map((item) => (item.id === turnId
-      ? {
-        ...item,
-        state: ['failed', 'conflicted'].includes(taskState || task.state) ? 'failed' : 'completed',
-        completedAt: ['failed', 'conflicted'].includes(taskState || task.state) ? null : now,
-        failedAt: ['failed', 'conflicted'].includes(taskState || task.state) ? now : null,
-        error: ['failed', 'conflicted'].includes(taskState || task.state)
-          ? (task.error || 'The follow-up result could not be applied.')
-          : null,
-        resultSourceFile: resultSourceFile || item.resultSourceFile || null,
-      }
-      : item));
-    return this.updateTask(taskId, {
-      turns,
-      activeTurnId: null,
-      chatStatus: ['failed', 'conflicted'].includes(taskState || task.state) ? 'failed' : 'completed',
-      chatStatusRaw: ['failed', 'conflicted'].includes(taskState || task.state) ? 'FAILURE' : 'COMPLETED',
-      chatFinishedAt: task.chatFinishedAt || now,
-      error: ['failed', 'conflicted'].includes(taskState || task.state) ? task.error : null,
+    return this.mutateTask(taskId, (task) => {
+      const turn = followUpTurn(task);
+      if (!turn || turn.id !== turnId) return null;
+      const now = new Date().toISOString();
+      const failed = ['failed', 'conflicted'].includes(taskState || task.state);
+      const turns = (task.turns || []).map((item) => (item.id === turnId
+        ? {
+          ...item,
+          state: failed ? 'failed' : 'completed',
+          completedAt: failed ? null : now,
+          failedAt: failed ? now : null,
+          error: failed ? (task.error || 'The follow-up result could not be applied.') : null,
+          resultSourceFile: resultSourceFile || item.resultSourceFile || null,
+        }
+        : item));
+      return {
+        turns,
+        activeTurnId: null,
+        chatStatus: failed ? 'failed' : 'completed',
+        chatStatusRaw: failed ? 'FAILURE' : 'COMPLETED',
+        chatFinishedAt: task.chatFinishedAt || now,
+        error: failed ? task.error : null,
+      };
     });
   }
 
@@ -1073,28 +1183,40 @@ class TaskService {
     if (!repositoryPath) throw new Error('Choose a valid task target.');
     const repository = await inspectRepository(repositoryPath);
     const targetTree = target.tree || null;
-    const writableId = writableRepositories[0].id;
-    const repositories = task.repositories.map((entry) => (entry.id === writableId
-      ? {
-        ...entry,
-        name: repository.name,
-        path: repository.path,
-        branch: repository.branch,
-        readOnly: false,
+    return this.mutateTask(taskId, (current) => {
+      if (TERMINAL_TASK_STATES.has(current.state)) {
+        throw new Error('This task can no longer change its apply target.');
       }
-      : entry));
-    return this.updateTask(taskId, {
-      treeId: targetTree?.id || null,
-      treeName: targetTree?.name || null,
-      sourceRepositoryPath: task.sourceRepositoryPath || targetTree?.repositoryPath || repository.path,
-      repositories,
+      const currentWritable = (Array.isArray(current.repositories) ? current.repositories : [])
+        .filter((entry) => !entry.readOnly);
+      if (currentWritable.length !== 1) {
+        throw new Error('Coding trees currently support one editable repository for this task.');
+      }
+      const writableId = currentWritable[0].id;
+      const repositories = current.repositories.map((entry) => (entry.id === writableId
+        ? {
+          ...entry,
+          name: repository.name,
+          path: repository.path,
+          branch: repository.branch,
+          readOnly: false,
+        }
+        : entry));
+      return {
+        treeId: targetTree?.id || null,
+        treeName: targetTree?.name || null,
+        sourceRepositoryPath: current.sourceRepositoryPath || targetTree?.repositoryPath || repository.path,
+        repositories,
+      };
     });
   }
 
   async deleteTask(taskId) {
-    const task = await this.getTask(taskId);
-    await fs.rm(this.taskDirectory(task.taskId), { recursive: true, force: true });
-    return task;
+    return this.queueTaskMutation(taskId, async () => {
+      const task = await this.getTask(taskId);
+      await fs.rm(this.taskDirectory(task.taskId), { recursive: true, force: true });
+      return task;
+    });
   }
 
   async listTasks() {
