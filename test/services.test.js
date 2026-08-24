@@ -1571,6 +1571,62 @@ test('a downloaded text result file validates and applies automatically', async 
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'plain text result\n');
 });
 
+test('plain-text result fields may mention the result end marker', () => {
+  const responseText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: 'task-with-marker-reference',
+    status: 'completed',
+    summary: 'The payload includes the required PATCHWORK_RESULT_END marker.',
+    commitMessage: 'fix(results): preserve marker references in metadata',
+    repositories: [],
+  })}\nPATCHWORK_RESULT_END`;
+
+  assert.equal(parsePlainTextResult(responseText).taskId, 'task-with-marker-reference');
+});
+
+test('a corrected result can replace an invalid result on a failed task', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-result-retry-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Retry a malformed result.', repositories: [repository], autoApply: false,
+  });
+  const results = new ResultService(tasks);
+
+  await assert.rejects(
+    results.ingestResult(task.taskId, 'Rejecting malformed result…', (current) => (
+      results.readPlainTextResult(current, 'PATCHWORK_RESULT_V1\n{"broken":\nPATCHWORK_RESULT_END')
+    )),
+    /invalid JSON/,
+  );
+  assert.equal((await tasks.getTask(task.taskId)).state, 'failed');
+
+  const responseText = `PATCHWORK_RESULT_V1\n${JSON.stringify({
+    schemaVersion: 2,
+    transport: 'plain-text-base64',
+    taskId: task.taskId,
+    status: 'completed',
+    summary: 'Recovered the corrected result.',
+    commitMessage: 'fix(results): retry a corrected result',
+    repositories: [{
+      id: repository.id,
+      baseCommit: repository.baseCommit,
+      patchEncoding: 'base64',
+      patch: '',
+    }],
+  })}\nPATCHWORK_RESULT_END`;
+  const recovered = await results.ingestResult(task.taskId, 'Retrying corrected result…', (current) => (
+    results.readPlainTextResult(current, responseText)
+  ));
+
+  assert.equal(recovered.state, 'ready');
+  assert.equal(recovered.error, null);
+});
+
 test('coding trees commit task results, accept follow-ups, and squash merge', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));

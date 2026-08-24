@@ -64,6 +64,7 @@ class Driver {
     this.stopSocketWatch = null;
     this.reconcileRetryTimer = null;
     this.seenTaskResultFiles = new Map();
+    this.pendingTaskResultFiles = new Map();
   }
 
   stop() {
@@ -84,6 +85,7 @@ class Driver {
       this.activeTaskId = null;
     }
     this.seenTaskResultFiles.delete(taskId);
+    this.pendingTaskResultFiles.delete(taskId);
   }
 
   async submitTask(task, { project = undefined } = {}) {
@@ -425,6 +427,38 @@ class Driver {
     return Boolean(key && this.resultFileSet(taskId).has(key));
   }
 
+  pendingResultFileSet(taskId) {
+    let files = this.pendingTaskResultFiles.get(taskId);
+    if (!files) {
+      files = new Set();
+      this.pendingTaskResultFiles.set(taskId, files);
+    }
+    return files;
+  }
+
+  hasPendingResultFile(taskId, file) {
+    const key = chatgpt.resultFileKey(file);
+    return Boolean(key && this.pendingResultFileSet(taskId).has(key));
+  }
+
+  beginResultFile(taskId, file, { includeSeen = false } = {}) {
+    const key = chatgpt.resultFileKey(file);
+    if (!key || this.pendingResultFileSet(taskId).has(key)) return false;
+    if (!includeSeen && this.hasSeenResultFile(taskId, file)) return false;
+    this.pendingResultFileSet(taskId).add(key);
+    return true;
+  }
+
+  finishResultFile(taskId, file, { success = false } = {}) {
+    const key = chatgpt.resultFileKey(file);
+    if (key) this.pendingResultFileSet(taskId).delete(key);
+    if (success) this.rememberResultFile(taskId, file);
+  }
+
+  hasHandledResultFile(taskId, file) {
+    return this.hasSeenResultFile(taskId, file) || this.hasPendingResultFile(taskId, file);
+  }
+
   resultFileMatches(task, candidate) {
     const expectedName = String(task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`);
     const expected = expectedName.toLowerCase();
@@ -468,6 +502,7 @@ class Driver {
     const currentSourceKey = chatgpt.resultFileKey(task.result?.sourceFile);
     const newestKey = chatgpt.resultFileKey(newest);
     if (currentSourceKey && newestKey === currentSourceKey) this.rememberResultFile(task.taskId, newest);
+    if (this.hasPendingResultFile(task.taskId, newest)) return null;
     if (!includeSeen && this.hasSeenResultFile(task.taskId, newest)) return null;
     return newest;
   }
@@ -499,7 +534,9 @@ class Driver {
     }
     if (turn?.mode === 'agent') {
       if (status !== 'completed') return statusTask;
-      return this.ingestTaskResult(statusTask, conversationId, conversationRecord)
+      return this.ingestTaskResult(statusTask, conversationId, conversationRecord, {
+        includeSeen: statusTask.state === 'failed' && !statusTask.result,
+      })
         .then((updated) => updated || statusTask)
         .catch((error) => {
           this.report({ type: 'task-result-error', taskId: task.taskId, message: error.message });
@@ -565,7 +602,7 @@ class Driver {
         includeSeen ? null : (candidate) => {
           const turn = activeFollowUp(task);
           if (turn?.mode === 'agent' && !resultFileFreshForTurn(candidate, turn)) return false;
-          return !this.hasSeenResultFile(task.taskId, candidate);
+            return !this.hasHandledResultFile(task.taskId, candidate);
         },
       ) : null);
     if (!file) return null;
@@ -576,23 +613,35 @@ class Driver {
       taskId: task.taskId,
       message: `Downloading ${file.name}…`,
     });
-    this.rememberResultFile(task.taskId, file);
-    const text = await chatgpt.downloadFileText(file, conversationId);
-    const { task: updated } = await this.api.taskResult(task.taskId, text, file);
-    this.activeTaskId = activeFollowUp(updated) || (!updated.answerOnly && updated.state === 'submitted')
-      ? task.taskId
-      : null;
-    return updated;
+    if (!this.beginResultFile(task.taskId, file, { includeSeen })) return null;
+    try {
+      const text = await chatgpt.downloadFileText(file, conversationId);
+      const { task: updated } = await this.api.taskResult(task.taskId, text, file);
+      this.finishResultFile(task.taskId, file, { success: true });
+      this.activeTaskId = activeFollowUp(updated) || (!updated.answerOnly && updated.state === 'submitted')
+        ? task.taskId
+        : null;
+      return updated;
+    } catch (error) {
+      this.finishResultFile(task.taskId, file);
+      throw error;
+    }
   }
 
   async ingestDomResult(task, file) {
     const turn = activeFollowUp(task);
     if (turn?.mode === 'agent' && !resultFileFreshForTurn(file, turn)) return null;
-    this.rememberResultFile(task.taskId, file);
-    const text = await chatgpt.downloadFileText(file, this.conversationIdFor(task));
-    const { task: updated } = await this.api.taskResult(task.taskId, text, file);
-    this.activeTaskId = activeFollowUp(updated) ? task.taskId : null;
-    return updated;
+    if (!this.beginResultFile(task.taskId, file)) return null;
+    try {
+      const text = await chatgpt.downloadFileText(file, this.conversationIdFor(task));
+      const { task: updated } = await this.api.taskResult(task.taskId, text, file);
+      this.finishResultFile(task.taskId, file, { success: true });
+      this.activeTaskId = activeFollowUp(updated) ? task.taskId : null;
+      return updated;
+    } catch (error) {
+      this.finishResultFile(task.taskId, file);
+      throw error;
+    }
   }
 
   watchTask(task, { responseComplete = null, recovery = false } = {}) {
@@ -631,7 +680,7 @@ class Driver {
           ? (file) => {
             const currentTurn = activeFollowUp(currentTask);
             if (currentTurn?.mode === 'agent' && !resultFileFreshForTurn(file, currentTurn)) return false;
-            return !this.hasSeenResultFile(currentTask.taskId, file);
+            return !this.hasHandledResultFile(currentTask.taskId, file);
           }
           : null,
         onFinished: () => finish(),

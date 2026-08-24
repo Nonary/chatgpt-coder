@@ -25,10 +25,13 @@ function parsePlainTextResult(value) {
   if (Buffer.byteLength(text, 'utf8') > MAX_RESULT_BYTES) {
     throw new Error('The plain-text result is larger than the 128 MB safety limit.');
   }
-  const start = text.indexOf(TEXT_RESULT_START);
-  const end = text.indexOf(TEXT_RESULT_END, start + TEXT_RESULT_START.length);
-  if (start < 0 || end < 0) throw new Error('The ChatGPT response does not contain a complete Patchwork result envelope.');
-  let jsonText = text.slice(start + TEXT_RESULT_START.length, end).trim();
+  const startMatch = text.match(new RegExp(`(?:^|\r?\n)${TEXT_RESULT_START}[ \t]*(?:\r?\n)`));
+  if (!startMatch) throw new Error('The ChatGPT response does not contain a complete Patchwork result envelope.');
+  const jsonStart = startMatch.index + startMatch[0].length;
+  const remaining = text.slice(jsonStart);
+  const endMatch = remaining.match(new RegExp(`(?:\r?\n)${TEXT_RESULT_END}[ \t]*(?=\r?\n|$)`));
+  if (!endMatch) throw new Error('The ChatGPT response does not contain a complete Patchwork result envelope.');
+  let jsonText = remaining.slice(0, endMatch.index).trim();
   jsonText = jsonText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
   if (Buffer.byteLength(jsonText, 'utf8') > MAX_MANIFEST_BYTES + (MAX_PATCH_BYTES * 2)) {
     throw new Error('The plain-text result envelope is unexpectedly large.');

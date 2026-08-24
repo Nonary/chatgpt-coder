@@ -272,6 +272,9 @@ function renderTaskDetail(ctx, task, { followUpComposer = null } = {}) {
     ['prepared', 'submitted', 'failed'].includes(task.state)
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.refreshTask(task.taskId) }, 'Refresh status')
       : null,
+    task.state === 'failed' && task.conversationUrl && taskHasAgentTurn(task)
+      ? h('button', { class: 'primary', onclick: () => ctx.actions.retryResult(task.taskId) }, 'Retry result')
+      : null,
     task.conversationUrl
       ? h('button', { class: 'secondary', onclick: () => ctx.actions.openConversation(task.taskId) }, 'Open conversation')
       : null,

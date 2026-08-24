@@ -698,6 +698,16 @@ class App {
         input.click();
       },
 
+      retryResult(taskId) {
+        return app.run(async () => {
+          const current = app.store.task(taskId);
+          if (!current) throw new Error('That task is no longer available.');
+          const task = await app.driver.refreshTaskResult(current);
+          app.store.upsertTask(task);
+          app.renderActiveView();
+        }, { success: 'Result downloaded and validated again.' });
+      },
+
       async deleteTask(taskId) {
         const task = app.store.task(taskId);
         const confirmed = await app.shell.confirm({

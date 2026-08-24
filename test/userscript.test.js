@@ -17,6 +17,38 @@ const {
   taskRequestConfiguration,
 } = require('../src/shared/chatgpt');
 const { element, installDocument, text } = require('./helpers/dom-stub');
+const chatgptApi = require('../src/userscript/src/chatgpt/api');
+const { Driver } = require('../src/userscript/src/driver');
+
+test('failed result ingestion leaves the same generated file retryable', async (context) => {
+  const originalDownloadFileText = chatgptApi.downloadFileText;
+  context.after(() => {
+    chatgptApi.downloadFileText = originalDownloadFileText;
+  });
+  chatgptApi.downloadFileText = async () => 'downloaded result';
+
+  let attempts = 0;
+  const driver = new Driver({
+    api: {
+      taskResult: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('temporary upload failure');
+        return { task: { taskId: 'task-1', state: 'ready', answerOnly: false } };
+      },
+    },
+  });
+  const task = { taskId: 'task-1', conversationId: 'conversation-1', answerOnly: false };
+  const file = { id: 'file-1234567890', name: 'chatgpt-ide-result-task-1.txt' };
+
+  await assert.rejects(driver.ingestDomResult(task, file), /temporary upload failure/);
+  assert.equal(driver.hasSeenResultFile(task.taskId, file), false);
+  assert.equal(driver.hasPendingResultFile(task.taskId, file), false);
+
+  const retried = await driver.ingestDomResult(task, file);
+  assert.equal(retried.state, 'ready');
+  assert.equal(driver.hasSeenResultFile(task.taskId, file), true);
+  assert.equal(attempts, 2);
+});
 
 test('result and merge filenames identify their task even with duplicate suffixes', () => {
   const taskId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
