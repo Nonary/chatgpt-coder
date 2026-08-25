@@ -19,6 +19,38 @@ const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_PATCH_BYTES = 64 * 1024 * 1024;
 const TEXT_RESULT_START = 'PATCHWORK_RESULT_V1';
 const TEXT_RESULT_END = 'PATCHWORK_RESULT_END';
+const LEGACY_RESULT_TRANSPORT = 'legacy-whole-payload-base64';
+
+function parseLegacyPlainTextResult(value) {
+  const encoded = String(value || '').trim();
+  if (!encoded || !/^[a-zA-Z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 !== 0) return null;
+  const decoded = Buffer.from(encoded, 'base64');
+  if (decoded.toString('base64').replace(/=+$/, '') !== encoded.replace(/=+$/, '')) return null;
+
+  let manifest;
+  try {
+    manifest = JSON.parse(decoded.toString('utf8'));
+  } catch {
+    return null;
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
+    || typeof manifest.taskId !== 'string'
+    || typeof manifest.commitMessage !== 'string'
+    || !Array.isArray(manifest.repositories)
+    || manifest.repositories.some((item) => (
+      !item || typeof item !== 'object' || Array.isArray(item)
+      || typeof item.id !== 'string' || typeof item.patch !== 'string'
+    ))) {
+    return null;
+  }
+  return {
+    ...manifest,
+    schemaVersion: 1,
+    transport: LEGACY_RESULT_TRANSPORT,
+    status: 'completed',
+    summary: String(manifest.summary || ''),
+  };
+}
 
 function parsePlainTextResult(value) {
   const text = String(value || '');
@@ -30,7 +62,11 @@ function parsePlainTextResult(value) {
   const jsonStart = startMatch.index + startMatch[0].length;
   const remaining = text.slice(jsonStart);
   const endMatch = remaining.match(new RegExp(`(?:\r?\n)${TEXT_RESULT_END}[ \t]*(?=\r?\n|$)`));
-  if (!endMatch) throw new Error('The ChatGPT response does not contain a complete Patchwork result envelope.');
+  if (!endMatch) {
+    const legacyManifest = parseLegacyPlainTextResult(remaining);
+    if (legacyManifest) return legacyManifest;
+    throw new Error('The ChatGPT response does not contain a complete Patchwork result envelope.');
+  }
   let jsonText = remaining.slice(0, endMatch.index).trim();
   jsonText = jsonText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
   if (Buffer.byteLength(jsonText, 'utf8') > MAX_MANIFEST_BYTES + (MAX_PATCH_BYTES * 2)) {
@@ -262,14 +298,19 @@ class ResultService {
     await fs.mkdir(resultDir, { recursive: true });
     const patches = [];
     for (const item of manifest.repositories) {
-      requireTaskRepository(task, item?.id);
-      if (item.patchEncoding !== 'base64') throw new Error(`${item.id} does not use base64 patch encoding.`);
+      const repository = requireTaskRepository(task, item?.id);
       const outputPath = path.join(resultDir, `${item.id}.patch`);
-      await fs.writeFile(outputPath, decodePatch(item.patch, item.id));
+      const legacyResult = manifest.transport === LEGACY_RESULT_TRANSPORT;
+      if (!legacyResult && item.patchEncoding !== 'base64') {
+        throw new Error(`${item.id} does not use base64 patch encoding.`);
+      }
+      const patch = legacyResult ? Buffer.from(item.patch, 'utf8') : decodePatch(item.patch, item.id);
+      if (patch.length > MAX_PATCH_BYTES) throw new Error(`${item.id} exceeds the 64 MB patch limit.`);
+      await fs.writeFile(outputPath, patch);
       patches.push({
         id: item.id,
-        baseCommit: item.baseCommit,
-        patchEncoding: item.patchEncoding,
+        baseCommit: legacyResult ? repository.baseCommit : item.baseCommit,
+        patchEncoding: legacyResult ? 'raw' : item.patchEncoding,
         localPath: outputPath,
       });
     }

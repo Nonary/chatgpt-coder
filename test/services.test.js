@@ -123,6 +123,10 @@ test('follow-up turns persist Ask/Agent state without rewriting the legacy answe
   const agentPrompt = buildFollowUpPrompt(task, 'Implement the requested change now.', 'agent');
   assert.match(agentPrompt, /manifest `access` is `context` remain read-only/i);
   assert.match(agentPrompt, /only repositories with `access` `edit` may be changed/i);
+  assert.match(agentPrompt, /original Ask package intentionally did not contain an Agent result contract/i);
+  assert.match(agentPrompt, /PATCHWORK_RESULT_END/);
+  assert.match(agentPrompt, /Do not base64-encode the whole JSON object/i);
+  assert.match(agentPrompt, /schemaVersion: 2/);
 
   await tasks.updateTask(task.taskId, { conversationId, conversationUrl, state: 'completed' });
 
@@ -1583,6 +1587,40 @@ test('plain-text result fields may mention the result end marker', () => {
   })}\nPATCHWORK_RESULT_END`;
 
   assert.equal(parsePlainTextResult(responseText).taskId, 'task-with-marker-reference');
+});
+
+test('legacy whole-payload base64 results remain ingestible', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-legacy-text-result-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  const tasks = new TaskService(path.join(root, 'data'));
+  await tasks.initialize();
+  const repository = (await tasks.inspectRepositories([repositoryPath]))[0];
+  const task = await tasks.createTask({
+    taskText: 'Change the greeting.', repositories: [repository], autoApply: true,
+  });
+
+  await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'legacy text result\n');
+  const { stdout: patchBody } = await runGit(repositoryPath, ['diff', '--binary', task.repositories[0].baseCommit, '--', '.']);
+  await runGit(repositoryPath, ['restore', 'hello.txt']);
+  const payload = {
+    taskId: task.taskId,
+    repositories: [{ id: repository.id, patch: patchBody }],
+    commitMessage: 'fix(results): accept legacy downloaded results',
+  };
+  const responseText = `PATCHWORK_RESULT_V1\n${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+
+  const parsed = parsePlainTextResult(responseText);
+  assert.equal(parsed.taskId, task.taskId);
+  assert.equal(parsed.transport, 'legacy-whole-payload-base64');
+
+  const results = new ResultService(tasks);
+  const downloadedPath = path.join(root, task.resultFilename);
+  await fs.writeFile(downloadedPath, responseText);
+  const current = await results.ingestTextFile(task.taskId, downloadedPath);
+  assert.equal(current.state, 'applied');
+  assert.equal(current.result.transport, 'plain-text-base64');
+  assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'legacy text result\n');
 });
 
 test('a corrected result can replace an invalid result on a failed task', async (context) => {
