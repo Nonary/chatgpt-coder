@@ -195,14 +195,14 @@ async function createWorkingSnapshotBundle(repository, scratchPath, outputPath) 
   const snapshotRef = `refs/patchwork/task-bundles/${crypto.randomUUID()}`;
   await runGit(repository.path, ['update-ref', snapshotRef, snapshotCommit]);
   try {
-    await createBundle(repository, outputPath, ['HEAD', snapshotRef]);
+    await createBundle(repository, outputPath, ['--all', snapshotRef]);
   } finally {
     await runGit(repository.path, ['update-ref', '-d', snapshotRef]).catch(() => {});
   }
   return { baseCommit: snapshotCommit, snapshotFingerprint: fingerprintAfter };
 }
 
-async function createBundle(repository, outputPath, revisions = ['HEAD']) {
+async function createBundle(repository, outputPath, revisions = ['--all', 'HEAD']) {
   await runGit(repository.path, ['bundle', 'create', outputPath, ...revisions]);
   await runGit(repository.path, ['bundle', 'verify', outputPath]);
 }

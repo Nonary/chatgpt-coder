@@ -13,7 +13,7 @@ require('node:fs').writeFileSync(gitConfigPath, '[core]\n\tautocrlf = false\n\te
 process.env.GIT_CONFIG_GLOBAL = gitConfigPath;
 process.env.GIT_CONFIG_SYSTEM = gitConfigPath;
 
-const { fingerprintRepository, runGit } = require('../src/agent/services/git');
+const { createBundle, fingerprintRepository, runGit } = require('../src/agent/services/git');
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/agent/services/git-service');
 const { IacService } = require('../src/agent/services/iac-service');
 const { ResultService, parsePlainTextResult } = require('../src/agent/services/result-service');
@@ -50,6 +50,27 @@ async function createRepository(root) {
   await runGit(repositoryPath, ['add', 'hello.txt']);
   await runGit(repositoryPath, ['commit', '-m', 'Initial commit']);
   return repositoryPath;
+}
+
+async function createDivergentHistory(repositoryPath) {
+  await runGit(repositoryPath, ['switch', '-c', 'feature/history-only']);
+  await fs.writeFile(path.join(repositoryPath, 'feature.txt'), 'feature history\n');
+  await runGit(repositoryPath, ['add', 'feature.txt']);
+  await runGit(repositoryPath, ['commit', '-m', 'Feature-only commit']);
+  const { stdout: featureCommitOutput } = await runGit(repositoryPath, ['rev-parse', 'HEAD']);
+  const featureCommit = featureCommitOutput.trim();
+  await runGit(repositoryPath, ['tag', 'feature-history']);
+
+  await runGit(repositoryPath, ['switch', 'main']);
+  await fs.writeFile(path.join(repositoryPath, 'main.txt'), 'main history\n');
+  await runGit(repositoryPath, ['add', 'main.txt']);
+  await runGit(repositoryPath, ['commit', '-m', 'Main-only commit']);
+  const { stdout: mainCommitOutput } = await runGit(repositoryPath, ['rev-parse', 'HEAD']);
+
+  return {
+    featureCommit,
+    mainCommit: mainCommitOutput.trim(),
+  };
 }
 
 async function ingestDownloadedText(results, tasks, task, text) {
@@ -325,6 +346,7 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
+  const history = await createDivergentHistory(repositoryPath);
   const tasks = new TaskService(path.join(root, 'data'));
   await tasks.initialize();
 
@@ -361,6 +383,31 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
   const extractedBundle = path.join(root, 'uploaded-repository.bundle');
   await fs.writeFile(extractedBundle, packagedBundle);
   await runGit(repositoryPath, ['bundle', 'verify', extractedBundle]);
+  const { stdout: bundleHeads } = await runGit(root, ['bundle', 'list-heads', extractedBundle]);
+  assert.ok(bundleHeads.includes(`${history.featureCommit} refs/heads/feature/history-only`));
+  assert.ok(bundleHeads.includes(`${history.featureCommit} refs/tags/feature-history`));
+  assert.ok(bundleHeads.includes(`${history.mainCommit} refs/heads/main`));
+});
+
+test('bundle creation keeps a detached HEAD commit alongside repository refs', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-detached-bundle-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(root);
+  await runGit(repositoryPath, ['switch', '--detach', 'HEAD']);
+  await fs.writeFile(path.join(repositoryPath, 'detached.txt'), 'detached history\n');
+  await runGit(repositoryPath, ['add', 'detached.txt']);
+  await runGit(repositoryPath, ['commit', '-m', 'Detached-only commit']);
+  const { stdout: detachedCommitOutput } = await runGit(repositoryPath, ['rev-parse', 'HEAD']);
+  const detachedCommit = detachedCommitOutput.trim();
+
+  const bundlePath = path.join(root, 'detached.bundle');
+  await createBundle({ path: repositoryPath }, bundlePath);
+
+  const { stdout: bundleHeads } = await runGit(root, ['bundle', 'list-heads', bundlePath]);
+  assert.ok(bundleHeads.includes(`${detachedCommit} HEAD`));
+  const clonePath = path.join(root, 'detached-clone');
+  await runGit(root, ['clone', '--no-checkout', bundlePath, clonePath]);
+  await runGit(clonePath, ['cat-file', '-e', `${detachedCommit}^{commit}`]);
 });
 
 test('answer-only tasks package repositories as read-only context without a result-file protocol', async (context) => {
@@ -822,6 +869,7 @@ test('dirty repositories keep their full history and capture unstaged files as a
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-working-snapshot-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
+  const history = await createDivergentHistory(repositoryPath);
   await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'locally changed\n');
   await fs.writeFile(path.join(repositoryPath, 'untracked.txt'), 'local context\n');
   const tasks = new TaskService(path.join(root, 'data'));
@@ -847,10 +895,14 @@ test('dirty repositories keep their full history and capture unstaged files as a
   assert.match(zip.getEntry('AGENTS.md').getData().toString('utf8'), /view those captured files as unstaged changes/i);
 
   const bundlePath = path.join(tasks.taskDirectory(task.taskId), 'repositories', `${taskRepository.id}.bundle`);
+  const { stdout: bundleHeads } = await runGit(root, ['bundle', 'list-heads', bundlePath]);
+  assert.ok(bundleHeads.includes(`${history.featureCommit} refs/heads/feature/history-only`));
+  assert.ok(bundleHeads.includes(`${history.featureCommit} refs/tags/feature-history`));
+  assert.ok(bundleHeads.includes(`${history.mainCommit} refs/heads/main`));
   const clonePath = path.join(root, 'history-clone');
   await runGit(root, ['clone', bundlePath, clonePath]);
   await runGit(clonePath, ['checkout', '--detach', taskRepository.baseCommit]);
-  assert.equal((await runGit(clonePath, ['rev-list', '--count', taskRepository.baseCommit])).stdout.trim(), '2');
+  assert.equal((await runGit(clonePath, ['rev-list', '--count', taskRepository.baseCommit])).stdout.trim(), '3');
   assert.equal(await fs.readFile(path.join(clonePath, 'hello.txt'), 'utf8'), 'locally changed\n');
   assert.equal(await fs.readFile(path.join(clonePath, 'untracked.txt'), 'utf8'), 'local context\n');
   const { stdout: suppliedDiff } = await runGit(clonePath, [
