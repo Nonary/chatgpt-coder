@@ -1759,6 +1759,100 @@ test('the request enforcer reads the picker at send time, not at task creation',
   }
 });
 
+test('the interceptor restores processed upload metadata when the composer drops the attachment', async () => {
+  delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  const { beginEnforcement } = require('../src/userscript/src/chatgpt/intercept');
+  const previous = { window: global.window, location: global.location };
+  global.location = { origin: 'https://chatgpt.com' };
+  const sent = [];
+  global.window = {
+    fetch: async (url, init) => {
+      sent.push({ url: String(url), body: init?.body ?? null });
+      if (String(url).endsWith('/backend-api/files')) {
+        return Response.json({ status: 'success', file_id: 'file-uploaded' });
+      }
+      if (String(url).endsWith('/backend-api/files/process_upload_stream')) {
+        return new Response([
+          JSON.stringify({ file_id: 'file-uploaded', event: 'file.processing.started', progress: 0 }),
+          JSON.stringify({
+            file_id: 'file-uploaded',
+            event: 'file.processing.completed',
+            progress: 100,
+            extra: {
+              metadata_object_id: 'libfile-uploaded',
+              library_file_name: 'chatgpt-ide-task-expected(1).zip',
+              mime_type: 'application/zip',
+            },
+          }),
+        ].join('\n'), { status: 200 });
+      }
+      return new Response('{"conversation_id":"3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22"}', { status: 200 });
+    },
+  };
+
+  try {
+    const enforcement = beginEnforcement({
+      configuration: () => ({ model: 'sol', reasoningMode: 'high', modelSlug: 'gpt-5-6-thinking' }),
+      packageFilename: 'chatgpt-ide-task-expected.zip',
+    });
+    await window.fetch('https://chatgpt.com/backend-api/files', {
+      method: 'POST',
+      body: JSON.stringify({
+        file_name: 'chatgpt-ide-task-expected.zip',
+        file_size: 1234,
+        mime_type: 'application/zip',
+        use_case: 'agent',
+      }),
+    });
+    await window.fetch('https://chatgpt.com/backend-api/files/process_upload_stream', {
+      method: 'POST',
+      body: JSON.stringify({
+        file_id: 'file-uploaded',
+        file_name: 'chatgpt-ide-task-expected.zip',
+        use_case: 'agent',
+        gizmo_id: 'g-p-project',
+        metadata: {
+          is_project_thread: true,
+          library_file_info: { gizmo_id: 'g-p-project', should_upload_to_project: true },
+        },
+      }),
+    });
+    await window.fetch('https://chatgpt.com/backend-api/f/conversation', {
+      method: 'POST',
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [{ author: { role: 'user' }, content: { content_type: 'text', parts: ['Test'] }, metadata: {} }],
+      }),
+    });
+    const verified = await enforcement.wait(1_000);
+    enforcement.dispose();
+
+    const createPayload = JSON.parse(sent[0].body);
+    const processPayload = JSON.parse(sent[1].body);
+    assert.equal(createPayload.use_case, 'ace_upload');
+    assert.equal(processPayload.use_case, 'ace_upload');
+    assert.equal(processPayload.gizmo_id, undefined);
+    assert.equal(processPayload.metadata.is_project_thread, false);
+    assert.equal(processPayload.metadata.library_file_info, undefined);
+
+    const payload = JSON.parse(sent.at(-1).body);
+    assert.deepEqual(payload.messages[0].metadata.attachments, [{
+      id: 'file-uploaded',
+      size: 1234,
+      name: 'chatgpt-ide-task-expected(1).zip',
+      mime_type: 'application/zip',
+      source: 'local',
+      library_file_id: 'libfile-uploaded',
+      is_big_paste: false,
+    }]);
+    assert.equal(verified.ok, true);
+  } finally {
+    global.window = previous.window;
+    global.location = previous.location;
+    delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
+  }
+});
+
 test('conversation navigation can confirm a send that the page fetch wrapper did not observe', async () => {
   delete require.cache[require.resolve('../src/userscript/src/chatgpt/intercept')];
   const { beginEnforcement } = require('../src/userscript/src/chatgpt/intercept');
