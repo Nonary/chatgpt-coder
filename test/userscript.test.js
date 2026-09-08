@@ -626,6 +626,21 @@ test('the agent client builds authenticated request paths for every workspace ca
   await api.skills(['C:/one', 'C:/two']);
   assert.equal(calls.at(-1).path, '/v1/skills?repositories=C%3A%2Fone%0AC%3A%2Ftwo');
 
+  await api.setPromptEnabled('prompt-123', false);
+  assert.equal(calls.at(-1).method, 'PATCH');
+  assert.equal(calls.at(-1).path, '/v1/prompts/prompt-123/enabled');
+  assert.deepEqual(calls.at(-1).body, { enabled: false });
+
+  await api.setSkillEnabled('skill-123', false, ['C:/repo']);
+  assert.equal(calls.at(-1).method, 'PATCH');
+  assert.equal(calls.at(-1).path, '/v1/skills/skill-123/enabled');
+  assert.deepEqual(calls.at(-1).body, { enabled: false, repositories: ['C:/repo'] });
+
+  await api.deleteSkill('skill-123', ['C:/repo']);
+  assert.equal(calls.at(-1).method, 'DELETE');
+  assert.equal(calls.at(-1).path, '/v1/skills/skill-123');
+  assert.deepEqual(calls.at(-1).body, { repositories: ['C:/repo'] });
+
   await api.taskTitle('task-1', {
     conversationId: '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
     title: 'Generated task title',
@@ -650,6 +665,12 @@ test('the agent client builds authenticated request paths for every workspace ca
 
   await api.uploadAttachment('notes v2.txt', new ArrayBuffer(4));
   assert.equal(calls.at(-1).path, '/v1/uploads?name=notes+v2.txt');
+
+  await api.promptFile('prompt-123');
+  assert.equal(calls.at(-1).method, 'GET');
+  assert.equal(calls.at(-1).path, '/v1/prompts/prompt-123/file');
+  assert.equal(calls.at(-1).responseType, 'arraybuffer');
+  assert.equal(calls.at(-1).timeout, 300_000);
 
   await api.events(12);
   assert.equal(calls.at(-1).path, '/v1/events?since=12');
@@ -1060,6 +1081,20 @@ test('composer command state stays ID-backed for skills and saved prompts', () =
   });
 });
 
+test('slash command source filters disabled library entries instead of removing them from state', () => {
+  const composerSource = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'composer.js'),
+    'utf8',
+  );
+  const followUpSource = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'task-follow-up.js'),
+    'utf8',
+  );
+  assert.match(composerSource, /if \(currentSkill\.enabled === false\) continue;/);
+  assert.match(composerSource, /if \(prompt\.enabled === false\) continue;/);
+  assert.match(followUpSource, /if \(prompt\.enabled === false\) continue;/);
+});
+
 test('composer target summary reflects the real selected tree, repository, and project state', () => {
   const { composerTargetSummary } = require('../src/userscript/src/ui/views/composer');
   const state = {
@@ -1108,6 +1143,14 @@ test('repository scope is shared by New Task and multi-repository Source Control
   assert.match(sourceView, /source-repository-chevron/);
   assert.match(pickerSource, /selectedPaths = \[\]/);
   assert.match(pickerSource, /allowEmpty = false/);
+});
+
+test('saved prompt follow-ups download Markdown files through the agent', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'driver.js'), 'utf8');
+  assert.match(source, /Array\.isArray\(turn\.promptFiles\)/);
+  assert.match(source, /this\.api\.promptFile\(promptFile\.id\)/);
+  assert.match(source, /toFile\(bytes, promptFile\.name, 'text\/markdown'\)/);
+  assert.match(source, /composer\.waitForAttachment\(promptFile\.name\)/);
 });
 
 test('task-detail send path persists and sends a follow-up without creating a new task', () => {

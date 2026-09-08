@@ -357,6 +357,7 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
       next.push({ type: 'skill', id: skill.id, name: skillCommandName(skill), search: skill.name || skill.id, description: skill.description || 'Task skill.' });
     }
     for (const prompt of ctx.store.state.prompts || []) {
+      if (prompt.enabled === false) continue;
       next.push({ type: 'prompt', id: prompt.id, name: promptCommandName(prompt), search: prompt.name || prompt.id, description: promptDescription(prompt) });
     }
     return next;

@@ -1,16 +1,14 @@
 const { h, replace } = require('../dom');
 
-const MAX_PROMPT_CONTENT_LENGTH = 12_000;
-
 function openPromptManager({ shell, api, onChange }) {
   const list = h('div', { class: 'stack' });
   const count = h('span', { class: 'field-help' }, '');
   const editor = h('form', { class: 'card', hidden: true });
   const nameInput = h('input', { type: 'text', class: 'field-control', maxlength: 60, placeholder: 'For example: UI accessibility review' });
   const descriptionInput = h('input', { type: 'text', class: 'field-control', maxlength: 140, placeholder: 'A quick review of keyboard access and labels' });
-  const contentInput = h('textarea', { class: 'field-control', rows: 8, maxlength: MAX_PROMPT_CONTENT_LENGTH, placeholder: 'Review the interface for keyboard navigation, focus states, accessible names, and clear error handling.' });
+  const contentInput = h('textarea', { class: 'field-control', rows: 8, placeholder: 'Review the interface for keyboard navigation, focus states, accessible names, and clear error handling.' });
   const editorTitle = h('strong', {}, 'Create a saved prompt');
-  const editorStatus = h('span', { class: 'field-help' }, 'Saved instructions are added whenever you select this prompt.');
+  const editorStatus = h('span', { class: 'field-help' }, 'Saved prompts are stored as Markdown files and attached as Markdown when selected.');
   let editingId = null;
   let prompts = [];
 
@@ -128,4 +126,4 @@ function openPromptManager({ shell, api, onChange }) {
   return handle;
 }
 
-module.exports = { MAX_PROMPT_CONTENT_LENGTH, openPromptManager };
+module.exports = { openPromptManager };

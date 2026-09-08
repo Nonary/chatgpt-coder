@@ -502,6 +502,42 @@ button.composer-send-button {
   color: var(--text-tertiary); font-size: 13px; text-align: center;
 }
 
+/* --------------------------------------------------------------------- library */
+
+.library-tabs {
+  display: flex; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface-raised);
+}
+.library-tab {
+  flex: 1; min-height: 34px; padding: 0 14px; border: 0; border-radius: 999px;
+  background: transparent; color: var(--text-secondary); font-size: 13px; font-weight: 500;
+}
+.library-tab:hover { color: var(--text); background: var(--surface-hover); }
+.library-tab.active { color: var(--text); background: var(--surface-elevated); box-shadow: var(--shadow-soft); }
+.library-toolbar { align-items: stretch; }
+.library-toolbar .field-control { flex: 1 1 190px; min-width: 140px; }
+.library-filter { flex: 0 0 120px; width: 120px; }
+.library-list { display: flex; flex-direction: column; gap: 2px; }
+.library-item {
+  display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 10px 10px 4px;
+  border-radius: var(--radius); background: transparent; transition: background-color .15s ease, opacity .15s ease;
+}
+.library-item:hover { background: var(--surface-hover); }
+.library-item.disabled { opacity: .62; }
+.library-item-copy { min-width: 0; }
+.library-item-copy .title { font-size: 14px; font-weight: 500; }
+.library-item-copy .subtitle { margin-top: 2px; color: var(--text-tertiary); font-size: 12px; line-height: 17px; }
+.library-enable {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 45px; flex: none;
+  color: var(--text-tertiary); font-size: 11px; font-weight: 500; text-transform: uppercase;
+}
+.library-enable input { margin-left: 2px; }
+.library-action { min-height: 30px !important; padding: 0 10px !important; font-size: 12px !important; }
+.library-editor { margin-top: 4px; }
+.library-check {
+  display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 13px;
+}
+
 /* -------------------------------------------------------------------- badges */
 
 .status-badge {

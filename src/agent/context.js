@@ -3,6 +3,7 @@ const { EventLog } = require('./events');
 const { FsService } = require('./services/fs-service');
 const { GitService } = require('./services/git-service');
 const { IacService } = require('./services/iac-service');
+const { LibraryService } = require('./services/library-service');
 const { PromptService } = require('./services/prompt-service');
 const { ResultService } = require('./services/result-service');
 const { SkillService } = require('./services/skill-service');
@@ -37,9 +38,10 @@ async function createContext(config) {
 
   const fsService = new FsService();
   const skillService = new SkillService();
+  const libraryService = new LibraryService(dataRoot);
   const iacService = new IacService({ settingsPath: config.iacSettingsPath });
   const promptService = new PromptService(dataRoot);
-  const taskService = new TaskService(dataRoot, skillService, iacService);
+  const taskService = new TaskService(dataRoot, skillService, iacService, promptService);
   await taskService.initialize();
   const updateService = new UpdateService();
   await updateService.initialize();
@@ -82,6 +84,7 @@ async function createContext(config) {
     fsService,
     gitService,
     iacService,
+    libraryService,
     promptService,
     resultService,
     skillService,

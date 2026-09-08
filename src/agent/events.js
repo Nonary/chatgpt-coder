@@ -37,7 +37,6 @@ class EventLog {
         this.waiters.delete(waiter);
         resolve([]);
       }, timeoutMilliseconds);
-      timer.unref?.();
       waiter.resolve = (value) => {
         clearTimeout(timer);
         resolve(value);

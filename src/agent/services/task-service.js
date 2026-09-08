@@ -20,6 +20,7 @@ const {
   TASK_MODEL_PICKER_OPTIONS,
   TASK_REASONING_PICKER_OPTIONS,
 } = require('../../shared/chatgpt');
+const { PromptService } = require('./prompt-service');
 
 const SCHEMA_VERSION = 1;
 const TASK_MODELS = new Set(['default', ...Object.keys(TASK_MODEL_PICKER_OPTIONS)]);
@@ -98,7 +99,7 @@ function followUpTurn(task) {
   return turns.find((turn) => turn.id === task.activeTurnId) || null;
 }
 
-function buildFollowUpPrompt(task, prompt, mode, skillIds = []) {
+function buildFollowUpPrompt(task, prompt, mode, skillIds = [], prompts = []) {
   const text = String(prompt || '').trim();
   if (!text) throw new Error('Describe the follow-up before sending it.');
   const selectedSkills = new Set((Array.isArray(skillIds) ? skillIds : []).map((id) => String(id)));
@@ -109,7 +110,10 @@ function buildFollowUpPrompt(task, prompt, mode, skillIds = []) {
   const skillNote = skills.length
     ? `\n\nFor this turn, use these task-bound skills from the existing package when relevant: ${skills.map((name) => `\`/${name}\``).join(', ')}. Read each selected skill's \`SKILL.md\` before relying on it.`
     : '';
-  if (mode === 'ask') return `${text}${skillNote}`;
+  const promptNote = prompts.length
+    ? `\n\nFor this turn, read these selected saved prompt Markdown attachments before responding: ${prompts.map((item) => `\`${item.fileName}\``).join(', ')}. Their contents are attached as Markdown files; do not expect their full text inline in the follow-up message.`
+    : '';
+  if (mode === 'ask') return `${text}${promptNote}${skillNote}`;
   const filename = task.resultFilename || `chatgpt-ide-result-${task.taskId}.txt`;
   const hasConfiguredAccess = (Array.isArray(task.repositories) ? task.repositories : [])
     .some((repository) => repository.configuredAccess === 'edit' || repository.configuredAccess === 'context');
@@ -121,7 +125,7 @@ function buildFollowUpPrompt(task, prompt, mode, skillIds = []) {
   const askUpgradeResultContract = task.answerOnly
     ? `\n\nThe original Ask package intentionally did not contain an Agent result contract. For this turn, the exact file format is: \`PATCHWORK_RESULT_V1\` on its own line, followed by one JSON object, followed by \`PATCHWORK_RESULT_END\` on its own line. Do not base64-encode the whole JSON object and do not wrap it in Markdown fences. The JSON object must contain \`schemaVersion: 2\`, \`transport: \"plain-text-base64\"\`, \`taskId: \"${task.taskId}\"\`, \`status: \"completed\"\`, a concise \`summary\`, the complete detailed Conventional Commit \`commitMessage\`, and a \`repositories\` array. Each repository entry must contain its manifest \`id\`, exact manifest \`baseCommit\`, \`patchEncoding: \"base64\"\`, and the complete base64-encoded \`git diff --binary <baseCommit> -- .\` output in \`patch\`.`
     : '';
-  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task.${askUpgradeNote} Do not create a second task identity. Recalculate the \`commitMessage\` from the complete cumulative changes and keep it as a detailed Conventional Commit message; this field is the authoritative commit message Patchwork will preserve and use when the result is applied.${askUpgradeResultContract}${skillNote}`;
+  return `${text}\n\n## Patchwork Agent follow-up protocol\n\nContinue the existing Patchwork task in Agent mode. Work in the repositories already attached to this conversation; do not create a new Patchwork task or conversation. Return the complete current task state in a Patchwork result file named \`${filename}\` using the existing \`PATCHWORK_RESULT_V1\` plain-text/base64 format. The result must use task ID \`${task.taskId}\` and include every task repository with an empty patch when it has no changes. This is a cumulative follow-up result, so preserve all changes that belong to this task. The existing task package already contains the authoritative context for the task.${askUpgradeNote} Do not create a second task identity. Recalculate the \`commitMessage\` from the complete cumulative changes and keep it as a detailed Conventional Commit message; this field is the authoritative commit message Patchwork will preserve and use when the result is applied.${askUpgradeResultContract}${promptNote}${skillNote}`;
 }
 
 function buildAgentInstructions(taskId, skills = [], options = {}) {
@@ -129,9 +133,21 @@ function buildAgentInstructions(taskId, skills = [], options = {}) {
   const summaryOnly = Boolean(options.summaryOnly);
   const answerOnly = Boolean(options.answerOnly);
   const includeIac = Boolean(options.includeIac);
+  const prompts = Array.isArray(options.prompts) ? options.prompts : [];
   const resultSummaryExample = summaryOnly
     ? 'A concise summary of the change.'
     : 'A concise summary of the implementation and verification performed.';
+  const promptInstructions = prompts.length
+    ? `## Selected saved prompts
+
+This task includes ${prompts.length} selected saved prompt${prompts.length === 1 ? '' : 's'} as Markdown files under the \`prompts/\` directory: ${prompts.map((prompt) => `\`${prompt.file}\``).join(', ')}. The selected prompts are also listed in \`manifest.json\`. Read every selected prompt file completely before ${answerOnly ? 'answering' : 'making changes'} and follow its instructions as additional user-selected task guidance. Prompt bodies are intentionally not copied into \`TASK.md\`.
+
+`
+    : `## Selected saved prompts
+
+Task packages may include selected saved prompts under the \`prompts/\` directory. When \`manifest.json.prompts\` is non-empty, read every listed prompt file completely before ${answerOnly ? 'answering' : 'making changes'} and follow those files as additional user-selected task guidance.
+
+`;
   const skillInstructions = skills.length
     ? `## Optional task skills
 
@@ -158,7 +174,7 @@ You are answering a question supplied by the user through Patchwork IDE. The upl
 
 Repository entries may include configured \`access\`, \`origin\`, and \`relations\`. \`access\` preserves whether the user selected a repository as \`edit\` or \`context\`; an Ask task is still globally read-only. A \`submodule\` relation identifies the parent repository by \`parentRepositoryId\`, gives its relative \`path\`, and records the parent's gitlink commit so you can reason about repository relationships without local absolute paths.
 
-${skillInstructions}## Sandbox constraints
+${promptInstructions}${skillInstructions}## Sandbox constraints
 
 Do not install or update dependencies, access package registries, or run builds, tests, linters, type checks, development servers, code generators, or packaging commands. You may search and inspect files and use read-only Git commands.
 
@@ -197,7 +213,7 @@ For every manifest repository with \`workingChanges: true\`, the supplied \`base
 
 You may create commits as checkpoints. Do not rewrite the supplied base history and do not add generated dependencies, build output, credentials, or unrelated files.
 
-${skillInstructions}## Sandbox constraints
+${promptInstructions}${skillInstructions}## Sandbox constraints
 
 The ChatGPT sandbox cannot successfully install dependencies or run this project's verification toolchain. Do not attempt any of the following:
 
@@ -261,8 +277,12 @@ function buildHandoffPrompt(taskId, taskText, attachments = [], skills = [], opt
   const summaryOnly = Boolean(options.summaryOnly);
   const answerOnly = Boolean(options.answerOnly);
   const includeIac = Boolean(options.includeIac);
+  const prompts = Array.isArray(options.prompts) ? options.prompts : [];
   const attachmentNote = attachments.length
     ? `\n\nThe task ZIP contains these user-provided context files under \`attachments/\`: ${attachments.map((item) => item.name).join(', ')}. Read them as needed ${answerOnly ? 'when answering' : 'before making changes'}.`
+    : '';
+  const promptNote = prompts.length
+    ? `\n\nThe task ZIP also includes these selected saved prompt Markdown files under \`prompts/\`: ${prompts.map((item) => item.file).join(', ')}. Read them completely ${answerOnly ? 'when answering' : 'before making changes'} and follow them as additional user-selected task guidance. Their contents are intentionally not copied into the handoff text or \`TASK.md\`.`
     : '';
   const skillNote = skills.length
     ? `\n\nThe task ZIP also includes ${skills.length} selected local skill${skills.length === 1 ? '' : 's'} under \`skills/\`. Use or invoke a selected skill only when it is relevant to the task, and do not load unrelated skills.`
@@ -271,12 +291,12 @@ function buildHandoffPrompt(taskId, taskText, attachments = [], skills = [], opt
     ? `\n\nThe task package may also contain read-only infrastructure-as-code Git bundles under \`iac/\`. Use those repositories for deployment and platform context, but do not edit them${answerOnly ? '.' : ' or include them in result patches.'}`
     : '';
   if (answerOnly) {
-    return `I attached a Patchwork IDE ZIP task package containing read-only Git context. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, inspect the bundled context, and answer the request in detail directly in the chat. Do not modify files, create commits, generate patches, or create a Patchwork result file.${attachmentNote}${skillNote}${iacNote}\n\nQuestion or request:\n${taskText}`;
+    return `I attached a Patchwork IDE ZIP task package containing read-only Git context. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, inspect the bundled context, and answer the request in detail directly in the chat. Do not modify files, create commits, generate patches, or create a Patchwork result file.${attachmentNote}${promptNote}${skillNote}${iacNote}\n\nQuestion or request:\n${taskText}`;
   }
   if (summaryOnly) {
-    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the complete generated Conventional Commit message, including its detailed body, in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nGit Summary instructions:\n${taskText}`;
+    return `I attached a Patchwork IDE ZIP task package containing Git bundles for a read-only Source Control summary. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then inspect the captured uncommitted changes without modifying files or creating commits. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt using the PATCHWORK_RESULT_V1 payload described in AGENTS.md. Return an empty patch for every repository and put the complete generated Conventional Commit message, including its detailed body, in commitMessage. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${promptNote}${skillNote}${iacNote}\n\nGit Summary instructions:\n${taskText}`;
   }
-  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${skillNote}${iacNote}\n\nTask summary:\n${taskText}\n\nFor the final PATCHWORK_RESULT_V1 payload, generate the complete detailed Conventional Commit message from the final cumulative diff and put that exact message in commitMessage. This field is required even when no coding tree was selected because Patchwork may use the result later for the commit or Source Control AI Summary/Suggestion.\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
+  return `I attached a Patchwork IDE ZIP task package containing Git bundles. Extract it, read AGENTS.md, manifest.json, and TASK.md completely, then solve the task against the bundled repositories. Create and attach the required downloadable text file named chatgpt-ide-result-${taskId}.txt. Do not paste PATCHWORK_RESULT_V1 or any result envelope into the chat.${attachmentNote}${promptNote}${skillNote}${iacNote}\n\nTask summary:\n${taskText}\n\nFor the final PATCHWORK_RESULT_V1 payload, generate the complete detailed Conventional Commit message from the final cumulative diff and put that exact message in commitMessage. This field is required even when no coding tree was selected because Patchwork may use the result later for the commit or Source Control AI Summary/Suggestion.\n\nDo not install dependencies or run builds, tests, linters, type checks, development servers, code generators, or packaging commands; the ChatGPT sandbox cannot run them. Make changes only in writable repositories and return an empty patch for each read-only repository. Never print or paste the result envelope or patch contents in the conversation.`;
 }
 
 function uniqueAttachmentName(filename, usedNames) {
@@ -373,17 +393,24 @@ The bundled repository base captures the selected repository exactly as it exist
 }
 
 class TaskService {
-  constructor(dataRoot, skillService = new SkillService(), iacService = new IacService()) {
+  constructor(
+    dataRoot,
+    skillService = new SkillService(),
+    iacService = new IacService(),
+    promptService = new PromptService(dataRoot),
+  ) {
     this.dataRoot = dataRoot;
     this.tasksRoot = path.join(dataRoot, 'tasks');
     this.skillService = skillService;
     this.iacService = iacService;
+    this.promptService = promptService;
     this.followUpCreationLocks = new Set();
     this.taskMutationQueues = new Map();
   }
 
   async initialize() {
     await fs.mkdir(this.tasksRoot, { recursive: true });
+    await this.promptService.initialize();
   }
 
   taskDirectory(taskId) {
@@ -597,6 +624,31 @@ class TaskService {
     const bundlesDir = path.join(taskDir, 'repositories');
     await fs.mkdir(bundlesDir, { recursive: true });
 
+    const requestedPromptIds = Array.isArray(input.promptIds)
+      ? [...new Set(input.promptIds.map((id) => String(id)).filter(Boolean))]
+      : [];
+    const selectedPrompts = await this.promptService.resolveSelected(requestedPromptIds);
+    if (selectedPrompts.length !== requestedPromptIds.length) {
+      throw new Error('One or more selected saved prompts no longer exist. Refresh the prompt library and try again.');
+    }
+    const packagePrompts = [];
+    if (selectedPrompts.length > 0) {
+      const promptsDir = path.join(taskDir, 'prompts');
+      await fs.mkdir(promptsDir, { recursive: true });
+      for (const prompt of selectedPrompts) {
+        const source = await this.promptService.getFile(prompt.id);
+        const destination = path.join(promptsDir, prompt.fileName);
+        await fs.copyFile(source.path, destination);
+        packagePrompts.push({
+          id: prompt.id,
+          name: prompt.name,
+          description: prompt.description,
+          file: `prompts/${prompt.fileName}`,
+          size: source.size,
+        });
+      }
+    }
+
     const attachments = [];
     const requestedAttachments = Array.isArray(input.attachments) ? input.attachments : [];
     if (requestedAttachments.length > 0) {
@@ -759,6 +811,7 @@ class TaskService {
       iac_repos: iacPackage.repositories,
       attachments: packageAttachments,
       skills: packageSkills,
+      prompts: packagePrompts,
       answerOnly,
     };
     const taskMarkdown = `# Software task\n\n${taskText}\n`;
@@ -766,6 +819,7 @@ class TaskService {
       summaryOnly,
       answerOnly,
       includeIac: Boolean(input.includeIac),
+      prompts: packagePrompts,
     });
 
     await Promise.all([
@@ -780,6 +834,9 @@ class TaskService {
     zip.addLocalFile(path.join(taskDir, 'TASK.md'));
     zip.addLocalFile(path.join(taskDir, 'AGENTS.md'));
     if (input.conflictContext) zip.addLocalFile(path.join(taskDir, 'CONFLICTS.md'));
+    for (const prompt of packagePrompts) {
+      addStoredLocalFile(zip, path.join(taskDir, prompt.file), 'prompts');
+    }
     for (const repository of publicRepositories) {
       addStoredLocalFile(zip, path.join(taskDir, repository.bundleFile), 'repositories');
     }
@@ -798,6 +855,8 @@ class TaskService {
       model,
       reasoningMode,
       skills: taskSkills,
+      prompts: packagePrompts,
+      promptIds: packagePrompts.map((prompt) => prompt.id),
       includeIac: Boolean(input.includeIac),
       autoApply: input.autoApply !== false,
       summaryOnly,
@@ -827,6 +886,7 @@ class TaskService {
         summaryOnly,
         answerOnly,
         includeIac: Boolean(input.includeIac),
+        prompts: packagePrompts,
       }),
       repositories: taskRepositories,
       state: 'prepared',
@@ -981,6 +1041,11 @@ class TaskService {
       const reasoningMode = normalizeReasoningMode(input.reasoningMode ?? task.reasoningMode);
       validateTaskConfiguration(model, reasoningMode);
       const promptIds = Array.isArray(input.promptIds) ? input.promptIds.map((id) => String(id)).filter(Boolean) : [];
+      const promptFiles = Array.isArray(input.promptFiles)
+        ? input.promptFiles
+          .map((item) => ({ id: String(item?.id || ''), name: String(item?.name || '') }))
+          .filter((item) => item.id && item.name)
+        : [];
       const taskSkillIds = new Set((Array.isArray(task.skills) ? task.skills : []).map((skill) => String(skill.id)));
       const skillIds = Array.isArray(input.skillIds) ? input.skillIds.map((id) => String(id)).filter(Boolean) : [];
       if (skillIds.some((id) => !taskSkillIds.has(id))) {
@@ -1001,6 +1066,7 @@ class TaskService {
         model,
         reasoningMode,
         promptIds,
+        promptFiles,
         skillIds,
         attachments,
         state: 'created',

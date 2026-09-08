@@ -52,11 +52,14 @@ transport in front of it is:
 
 - `services/git.js`, `git-service.js` — inspect, bundle, snapshot, stage, commit, diff
 - `services/task-service.js` — ZIP task packaging (`AGENTS.md`, `TASK.md`,
-  `manifest.json`, bundles, skills, attachments, IaC, conflicts)
+  `manifest.json`, bundles, prompts, skills, attachments, IaC, conflicts)
 - `services/result-service.js` — `PATCHWORK_RESULT_V1` envelope validation and apply
 - `services/worktree-service.js` — coding trees and squash merges
-- `services/skill-service.js`, `iac-service.js` — skill discovery, IaC settings
-- `services/prompt-service.js` — the prompt library (moved off browser localStorage)
+- `services/skill-service.js`, `iac-service.js` — skill discovery and CRUD, IaC settings
+- `services/library-service.js` — durable prompt/skill visibility preferences; disabled
+  items stay selectable by existing task state but are omitted from the slash menu
+- `services/prompt-service.js` — the prompt library, stored as Markdown files under
+  the agent's `prompts/` directory (moved off browser localStorage)
 - `services/fs-service.js` — directory browsing, reveal-in-file-manager, repo discovery
 
 Electron-only concerns are replaced: native `dialog.showOpenDialog` becomes an
@@ -153,6 +156,13 @@ Everything that can be an API call is an API call:
 - **Attachments** — bytes come from the agent as an `ArrayBuffer`, become a real
   `File`, and are handed to ChatGPT's own upload path via `DataTransfer` on the
   composer's file input. No disk path, no CDP.
+- **Saved prompts** — prompt definitions live as `.md` files under the agent's
+  `prompts/` directory. When selected for a new task, the Markdown files are copied
+  into the task ZIP under `prompts/` and listed in `manifest.json`; their bodies are
+  deliberately not duplicated into `TASK.md`. When selected for a follow-up turn,
+  the same Markdown files are fetched by the userscript and attached directly to the
+  existing ChatGPT conversation. This keeps reusable prompt text out of the handoff
+  message and removes the old 12,000-character prompt limit.
 - **Model and reasoning effort** — Patchwork replaces ChatGPT's own model control in
   the composer with a `patchwork-model-selector` offering GPT-5.6 Sol/Luna and
   Auto/Instant/Low/Medium/High/Extra High. It is installed on boot and stays for the
@@ -206,10 +216,23 @@ All durable state lives in the agent, so a hard page reload (which restarts the
 userscript) loses nothing. In-flight submissions are recovered on boot the same way
 v2 recovered them on app start.
 
+Saved prompts are human-editable Markdown files under `prompts/`. Managed files carry
+small front matter for stable identity and metadata, while ordinary `.md` files in the
+directory are also discoverable as prompts. Existing `prompts.json` libraries are
+migrated on first access rather than discarded.
+
+The userscript also exposes a dedicated Library workspace tab with Prompts and Skills
+sub-tabs. It is the management surface for reusable resources: prompt files retain
+full Markdown CRUD, skills retain their provider/scope filesystem roots, and an
+agent-owned `library.json` stores only Patchwork presentation preferences such as
+`enabled`. An item defaults to enabled when no preference exists. The slash menu reads
+all catalog entries but presents only enabled prompts and skills; already-selected task
+resources remain valid when later disabled so visibility does not alter task history.
+
 ## Parity checklist
 
 Task composer · repositories · coding trees · task targets · model and reasoning ·
-prompt library · skills drawer · IaC context · attachments · ChatGPT project
+prompt/skill library · skills drawer · IaC context · attachments · ChatGPT project
 selection · submit · live chat status and elapsed time · result validation and apply
 · conflicts, retry, and resolve-with-ChatGPT · rollback · source control (status,
 stage, diff, commit, AI summary) · task history with search and filters · tree merge.

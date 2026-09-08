@@ -7,12 +7,12 @@ const { Shell } = require('./ui/shell');
 const { Store, writePreference } = require('./store');
 const { h, replace } = require('./ui/dom');
 const { openConflictResolution } = require('./ui/dialogs/conflict');
-const { openPromptManager } = require('./ui/dialogs/prompts');
 const { openRepositoryPicker } = require('./ui/dialogs/repository-picker');
 const { openSkillDrawer } = require('./ui/dialogs/skills');
 const { renderComposer, NEW_PROJECT_VALUE, NEW_TREE_VALUE } = require('./ui/views/composer');
 const { latestGitSummaryTask, renderDiffOverlay, renderSource } = require('./ui/views/source');
 const { renderHistory } = require('./ui/views/history');
+const { createLibraryView } = require('./ui/views/library');
 const { renderTaskDetail } = require('./ui/views/task-detail');
 const { renderTrees } = require('./ui/views/trees');
 const { taskLabel } = require('./ui/labels');
@@ -57,6 +57,8 @@ class App {
     this.shell.addView('source', { label: 'Source', icon: 'source' });
     this.shell.addView('trees', { label: 'Trees', icon: 'trees' });
     this.shell.addView('history', { label: 'History', icon: 'history' });
+    this.shell.addView('library', { label: 'Library', icon: 'library' });
+    this.libraryView = createLibraryView(this);
     this.shell.show('tasks');
     setInterval(() => this.tickElapsed(), ELAPSED_TICK_MILLISECONDS);
   }
@@ -80,6 +82,7 @@ class App {
     if (view === 'source') this.renderSourceView();
     if (view === 'trees') this.shell.render('trees', ...renderTrees(this));
     if (view === 'history') this.shell.render('history', ...renderHistory(this));
+    if (view === 'library') this.libraryView.render();
     this.shell.setCount('trees', this.store.state.trees.length);
     this.shell.setCount('history', this.store.state.tasks.length);
     this.shell.setCount('source', Object.values(this.store.state.sourceStatuses)
@@ -570,15 +573,13 @@ class App {
         });
       },
 
+      openLibrary(tab = 'prompts') {
+        app.shell.show('library');
+        app.libraryView.showTab(tab);
+      },
+
       openPromptManager() {
-        openPromptManager({
-          shell: app.shell,
-          api: app.api,
-          onChange: (prompts) => {
-            app.store.set({ prompts }, 'prompts');
-            app.renderActiveView();
-          },
-        });
+        app.actions.openLibrary('prompts');
       },
 
       refreshProjects(showErrors) {
@@ -1137,6 +1138,7 @@ class App {
       repositoryScopePaths = [availableRepositories[0].path];
     }
     this.setRepositoryScope(repositoryScopePaths, { reason: 'silent' });
+    this.libraryView.refresh().catch(() => {});
     await this.refreshSource();
 
     this.installComposerPicker();

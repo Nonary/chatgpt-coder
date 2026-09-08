@@ -41,7 +41,11 @@ class Api {
 
   post(path, body, options) { return this.call('POST', path, body ?? {}, options); }
 
+  patch(path, body, options) { return this.call('PATCH', path, body ?? {}, options); }
+
   remove(path, options) { return this.call('DELETE', path, null, options); }
+
+  delete(path, body, options) { return this.call('DELETE', path, body ?? {}, options); }
 
   /* system */
   health() { return this.get('/health', { timeout: 3_000 }); }
@@ -101,11 +105,38 @@ class Api {
     return this.get(`/v1/skills${query({ repositories: repositoryPaths.join('\n') })}`);
   }
 
+  skill(skillId, repositoryPaths = []) {
+    return this.get(`/v1/skills/${encodeURIComponent(skillId)}${query({ repositories: repositoryPaths.join('\n') })}`);
+  }
+
+  saveSkill(skill) { return this.post('/v1/skills', skill); }
+
+  updateSkill(skillId, skill) { return this.patch(`/v1/skills/${encodeURIComponent(skillId)}`, skill); }
+
+  deleteSkill(skillId, repositories = []) {
+    return this.delete(`/v1/skills/${encodeURIComponent(skillId)}`, { repositories });
+  }
+
+  setSkillEnabled(skillId, enabled, repositories = []) {
+    return this.patch(`/v1/skills/${encodeURIComponent(skillId)}/enabled`, { enabled, repositories });
+  }
+
   iac() { return this.get('/v1/iac'); }
 
   prompts() { return this.get('/v1/prompts'); }
 
   savePrompt(prompt) { return this.post('/v1/prompts', prompt); }
+
+  setPromptEnabled(promptId, enabled) {
+    return this.patch(`/v1/prompts/${encodeURIComponent(promptId)}/enabled`, { enabled });
+  }
+
+  promptFile(promptId) {
+    return this.call('GET', `/v1/prompts/${encodeURIComponent(promptId)}/file`, null, {
+      responseType: 'arraybuffer',
+      timeout: 300_000,
+    });
+  }
 
   deletePrompt(promptId) { return this.remove(`/v1/prompts/${encodeURIComponent(promptId)}`); }
 

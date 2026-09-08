@@ -6,6 +6,7 @@ const os = require('node:os');
 const temporaryRoot = require('node:fs').realpathSync(os.tmpdir());
 const path = require('node:path');
 const { test } = require('node:test');
+const AdmZip = require('adm-zip');
 
 const gitConfigPath = path.join(temporaryRoot, 'patchwork-agent-test-gitconfig');
 require('node:fs').writeFileSync(gitConfigPath, '[core]\n\tautocrlf = false\n\teol = lf\n');
@@ -15,7 +16,11 @@ process.env.GIT_CONFIG_SYSTEM = gitConfigPath;
 const { isAllowedOrigin, loadConfig } = require('../src/agent/config');
 const { EventLog } = require('../src/agent/events');
 const { FsService } = require('../src/agent/services/fs-service');
-const { PromptService, appendPromptInstructions, normalizePrompt } = require('../src/agent/services/prompt-service');
+const {
+  MAX_PROMPT_FILE_BYTES,
+  PromptService,
+  normalizePrompt,
+} = require('../src/agent/services/prompt-service');
 const { Router } = require('../src/agent/router');
 const { runGit } = require('../src/agent/services/git');
 const { startServer } = require('../src/agent/server');
@@ -548,7 +553,7 @@ test('uploaded attachments are staged on disk and reach the task package', async
   assert.equal(await download.text(), 'requirement one\n', 'the page can re-upload attachments to ChatGPT');
 });
 
-test('saved prompts live in the agent and are appended to the task text', async (context) => {
+test('saved prompts are file-backed Markdown and packaged without inflating task text', async (context) => {
   const agent = await startAgent(context);
   const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-prompts-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
@@ -561,6 +566,23 @@ test('saved prompts live in the agent and are appended to the task text', async 
   });
   assert.equal(saved.status, 200);
   const promptId = saved.payload.prompt.id;
+  const promptFile = saved.payload.prompt.fileName;
+  assert.match(promptFile, /^[a-z0-9-]+\.md$/);
+  const storedPrompt = await fs.readFile(
+    path.join(agent.root, 'patchwork', 'prompts', promptFile),
+    'utf8',
+  );
+  assert.match(storedPrompt, /^---\n/);
+  assert.match(storedPrompt, /name: "Accessibility review"/);
+  assert.match(storedPrompt, /Check keyboard navigation and accessible names\./);
+
+  const promptDownload = await fetch(
+    `http://127.0.0.1:${agent.port}/v1/prompts/${encodeURIComponent(promptId)}/file`,
+    { headers: { Authorization: `Bearer ${agent.config.token}` } },
+  );
+  assert.equal(promptDownload.status, 200);
+  assert.match(promptDownload.headers.get('content-type'), /text\/markdown/);
+  assert.equal(await promptDownload.text(), storedPrompt);
 
   const duplicate = await agent.call('POST', '/v1/prompts', { name: 'accessibility review', content: 'Other text.' });
   assert.equal(duplicate.status, 400);
@@ -571,13 +593,136 @@ test('saved prompts live in the agent and are appended to the task text', async 
     repositories: [{ path: repositoryPath }],
     promptIds: [promptId],
   });
-  assert.match(created.payload.task.taskText, /Improve the settings dialog\./);
-  assert.match(created.payload.task.taskText, /Additional instructions from the prompt library/);
-  assert.match(created.payload.task.taskText, /### Accessibility review/);
+  const task = created.payload.task;
+  assert.equal(task.taskText, 'Improve the settings dialog.');
+  assert.deepEqual(task.promptIds, [promptId]);
+  assert.equal(task.prompts.length, 1);
+  assert.equal(task.prompts[0].file, `prompts/${promptFile}`);
+
+  const archive = new AdmZip(task.packagePath);
+  const manifest = JSON.parse(archive.getEntry('manifest.json').getData().toString('utf8'));
+  assert.deepEqual(manifest.prompts, task.prompts);
+  assert.ok(archive.getEntry(`prompts/${promptFile}`));
+  assert.equal(archive.getEntry('TASK.md').getData().toString('utf8'), '# Software task\n\nImprove the settings dialog.\n');
+  assert.match(archive.getEntry('AGENTS.md').getData().toString('utf8'), /selected saved prompt/i);
+  assert.match(archive.getEntry('AGENTS.md').getData().toString('utf8'), new RegExp(`prompts/${promptFile.replace('.', '\\.')}`));
+  assert.equal(
+    archive.getEntry(`prompts/${promptFile}`).getData().toString('utf8'),
+    storedPrompt,
+  );
+
+  const longContent = `# Long prompt\n\n${'Long instruction. '.repeat(900)}`;
+  assert.ok(Buffer.byteLength(longContent, 'utf8') > 12_000);
+  const longSaved = await agent.call('POST', '/v1/prompts', {
+    name: 'Long prompt',
+    content: longContent,
+  });
+  assert.equal(longSaved.status, 200);
+  assert.equal(longSaved.payload.prompt.content, longContent.trim());
+  assert.ok(Buffer.byteLength(longSaved.payload.prompt.content, 'utf8') < MAX_PROMPT_FILE_BYTES);
+
+  await agent.call('POST', `/v1/tasks/${task.taskId}/submitted`, {
+    conversationUrl: 'https://chatgpt.com/c/3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+    conversationId: '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22',
+  });
+  await agent.context.taskService.updateTask(task.taskId, { state: 'completed' });
+  const followUp = await agent.call('POST', `/v1/tasks/${task.taskId}/follow-ups`, {
+    mode: 'ask',
+    prompt: 'Apply the saved review guidance to the existing task.',
+    promptIds: [promptId],
+  });
+  assert.equal(followUp.status, 200);
+  assert.deepEqual(followUp.payload.turn.promptFiles, [{ id: promptId, name: promptFile }]);
+  assert.doesNotMatch(followUp.payload.turn.resolvedPrompt, /Check keyboard navigation and accessible names/);
+  assert.match(followUp.payload.turn.resolvedPrompt, /Markdown attachments/);
 
   const removed = await agent.call('DELETE', `/v1/prompts/${promptId}`);
-  assert.deepEqual(removed.payload.prompts, []);
+  assert.equal(removed.payload.prompts.length, 1);
+  await assert.rejects(
+    fs.access(path.join(agent.root, 'patchwork', 'prompts', promptFile)),
+    { code: 'ENOENT' },
+  );
 });
+
+test('prompt and skill library APIs persist visibility and manage skill files', async (context) => {
+  const agent = await startAgent(context);
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-library-'));
+  context.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const repositoryPath = await createRepository(workspace);
+
+  const promptCreated = await agent.call('POST', '/v1/prompts', {
+    name: 'Library prompt',
+    description: 'Managed from the library.',
+    content: 'Use the library prompt.',
+  });
+  assert.equal(promptCreated.status, 200);
+  const promptId = promptCreated.payload.prompt.id;
+  assert.equal(promptCreated.payload.prompt.enabled, true);
+
+  const promptHidden = await agent.call('PATCH', `/v1/prompts/${encodeURIComponent(promptId)}/enabled`, { enabled: false });
+  assert.equal(promptHidden.status, 200);
+  assert.equal(promptHidden.payload.prompts.find((item) => item.id === promptId).enabled, false);
+  const promptList = await agent.call('GET', '/v1/prompts');
+  assert.equal(promptList.payload.prompts.find((item) => item.id === promptId).enabled, false);
+
+  const skillCreated = await agent.call('POST', '/v1/skills', {
+    name: 'Library skill',
+    description: 'Managed skill.',
+    content: 'Use the skill instructions.',
+    provider: 'Codex',
+    scope: 'project',
+    repositoryPath,
+    repositories: [repositoryPath],
+  });
+  assert.equal(skillCreated.status, 200);
+  const skillId = skillCreated.payload.skill.id;
+  assert.equal(skillCreated.payload.skill.enabled, true);
+  assert.equal(skillCreated.payload.skill.provider, 'Codex');
+  assert.match(skillCreated.payload.skill.location, /\.codex\/skills/);
+  assert.ok(await fs.access(path.join(repositoryPath, '.codex', 'skills', 'library-skill', 'SKILL.md')).then(() => true));
+
+  const skillHidden = await agent.call('PATCH', `/v1/skills/${encodeURIComponent(skillId)}/enabled`, {
+    enabled: false,
+    repositories: [repositoryPath],
+  });
+  assert.equal(skillHidden.status, 200);
+  assert.equal(skillHidden.payload.skills.find((item) => item.id === skillId).enabled, false);
+
+  const skillEdited = await agent.call('PATCH', `/v1/skills/${encodeURIComponent(skillId)}`, {
+    name: 'Library skill',
+    description: 'Updated managed skill.',
+    content: 'Updated skill instructions.',
+    repositories: [repositoryPath],
+  });
+  assert.equal(skillEdited.status, 200);
+  assert.equal(skillEdited.payload.skill.description, 'Updated managed skill.');
+  const storedSkill = await fs.readFile(
+    path.join(repositoryPath, '.codex', 'skills', 'library-skill', 'SKILL.md'),
+    'utf8',
+  );
+  assert.match(storedSkill, /Updated skill instructions\./);
+
+  const skillDetail = await agent.call('GET', `/v1/skills/${encodeURIComponent(skillId)}?repositories=${encodeURIComponent(repositoryPath)}`);
+  assert.equal(skillDetail.status, 200);
+  assert.equal(skillDetail.payload.skill.content, 'Updated skill instructions.');
+  assert.equal(skillDetail.payload.skill.enabled, false);
+  assert.equal(skillDetail.payload.skill.sourcePath, undefined);
+
+  const skillDeleted = await agent.call('DELETE', `/v1/skills/${encodeURIComponent(skillId)}`, { repositories: [repositoryPath] });
+  assert.equal(skillDeleted.status, 200);
+  assert.equal(skillDeleted.payload.skills.some((item) => item.id === skillId), false);
+  assert.equal(
+    await fs.access(path.join(repositoryPath, '.codex', 'skills', 'library-skill'))
+      .then(() => true)
+      .catch(() => false),
+    false,
+  );
+
+  const promptDeleted = await agent.call('DELETE', `/v1/prompts/${encodeURIComponent(promptId)}`);
+  assert.equal(promptDeleted.status, 200);
+  assert.equal(promptDeleted.payload.prompts.some((item) => item.id === promptId), false);
+});
+
 
 test('the Git summary route packages a read-only task using the saved Git Summary prompt', async (context) => {
   const agent = await startAgent(context);
@@ -701,7 +846,7 @@ test('filesystem discovery adds repositories to the durable picker catalog', asy
   assert.deepEqual(catalog.payload.repositories, [{ name: 'remember-me', path: repositoryPath }]);
 });
 
-test('prompt records are normalized and clamped before they are stored', async (context) => {
+test('prompt records are normalized and stored without a character clamp', async (context) => {
   const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-prompt-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
 
@@ -718,15 +863,14 @@ test('prompt records are normalized and clamped before they are stored', async (
   assert.equal(await service.gitSummaryPrompt(), 'Summarize.');
   const updated = await service.save({ id: saved.id, name: 'Git Summary', content: 'Summarize better.' });
   assert.equal(updated.id, saved.id);
+  assert.equal(updated.fileName, saved.fileName);
   assert.equal((await service.list()).length, 1);
+  assert.match(
+    await fs.readFile(path.join(root, 'prompts', saved.fileName), 'utf8'),
+    /Summarize better\./,
+  );
   assert.equal(await service.gitSummaryPrompt(), 'Summarize better.');
   await assert.rejects(() => service.remove('missing'), /no longer exists/);
-
-  assert.equal(appendPromptInstructions('Task.', []), 'Task.');
-  assert.match(
-    appendPromptInstructions('Task.', [{ name: 'Review', content: 'Look closely.' }]),
-    /Task\.\n\nAdditional instructions from the prompt library:\n\n### Review\nLook closely\./,
-  );
 });
 
 test('the router matches parameters and distinguishes an unknown path from a wrong method', () => {

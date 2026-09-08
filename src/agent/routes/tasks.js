@@ -1,7 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { appendPromptInstructions, resolveGitSummaryPrompt } = require('../services/prompt-service');
+const { resolveGitSummaryPrompt } = require('../services/prompt-service');
 const {
   buildFollowUpPrompt, followUpTurn, resolveTreeTaskRepositories,
 } = require('../services/task-service');
@@ -48,8 +48,7 @@ function register(router, context) {
   router.post('/v1/tasks', async ({ body }) => {
     const baseTaskText = String(body.taskText || '').trim();
     if (!baseTaskText) throw new Error('Describe the software task before creating a task package.');
-    const selectedPrompts = await promptService.resolveSelected(body.promptIds);
-    const taskText = appendPromptInstructions(baseTaskText, selectedPrompts);
+    const taskText = baseTaskText;
 
     let tree = null;
     let taskRepositories = await gitService.resolveTaskRepositories(
@@ -148,13 +147,19 @@ function register(router, context) {
     if (!prompt) throw new Error('Describe the follow-up before sending it.');
     const mode = String(body.mode || '').trim().toLowerCase();
     const selectedPrompts = await promptService.resolveSelected(body.promptIds);
-    const expandedPrompt = appendPromptInstructions(prompt, selectedPrompts);
-    const resolvedPrompt = buildFollowUpPrompt(task, expandedPrompt, mode, body.skillIds);
+    const requestedPromptIds = Array.isArray(body.promptIds)
+      ? [...new Set(body.promptIds.map((id) => String(id)).filter(Boolean))]
+      : [];
+    if (selectedPrompts.length !== requestedPromptIds.length) {
+      throw new Error('One or more selected saved prompts no longer exist. Refresh the prompt library and try again.');
+    }
+    const resolvedPrompt = buildFollowUpPrompt(task, prompt, mode, body.skillIds, selectedPrompts);
     const created = await taskService.createFollowUp(task.taskId, {
       ...body,
       mode,
       prompt,
       resolvedPrompt,
+      promptFiles: selectedPrompts.map((item) => ({ id: item.id, name: item.fileName })),
     });
     const turn = followUpTurn(created);
     emit({

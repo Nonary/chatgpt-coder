@@ -274,6 +274,13 @@ class Driver {
         },
       });
       composer.setPrompt(turn.resolvedPrompt || turn.prompt);
+      const promptFiles = Array.isArray(turn.promptFiles) ? turn.promptFiles : [];
+      for (const promptFile of promptFiles) {
+        this.report({ type: 'automation-progress', taskId: task.taskId, message: `Attaching ${promptFile.name}…` });
+        const bytes = await this.api.promptFile(promptFile.id);
+        await composer.attachFile(toFile(bytes, promptFile.name, 'text/markdown'));
+        await composer.waitForAttachment(promptFile.name);
+      }
       for (const file of files) {
         this.report({ type: 'automation-progress', taskId: task.taskId, message: `Attaching ${file.name}…` });
         await composer.attachFile(file);

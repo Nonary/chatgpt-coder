@@ -132,7 +132,7 @@ original attachments.
   original checkout.
 - **History** — every saved task with search and status filters.
 - **Prompt library** — reusable named instructions, stored by the agent rather than in
-  browser storage, appended to a task only when selected.
+  browser storage, saved as human-editable Markdown under `prompts/`, and packaged or attached as Markdown only when selected.
 - **Skills** — a drawer that scans the local skill folders used by Claude Code, Codex,
   GitHub Copilot, and the provider-agnostic Agent Skills layout. Any directory with a
   `SKILL.md` qualifies. Selected directories are copied into the package under
@@ -164,7 +164,7 @@ and their bytes are staged by the agent before packaging.
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `--port`, `PATCHWORK_PORT` | `8787` | Preferred agent HTTP port; an occupied port falls back to a random available port |
-| `--home`, `PATCHWORK_HOME` | `~/.patchwork` | Token, task storage, workspace, prompts |
+| `--home`, `PATCHWORK_HOME` | `~/.patchwork` | Token, task storage, workspace, prompts (`prompts/`) |
 | `--iac-settings`, `PATCHWORK_IAC_SETTINGS` | `<home>/settings.json` | IaC repository list |
 
 The agent generates a token on first run and only accepts requests carrying it, from

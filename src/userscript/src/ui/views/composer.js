@@ -426,15 +426,18 @@ function renderComposer(ctx) {
   function buildCommands(skills) {
     const next = [];
     for (const skill of skills) {
+      const currentSkill = ctx.store.state.skills.find((item) => item.id === skill.id) || skill;
+      if (currentSkill.enabled === false) continue;
       next.push({
         type: 'skill',
-        id: skill.id,
-        name: skillCommandName(skill),
-        search: skill.name || skill.id,
-        description: skill.description || 'No description.',
+        id: currentSkill.id,
+        name: skillCommandName(currentSkill),
+        search: currentSkill.name || currentSkill.id,
+        description: currentSkill.description || 'No description.',
       });
     }
     for (const prompt of ctx.store.state.prompts) {
+      if (prompt.enabled === false) continue;
       next.push({
         type: 'prompt',
         id: prompt.id,

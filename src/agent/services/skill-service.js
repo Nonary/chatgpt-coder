@@ -41,6 +41,38 @@ function parseFrontmatter(content) {
   return fields;
 }
 
+function parseSkillDocument(content) {
+  const text = String(content || '').replaceAll('\r\n', '\n');
+  const match = text.match(/^---\s*\n([\s\S]*?)\n---\s*(?:\n|$)/);
+  return {
+    frontmatter: match ? parseFrontmatter(text) : {},
+    content: (match ? text.slice(match[0].length) : text).trim(),
+  };
+}
+
+function skillDocument({ name, description, content }) {
+  return [
+    '---',
+    `name: ${JSON.stringify(String(name || '').trim())}`,
+    `description: ${JSON.stringify(String(description || '').trim())}`,
+    '---',
+    '',
+    String(content || '').replaceAll('\r\n', '\n').trim(),
+    '',
+  ].join('\n');
+}
+
+function skillSlug(value) {
+  const slug = String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase()
+    .slice(0, 80);
+  return slug || 'skill';
+}
+
 function fallbackSkillDescription(content) {
   const lines = String(content || '')
     .replace(/^---\s*\n[\s\S]*?\n---\s*(?:\n|$)/, '')
@@ -76,6 +108,17 @@ async function readSkillMetadata(skillPath, fallbackName) {
   return {
     name: normalizeSkillText(frontmatter.name) || fallbackName,
     description: normalizeSkillText(frontmatter.description) || fallbackSkillDescription(content),
+  };
+}
+
+async function readSkillContent(skillPath, fallbackName) {
+  const skillFile = path.join(skillPath, 'SKILL.md');
+  const content = await fs.readFile(skillFile, 'utf8');
+  const parsed = parseSkillDocument(content);
+  return {
+    name: normalizeSkillText(parsed.frontmatter.name) || fallbackName,
+    description: normalizeSkillText(parsed.frontmatter.description) || fallbackSkillDescription(content),
+    content: parsed.content,
   };
 }
 
@@ -172,6 +215,8 @@ class SkillService {
           rootLabel: root.label,
           sourcePath,
           skillFile,
+          rootPath: rootDirectory,
+          writable: !entry.isSymbolicLink(),
         });
       }
     }
@@ -180,6 +225,108 @@ class SkillService {
         `${right.scope}|${right.provider}|${right.name}|${right.location}`,
       )
     ));
+  }
+
+  async skillRoots(repositoryPaths = []) {
+    const roots = await this.buildRoots(repositoryPaths);
+    return roots;
+  }
+
+  rootDefinition(scope, provider, repositoryPath = null) {
+    const normalizedScope = String(scope || '').trim().toLowerCase();
+    const definitions = normalizedScope === 'project' ? PROJECT_SKILL_ROOTS : USER_SKILL_ROOTS;
+    const definition = definitions.find((item) => item.provider === provider);
+    if (!definition) throw new Error(`Unknown skill provider: ${provider}`);
+    return {
+      scope: normalizedScope === 'project' ? 'project' : 'user',
+      provider: definition.provider,
+      label: definition.label,
+      repositoryName: null,
+      path: normalizedScope === 'project'
+        ? null
+        : path.join(this.homeDirectory, ...definition.segments),
+      segments: definition.segments,
+      repositoryPath,
+    };
+  }
+
+  async create({ name, description, content, provider, scope = 'user', repositoryPath = null }) {
+    const normalizedName = normalizeSkillText(name);
+    const normalizedDescription = normalizeSkillText(description);
+    const normalizedContent = String(content || '').replaceAll('\r\n', '\n').trim();
+    if (!normalizedName || !normalizedContent) {
+      throw new Error('A skill needs a name and instruction text.');
+    }
+    const normalizedScope = String(scope || 'user').trim().toLowerCase() === 'project' ? 'project' : 'user';
+    if (normalizedScope === 'project' && !repositoryPath) {
+      throw new Error('Choose a project repository before creating a project skill.');
+    }
+    let root;
+    if (normalizedScope === 'project') {
+      const repositoryRoot = await realDirectory(repositoryPath);
+      if (!repositoryRoot) throw new Error('The selected project repository no longer exists.');
+      root = this.rootDefinition(normalizedScope, provider, repositoryRoot);
+      root.path = path.join(repositoryRoot, ...root.segments);
+      root.repositoryName = path.basename(repositoryRoot) || 'Project';
+    } else {
+      root = this.rootDefinition(normalizedScope, provider);
+    }
+
+    const directory = path.join(root.path, skillSlug(normalizedName));
+    if (await existingDirectory(directory)) {
+      throw new Error(`A skill directory named “${path.basename(directory)}” already exists.`);
+    }
+    await fs.mkdir(root.path, { recursive: true });
+    await fs.mkdir(directory);
+    await fs.writeFile(path.join(directory, 'SKILL.md'), skillDocument({
+      name: normalizedName,
+      description: normalizedDescription,
+      content: normalizedContent,
+    }), 'utf8');
+
+    const repositoryPaths = normalizedScope === 'project' ? [root.repositoryPath] : [];
+    const discovered = await this.discover(repositoryPaths);
+    const created = discovered.find((skill) => path.resolve(skill.sourcePath) === path.resolve(directory));
+    if (!created) throw new Error('The skill was created but could not be rediscovered.');
+    return this.getDetails(created);
+  }
+
+  async get(skillId, repositoryPaths = []) {
+    const skills = await this.discover(repositoryPaths);
+    const skill = skills.find((item) => item.id === String(skillId));
+    if (!skill) throw new Error('That skill no longer exists.');
+    return this.getDetails(skill);
+  }
+
+  async getDetails(skill) {
+    const metadata = await readSkillContent(skill.sourcePath, skill.name);
+    return { ...skill, ...metadata };
+  }
+
+  async update(skillId, input, repositoryPaths = []) {
+    const skill = await this.get(skillId, repositoryPaths);
+    if (!skill.writable) throw new Error('Linked skills cannot be edited from Patchwork.');
+    const name = normalizeSkillText(input?.name || skill.name);
+    const description = normalizeSkillText(input?.description ?? skill.description ?? '');
+    const content = String(input?.content ?? skill.content ?? '').replaceAll('\r\n', '\n').trim();
+    if (!name || !content) throw new Error('A skill needs a name and instruction text.');
+    await fs.writeFile(skill.skillFile, skillDocument({ name, description, content }), 'utf8');
+    return this.get(skill.id, repositoryPaths);
+  }
+
+  async remove(skillId, repositoryPaths = []) {
+    const skill = await this.get(skillId, repositoryPaths);
+    if (!skill.writable) throw new Error('Linked skills cannot be deleted from Patchwork.');
+    if (!skill.rootPath || path.resolve(skill.rootPath) === path.resolve(skill.sourcePath)) {
+      throw new Error('Refusing to delete a skill outside a configured skill root.');
+    }
+    const sourcePath = path.resolve(skill.sourcePath);
+    const rootPath = path.resolve(skill.rootPath);
+    if (!sourcePath.startsWith(`${rootPath}${path.sep}`)) {
+      throw new Error('Refusing to delete a skill outside a configured skill root.');
+    }
+    await fs.rm(sourcePath, { recursive: true, force: true });
+    return this.discover(repositoryPaths);
   }
 
   async resolveSelectedSkillIds(skillIds, repositoryPaths = []) {
@@ -197,6 +344,9 @@ class SkillService {
 
 module.exports = {
   SkillService,
+  parseSkillDocument,
+  skillDocument,
+  skillSlug,
   PROJECT_SKILL_ROOTS,
   USER_SKILL_ROOTS,
 };

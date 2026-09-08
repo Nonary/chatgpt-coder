@@ -19,10 +19,14 @@ const { createBundle, fingerprintRepository, runGit } = require('../src/agent/se
 const { GitService, buildCompareRows, parsePorcelainStatus } = require('../src/agent/services/git-service');
 const { IacService } = require('../src/agent/services/iac-service');
 const { ResultService, parsePlainTextResult } = require('../src/agent/services/result-service');
-const { SkillService } = require('../src/agent/services/skill-service');
+const { SkillService, skillDocument, skillSlug } = require('../src/agent/services/skill-service');
+const { LibraryService, normalizeLibrary } = require('../src/agent/services/library-service');
 const {
   DEFAULT_GIT_SUMMARY_PROMPT,
+  MAX_PROMPT_FILE_BYTES,
   PromptService,
+  parsePromptDocument,
+  promptDocument,
   resolveGitSummaryPrompt,
 } = require('../src/agent/services/prompt-service');
 const {
@@ -113,10 +117,147 @@ test('Git Summary prompt service uses the saved prompt as the replaceable Source
   );
 });
 
+test('saved prompts are Markdown documents, discover hand-authored files, and migrate legacy JSON', async (context) => {
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-prompt-files-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  const promptsDirectory = path.join(root, 'prompts');
+  await fs.mkdir(promptsDirectory, { recursive: true });
+  const handAuthored = [
+    '# Architecture review',
+    '',
+    'Review the design against the repository architecture.',
+  ].join('\n');
+  await fs.writeFile(path.join(promptsDirectory, 'architecture-review.md'), handAuthored);
+
+  const legacyPrompt = {
+    id: 'prompt-legacy',
+    name: 'Legacy review',
+    description: 'Migrated prompt',
+    content: '# Legacy review\n\nPreserve the old prompt during migration.',
+    createdAt: '2026-08-01T00:00:00.000Z',
+    updatedAt: '2026-08-01T00:00:00.000Z',
+  };
+  await fs.writeFile(path.join(root, 'prompts.json'), `${JSON.stringify([legacyPrompt])}\n`);
+
+  const service = new PromptService(root);
+  const prompts = await service.list();
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts.some((prompt) => prompt.name === 'Architecture review' && prompt.fileName === 'architecture-review.md'));
+  assert.ok(prompts.some((prompt) => prompt.id === legacyPrompt.id && prompt.fileName === 'legacy-review.md'));
+  assert.equal(await fs.readFile(path.join(root, 'prompts', 'legacy-review.md'), 'utf8').then((text) => text.includes(legacyPrompt.content)), true);
+  await fs.access(path.join(root, 'prompts.json.migrated'));
+
+  const direct = parsePromptDocument(handAuthored, 'architecture-review.md');
+  assert.equal(direct.name, 'Architecture review');
+  assert.equal(direct.description, 'Review the design against the repository architecture.');
+  assert.equal(direct.content, handAuthored);
+
+  const formatted = promptDocument({
+    id: 'prompt-test',
+    name: 'Test',
+    description: 'Description',
+    content: 'Instruction text.',
+    createdAt: '2026-08-01T00:00:00.000Z',
+    updatedAt: '2026-08-01T00:00:00.000Z',
+  });
+  assert.match(formatted, /id: "prompt-test"/);
+  assert.match(formatted, /Instruction text\./);
+
+  const longContent = '# Long\n\n' + 'Instruction. '.repeat(3000);
+  assert.ok(Buffer.byteLength(longContent, 'utf8') > 12_000);
+  assert.ok(Buffer.byteLength(longContent, 'utf8') < MAX_PROMPT_FILE_BYTES);
+  const saved = await service.save({ name: 'Long', content: longContent });
+  assert.equal((await service.list()).find((prompt) => prompt.id === saved.id).content, longContent.trim());
+});
+
+test('library visibility preferences default to enabled and persist disabled resources', async (context) => {
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-library-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+
+  const first = new LibraryService(root);
+  const items = await first.decorate('prompts', [{ id: 'prompt-1', name: 'One' }, { id: 'prompt-2', name: 'Two' }]);
+  assert.deepEqual(items.map((item) => item.enabled), [true, true]);
+
+  await first.setEnabled('prompts', 'prompt-1', false);
+  assert.equal((await first.decorate('prompts', [{ id: 'prompt-1' }]))[0].enabled, false);
+  assert.match(await fs.readFile(path.join(root, 'library.json'), 'utf8'), /prompt-1/);
+
+  const second = new LibraryService(root);
+  assert.equal((await second.decorate('prompts', [{ id: 'prompt-1' }]))[0].enabled, false);
+  await second.setEnabled('prompts', 'prompt-1', true);
+  assert.equal((await second.decorate('prompts', [{ id: 'prompt-1' }]))[0].enabled, true);
+
+  assert.deepEqual(normalizeLibrary({ prompts: { 'prompt-3': false }, skills: { 'skill-1': { enabled: true } } }), {
+    schemaVersion: 1,
+    prompts: { 'prompt-3': { enabled: false } },
+    skills: { 'skill-1': { enabled: true } },
+  });
+});
+
+test('skills support managed personal CRUD while preserving stable path ids', async (context) => {
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-managed-skills-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const homeDirectory = path.join(root, 'home');
+  const service = new SkillService({ homeDirectory });
+
+  assert.equal(skillSlug('Code Review / Accessibility'), 'code-review-accessibility');
+  assert.match(skillDocument({ name: 'Code Review', description: 'Review code.', content: 'Do the review.' }), /^---\nname:/);
+
+  const created = await service.create({
+    name: 'Code Review',
+    description: 'Review code.',
+    content: 'Do the review.',
+    provider: 'Codex',
+    scope: 'user',
+  });
+  assert.equal(created.scope, 'user');
+  assert.equal(created.provider, 'Codex');
+  assert.equal(created.writable, true);
+  assert.equal(created.content, 'Do the review.');
+
+  const updated = await service.update(created.id, {
+    name: 'Code Review',
+    description: 'Review code carefully.',
+    content: 'Do the review carefully.',
+  });
+  assert.equal(updated.id, created.id);
+  assert.equal(updated.description, 'Review code carefully.');
+  assert.equal(updated.content, 'Do the review carefully.');
+
+  const skills = await service.discover([]);
+  assert.ok(skills.some((skill) => skill.id === created.id));
+  await service.remove(created.id, []);
+  assert.equal((await service.discover([])).some((skill) => skill.id === created.id), false);
+});
+
 test('Git Summary result instructions do not ask for verification in the generated summary', () => {
   const instructions = buildAgentInstructions('summary-task', [], { summaryOnly: true });
   assert.match(instructions, /"summary": "A concise summary of the change\."/);
   assert.doesNotMatch(instructions, /A concise summary of the implementation and verification performed/);
+});
+
+test('generated task protocols identify selected prompt files without embedding their bodies', () => {
+  const prompts = [{
+    id: 'prompt-review',
+    name: 'Architecture review',
+    description: 'Review architecture.',
+    file: 'prompts/architecture-review.md',
+  }];
+  const instructions = buildAgentInstructions('task-1', [], { prompts });
+  assert.match(instructions, /selected saved prompt/i);
+  assert.match(instructions, /prompts\//);
+  assert.doesNotMatch(instructions, /Review architecture\./);
+
+  const handoff = buildFollowUpPrompt(
+    { taskId: 'task-1', answerOnly: false, repositories: [] },
+    'Continue the task.',
+    'ask',
+    [],
+    [{ fileName: 'architecture-review.md' }],
+  );
+  assert.match(handoff, /architecture-review\.md/);
+  assert.doesNotMatch(handoff, /Review architecture\./);
 });
 
 test('follow-up turns persist Ask/Agent state without rewriting the legacy answerOnly flag', async (context) => {
