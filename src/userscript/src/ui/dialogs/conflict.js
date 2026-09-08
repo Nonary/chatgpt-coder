@@ -1,6 +1,6 @@
-const { h, option } = require('../dom');
+const { h, option, replace } = require('../dom');
 const { MODEL_LABELS, REASONING_LABELS, taskLabel } = require('../labels');
-const { taskModelSupportsReasoning } = require('../../../../shared/chatgpt');
+const { taskModelSupportsReasoning, taskModelDefaultReasoning } = require('../../../../shared/chatgpt');
 
 function openConflictResolution({ shell, task, onSubmit }) {
   const modelSelect = h(
@@ -8,17 +8,21 @@ function openConflictResolution({ shell, task, onSubmit }) {
     { class: 'field-control' },
     ...Object.entries(MODEL_LABELS).map(([value, label]) => option(value, label, value === (task.model || 'default'))),
   );
-  const reasoningSelect = h(
-    'select',
-    { class: 'field-control' },
-    ...Object.entries(REASONING_LABELS)
-      .filter(([value]) => taskModelSupportsReasoning(task.model || 'default', value))
+  const reasoningSelect = h('select', { class: 'field-control' });
+  const refreshReasoning = (requestedMode) => {
+    const model = modelSelect.value;
+    const selectedMode = taskModelSupportsReasoning(model, requestedMode)
+      ? requestedMode : taskModelDefaultReasoning(model);
+    replace(reasoningSelect, ...Object.entries(REASONING_LABELS)
+      .filter(([value]) => taskModelSupportsReasoning(model, value))
       .map(([value, label]) => option(
         value,
         value === 'default' ? 'Default reasoning' : label,
-        value === (task.reasoningMode || 'default'),
-      )),
-  );
+        value === selectedMode,
+      )));
+  };
+  refreshReasoning(task.reasoningMode || 'default');
+  modelSelect.addEventListener('change', () => refreshReasoning(reasoningSelect.value));
   const instructions = h('textarea', {
     class: 'field-control',
     rows: 7,

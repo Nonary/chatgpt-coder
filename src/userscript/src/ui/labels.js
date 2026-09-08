@@ -1,10 +1,13 @@
 const MODEL_LABELS = {
+  astra: 'GPT-6 Astra',
   default: 'Default',
   sol: 'GPT-5.6 Sol',
   luna: 'GPT-5.6 Luna',
 };
 
 const REASONING_LABELS = {
+  standard: 'Standard',
+  extended: 'Extended',
   default: 'default reasoning',
   instant: 'Instant',
   low: 'Low',

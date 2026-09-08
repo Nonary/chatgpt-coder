@@ -1,6 +1,6 @@
 const { h, replace } = require('./dom');
 const { MODEL_LABELS, REASONING_LABELS } = require('./labels');
-const { taskModelSupportsReasoning } = require('../../../shared/chatgpt');
+const { taskModelSupportsReasoning, taskModelDefaultReasoning } = require('../../../shared/chatgpt');
 const { createComposerPopover } = require('./composer-controls');
 const { filterComposerCommands, findSlashCommand } = require('./composer-controls');
 
@@ -125,7 +125,7 @@ function openModelMenu({ anchor, getConfiguration, setConfiguration, onRefresh, 
   const selectChoice = (choice) => {
     const configuration = getConfiguration();
     setConfiguration(choice.kind === 'model'
-      ? { model: choice.value, reasoningMode: taskModelSupportsReasoning(choice.value, configuration.reasoningMode) ? configuration.reasoningMode : 'default' }
+      ? { model: choice.value, reasoningMode: taskModelSupportsReasoning(choice.value, configuration.reasoningMode) ? configuration.reasoningMode : taskModelDefaultReasoning(choice.value) }
       : { reasoningMode: choice.value });
     controller.close();
     onRefresh();

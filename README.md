@@ -73,8 +73,8 @@ radii, and type scale — and follows whichever theme ChatGPT is currently showi
 reads as one of the page's own surfaces rather than as something bolted on.
 
 Patchwork also replaces ChatGPT's model control in the composer with a **Sol · Auto**
-picker, drawn to match ChatGPT's own menus in both themes, offering GPT-5.6 Sol/Luna and
-Auto/Instant/Low/Medium/High/Extra High. That picker is part of the page, not the dock — it is there whether Patchwork is
+picker, drawn to match ChatGPT's own menus in both themes, offering GPT-6 Astra and GPT-5.6 Sol/Luna.
+Astra uses the Pro model with Standard or Extended thinking; Sol supports Auto/Instant/Low/Medium/High/Extra High/Pro, and Luna supports those options except Pro. That picker is part of the page, not the dock — it is there whether Patchwork is
 open or closed, works for ordinary chats, and whatever it shows when you press Send is
 what the request is sent with.
 

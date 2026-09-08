@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
+// Git resolves symlinks in repository paths (including macOS /var).
+const temporaryRoot = require('node:fs').realpathSync(os.tmpdir());
 const path = require('node:path');
 const { test } = require('node:test');
 
@@ -18,7 +20,7 @@ async function configureAuthor(repositoryPath) {
 }
 
 async function createUpdateRepositories(context) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-update-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-update-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const remote = path.join(root, 'remote.git');
   const local = path.join(root, 'local');

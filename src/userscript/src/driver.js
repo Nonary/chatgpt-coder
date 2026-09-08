@@ -106,6 +106,7 @@ class Driver {
       }
     }
     await this.api.taskFailed(task.taskId, lastError.message).catch(() => {});
+    navigate.forgetPendingNavigation();
     this.stop();
     if (this.activeTaskId === task.taskId) this.activeTaskId = null;
     throw lastError;
@@ -167,6 +168,7 @@ class Driver {
       this.report({ type: 'automation-progress', taskId: task.taskId, message: 'Sending the task…' });
       await composer.clickSend({
         isConversationOpen: () => Boolean(conversationIdFromRouteUrl(location.href)),
+        isSubmissionObserved: () => enforcement.isSettled(),
       });
       const routeConfirmation = navigate.waitForConversationUrl().then(async (conversationUrl) => {
         if (!conversationUrl) return new Promise(() => {});
@@ -222,6 +224,10 @@ class Driver {
       model: verified.selectedModel,
       reasoningMode: verified.selectedReasoningMode,
     });
+    // A reload is recoverable until the agent has durably recorded the
+    // conversation. Once that acknowledgement succeeds, do not replay the task
+    // on a later, unrelated page reload.
+    navigate.forgetPendingNavigation();
     this.activeTaskId = submitted.taskId;
     this.watchTask(submitted, { responseComplete: verified.responseComplete });
     return submitted;
@@ -276,6 +282,7 @@ class Driver {
       this.report({ type: 'automation-progress', taskId: task.taskId, message: `Sending ${turn.mode === 'ask' ? 'Ask' : 'Agent'} follow-up…` });
       await composer.clickSend({
         isConversationOpen: () => conversationIdFromRouteUrl(location.href) === conversationId,
+        isSubmissionObserved: () => enforcement?.isSettled?.(),
       });
       sendStarted = true;
       verified = await enforcement.wait(45_000);
@@ -356,6 +363,7 @@ class Driver {
     });
     const conversationUrl = await navigate.waitForConversationUrl();
     const { tree } = await this.api.treeMergeSubmitted(request.treeId, conversationUrl);
+    navigate.forgetPendingNavigation();
     this.activeMerge = {
       treeId: request.treeId,
       resultFilename: request.resultFilename,

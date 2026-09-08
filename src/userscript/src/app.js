@@ -47,6 +47,7 @@ class App {
     this.eventSequence = 0;
     this.notifiedUpdateKey = null;
     this.taskTargetUpdates = new Map();
+    this.taskSubmissionPromises = new Map();
     this.actions = this.buildActions();
     this.setupViews();
   }
@@ -630,6 +631,10 @@ class App {
 
           const { task } = await app.api.createTask(input);
           app.store.upsertTask(task);
+          // Clear the draft only after the agent has durably created the task.
+          // The draft stays in memory while the browser is being navigated so a
+          // transient ChatGPT route/render failure cannot make the user's task
+          // appear to vanish.
           app.store.setComposer({ taskText: '', attachments: [], treeName: '' }, 'silent');
           app.store.set({ activeTaskId: task.taskId, activity: [] }, 'tasks');
           app.renderActiveView();
@@ -638,14 +643,23 @@ class App {
         }, { failure: 'The task package could not be created.' });
       },
 
-      async submitTask(taskId) {
-        const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
-        return app.run(async () => {
-          const submitted = await app.driver.submitTask(task);
-          app.store.upsertTask(submitted);
-          app.renderActiveView();
-          return submitted;
-        }, { failure: 'The send failed.' });
+      submitTask(taskId) {
+        if (app.taskSubmissionPromises.has(taskId)) return app.taskSubmissionPromises.get(taskId);
+        const promise = (async () => {
+          const task = app.store.task(taskId) || (await app.api.task(taskId)).task;
+          return app.run(async () => {
+            const submitted = await app.driver.submitTask(task);
+            app.store.upsertTask(submitted);
+            app.renderActiveView();
+            return submitted;
+          }, { failure: 'The send failed.' });
+        })();
+        let tracked;
+        tracked = promise.finally(() => {
+          if (app.taskSubmissionPromises.get(taskId) === tracked) app.taskSubmissionPromises.delete(taskId);
+        });
+        app.taskSubmissionPromises.set(taskId, tracked);
+        return tracked;
       },
 
       async refreshTask(taskId) {
@@ -1134,11 +1148,25 @@ class App {
     this.checkForUpdate({ announce: true }).catch(() => {});
     setInterval(() => this.checkForUpdate({ announce: true }).catch(() => {}), UPDATE_CHECK_INTERVAL_MILLISECONDS);
 
-    const pending = navigate.takePendingNavigation();
+    // Leave the recovery marker in sessionStorage until the driver has
+    // acknowledged the submission with the agent. If ChatGPT reloads while the
+    // composer is being prepared, consuming it during boot would lose the task
+    // before the retry had a chance to start.
+    const pending = navigate.peekPendingNavigation();
     if (pending?.taskId) {
-      this.actions.submitTask(pending.taskId).catch(() => {});
+      const task = this.store.task(pending.taskId);
+      // If the acknowledgement made it to the agent just before a page reload,
+      // the task is already being watched by refreshTasks(). Replaying the
+      // prompt here would create a second ChatGPT turn. Only prepared tasks are
+      // safe to resume from this marker.
+      if (task?.state === 'prepared') this.actions.submitTask(pending.taskId).catch(() => {});
+      else navigate.forgetPendingNavigation();
     } else if (pending?.merge?.treeId) {
-      this.driver.submitMerge(pending.merge).catch(() => {});
+      const tree = this.store.state.trees.find((item) => item.id === pending.merge.treeId);
+      // refreshTrees() adopts a merge that was acknowledged before a reload;
+      // do not submit the same merge prompt a second time.
+      if (tree?.mergeState !== 'submitted') this.driver.submitMerge(pending.merge).catch(() => {});
+      else navigate.forgetPendingNavigation();
     }
   }
 }

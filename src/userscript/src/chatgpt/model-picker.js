@@ -2,6 +2,7 @@ const {
   TASK_MODEL_PICKER_OPTIONS,
   TASK_REASONING_PICKER_OPTIONS,
   taskModelSupportsReasoning,
+  taskModelDefaultReasoning,
 } = require('../../../shared/chatgpt');
 const { isDarkTheme, observeTheme } = require('../ui/theme');
 
@@ -13,7 +14,7 @@ const MENU_ID = 'patchwork-task-model-menu';
 const SLOT_ID = 'patchwork-task-model-selector-slot';
 const SUPPRESSION_ID = 'patchwork-native-model-selector-suppression';
 const MUTATION_SETTLE_MILLISECONDS = 250;
-const MENU_HEIGHT = 374;
+const MENU_HEIGHT = 412;
 const MENU_WIDTH = 260;
 
 const NATIVE_PICKER_SELECTOR = [
@@ -27,16 +28,19 @@ const NATIVE_PICKER_SELECTOR = [
   'button[class*="composer-intelligence-button"]',
 ].join(', ');
 
-const NATIVE_PICKER_LABEL = /^(?:ChatGPT(?:\s+5(?:\.\d+)*)?|GPT-5(?:\.\d+)*(?:\s+(?:Sol|Luna|Instant|Thinking|Auto|Pro))?|5\.6\s+(?:Sol|Luna)|Instant|Thinking(?:\s+mini)?|Auto|Pro)$/i;
+const NATIVE_PICKER_LABEL = /^(?:ChatGPT(?:\s+[56](?:\.\d+)*)?|GPT-[56](?:\.\d+)*(?:\s+(?:Astra|Sol|Luna|Instant|Thinking|Auto|Pro))?|6\s+Astra|5\.6\s+(?:Sol|Luna)|Instant|Thinking(?:\s+mini)?|Auto|Pro)$/i;
 const COMPOSER_PROMPT_SELECTOR = '#prompt-textarea, [data-testid=\"prompt-textarea\"]';
 const COMPOSER_SEND_SELECTOR = '[data-testid=\"send-button\"], button[aria-label^=\"Send\" i]';
 
 const MENU_ITEMS = [
   { section: 'Model' },
+  { choice: 'model:astra', label: 'GPT-6 Astra' },
   { choice: 'model:sol', label: 'GPT-5.6 Sol' },
   { choice: 'model:luna', label: 'GPT-5.6 Luna' },
   { divider: true },
   { section: 'Thinking' },
+  { choice: 'reasoning:standard', label: 'Standard' },
+  { choice: 'reasoning:extended', label: 'Extended' },
   { choice: 'reasoning:default', label: 'Auto' },
   { choice: 'reasoning:instant', label: 'Instant' },
   { choice: 'reasoning:low', label: 'Low' },
@@ -115,7 +119,7 @@ function displayModel(current = selection) {
 }
 
 function compactModelLabel(model) {
-  return model === 'luna' ? 'Luna' : 'Sol';
+  return model === 'astra' ? 'Astra' : model === 'luna' ? 'Luna' : 'Sol';
 }
 
 function reasoningLabel(mode) {
@@ -147,7 +151,7 @@ function applyChoice(choice, current = selection) {
   const [kind, value] = choice.split(':');
   if (kind === 'model') {
     current.model = value;
-    if (!taskModelSupportsReasoning(displayModel(current), current.reasoningMode)) current.reasoningMode = 'default';
+    if (!taskModelSupportsReasoning(displayModel(current), current.reasoningMode)) current.reasoningMode = taskModelDefaultReasoning(current.model);
   }
   else if (taskModelSupportsReasoning(displayModel(current), value)) current.reasoningMode = value;
   return current;
@@ -174,7 +178,7 @@ function setSelection({ model, reasoningMode } = {}) {
   if (!changed) return currentSelection();
   if (model) selection.model = model;
   if (reasoningMode) selection.reasoningMode = reasoningMode;
-  if (!taskModelSupportsReasoning(displayModel(), selection.reasoningMode)) selection.reasoningMode = 'default';
+  if (!taskModelSupportsReasoning(displayModel(), selection.reasoningMode)) selection.reasoningMode = taskModelDefaultReasoning(selection.model);
   const picker = document.getElementById(PICKER_ID);
   picker?.__patchworkRender?.();
   session?.menu?.renderMenu?.();
@@ -492,7 +496,8 @@ function install({
 } = {}) {
   // A re-install for the same task keeps whatever the user chose in the picker.
   if (!keepSelection && (!session || selection.taskId !== taskId)) {
-    selection = { taskId, model, reasoningMode };
+    selection = { taskId, model, reasoningMode: taskModelSupportsReasoning(model, reasoningMode)
+      ? reasoningMode : taskModelDefaultReasoning(model) };
   } else {
     selection.taskId = taskId;
   }
@@ -571,7 +576,7 @@ function uninstallDom() {
 }
 
 // The picker normally stays for the whole session so ChatGPT's composer always
-// offers Sol/Luna, with or without the Patchwork dock open. Uninstalling tears
+// offers Astra/Sol/Luna, with or without the Patchwork dock open. Uninstalling tears
 // down every hook and lets ChatGPT's own control re-render.
 function uninstall() {
   if (!session) {

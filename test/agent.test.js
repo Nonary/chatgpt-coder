@@ -2,10 +2,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const http = require('node:http');
 const os = require('node:os');
+// Git resolves symlinks in repository paths (including macOS /var).
+const temporaryRoot = require('node:fs').realpathSync(os.tmpdir());
 const path = require('node:path');
 const { test } = require('node:test');
 
-const gitConfigPath = path.join(os.tmpdir(), 'patchwork-agent-test-gitconfig');
+const gitConfigPath = path.join(temporaryRoot, 'patchwork-agent-test-gitconfig');
 require('node:fs').writeFileSync(gitConfigPath, '[core]\n\tautocrlf = false\n\teol = lf\n');
 process.env.GIT_CONFIG_GLOBAL = gitConfigPath;
 process.env.GIT_CONFIG_SYSTEM = gitConfigPath;
@@ -33,7 +35,7 @@ async function createRepository(root, name = 'sample-repository') {
 }
 
 async function startAgent(context) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-'));
   const config = await loadConfig({ dataRoot: root, port: 0 });
   const started = await startServer(config);
   const { port } = started.server.address();
@@ -99,7 +101,7 @@ test('an occupied configured port falls back until a random port can be bound', 
     new Promise((resolve) => blocker.close(resolve))
   ))));
 
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-port-fallback-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-port-fallback-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const config = await loadConfig({ dataRoot: root, port: occupiedPorts[0] });
   const candidates = [occupiedPorts[1], 0];
@@ -145,7 +147,7 @@ test('unknown routes and wrong methods are reported distinctly', async (context)
 
 test('choosing the original repositories never runs coding-tree validation', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-original-target-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-original-target-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const firstRepository = await createRepository(workspace, 'first-repository');
   const secondRepository = await createRepository(workspace, 'second-repository');
@@ -172,7 +174,7 @@ test('choosing the original repositories never runs coding-tree validation', asy
 
 test('a task travels create, download, submit, result, and apply entirely over HTTP', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-repo-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-repo-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -277,7 +279,7 @@ test('a task travels create, download, submit, result, and apply entirely over H
 
 test('creating an apply target sends the ready result to that new tree', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-new-apply-tree-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-new-apply-tree-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
   const created = await agent.call('POST', '/v1/tasks', {
@@ -331,7 +333,7 @@ test('creating an apply target sends the ready result to that new tree', async (
 
 test('a ready result applies to an existing coding tree when that target is selected', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-existing-apply-tree-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-existing-apply-tree-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
   const tree = await agent.context.worktreeService.create(repositoryPath, 'Existing apply target');
@@ -383,7 +385,7 @@ test('a ready result applies to an existing coding tree when that target is sele
 
 test('answer-only tasks complete with the ChatGPT response and reject result uploads', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-answer-only-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-answer-only-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -415,7 +417,7 @@ test('answer-only tasks complete with the ChatGPT response and reject result upl
 
 test('Ask-first tasks can apply a result after an Agent follow-up has completed', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-follow-up-result-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-follow-up-result-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -477,7 +479,11 @@ test('Ask-first tasks can apply a result after an Agent follow-up has completed'
     }],
   })}\nPATCHWORK_RESULT_END`;
 
-  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  const ready = await agent.call('POST', `/v1/tasks/${task.taskId}/result`, { text: envelope });
+  assert.equal(ready.status, 200);
+  assert.equal(ready.payload.task.state, 'ready');
+  await assert.rejects(fs.access(path.join(repositoryPath, 'follow-up.txt')), { code: 'ENOENT' });
+  const applied = await agent.call('POST', `/v1/tasks/${task.taskId}/apply`, {});
   assert.equal(applied.status, 200);
   assert.equal(applied.payload.task.state, 'applied');
   assert.equal(applied.payload.task.activeTurnId, null);
@@ -487,7 +493,7 @@ test('Ask-first tasks can apply a result after an Agent follow-up has completed'
 
 test('a result envelope for a different task is refused before anything is applied', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-mismatch-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-mismatch-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -513,7 +519,7 @@ test('a result envelope for a different task is refused before anything is appli
 
 test('uploaded attachments are staged on disk and reach the task package', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-upload-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-upload-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -544,7 +550,7 @@ test('uploaded attachments are staged on disk and reach the task package', async
 
 test('saved prompts live in the agent and are appended to the task text', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-prompts-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-prompts-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -575,7 +581,7 @@ test('saved prompts live in the agent and are appended to the task text', async 
 
 test('the Git summary route packages a read-only task using the saved Git Summary prompt', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-summary-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-summary-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
   await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'hello again\n');
@@ -597,7 +603,7 @@ test('the Git summary route packages a read-only task using the saved Git Summar
 
 test('the event log is replayed from a sequence so a page reload misses nothing', async (context) => {
   const agent = await startAgent(context);
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-agent-events-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-agent-events-'));
   context.after(() => fs.rm(workspace, { recursive: true, force: true }));
   const repositoryPath = await createRepository(workspace);
 
@@ -626,7 +632,7 @@ test('event long-polling resolves as soon as an event arrives and otherwise time
 });
 
 test('the filesystem service browses directories and finds repositories for the in-page picker', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-fs-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-fs-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   await createRepository(path.join(root, 'projects'), 'alpha');
   await fs.mkdir(path.join(root, 'projects', 'plain'), { recursive: true });
@@ -647,7 +653,7 @@ test('the filesystem service browses directories and finds repositories for the 
 });
 
 test('the filesystem service opens the Windows folder picker and returns its selected directory', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-native-picker-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-native-picker-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const calls = [];
   const service = new FsService({
@@ -681,7 +687,7 @@ test('canceling the native folder picker returns no directory', async () => {
 
 test('filesystem discovery adds repositories to the durable picker catalog', async (context) => {
   const agent = await startAgent(context);
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-catalog-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-catalog-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root, 'remember-me');
   const query = new URLSearchParams({ path: root });
@@ -696,7 +702,7 @@ test('filesystem discovery adds repositories to the durable picker catalog', asy
 });
 
 test('prompt records are normalized and clamped before they are stored', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-prompt-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-prompt-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
 
   assert.equal(normalizePrompt({ name: '  ', content: 'x' }), null);
@@ -792,8 +798,8 @@ test('the served userscript has its placeholders replaced and no CORS grant', as
 });
 
 test('a submitted task without a confirmed conversation is recovered on agent start', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-recover-'));
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-recover-repo-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-recover-'));
+  const workspace = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-recover-repo-'));
   context.after(() => Promise.all([
     fs.rm(root, { recursive: true, force: true }),
     fs.rm(workspace, { recursive: true, force: true }),

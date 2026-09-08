@@ -377,6 +377,9 @@ function beginEnforcement({ configuration, packageFilename = null }) {
     dispose() {
       if (enforcement === active) enforcement = null;
     },
+    isSettled() {
+      return settled;
+    },
   };
 }
 

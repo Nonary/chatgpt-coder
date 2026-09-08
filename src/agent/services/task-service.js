@@ -17,11 +17,13 @@ const {
   isChatGPTConversationUrl,
   normalizeConversationTitle,
   taskModelSupportsReasoning,
+  TASK_MODEL_PICKER_OPTIONS,
+  TASK_REASONING_PICKER_OPTIONS,
 } = require('../../shared/chatgpt');
 
 const SCHEMA_VERSION = 1;
-const TASK_MODELS = new Set(['default', 'sol', 'luna']);
-const REASONING_MODES = new Set(['default', 'instant', 'low', 'medium', 'high', 'extra-high', 'pro']);
+const TASK_MODELS = new Set(['default', ...Object.keys(TASK_MODEL_PICKER_OPTIONS)]);
+const REASONING_MODES = new Set(['default', ...Object.keys(TASK_REASONING_PICKER_OPTIONS)]);
 const FOLLOW_UP_MODES = new Set(['ask', 'agent']);
 const FOLLOW_UP_ACTIVE_STATES = new Set(['created', 'submitted', 'awaiting-result']);
 const TERMINAL_TASK_STATES = new Set(['applied', 'rolled-back', 'resolved']);

@@ -46,6 +46,12 @@ function freshRouteReady(workspaceId = null) {
   return workspaceRouteMatches(location.href, workspaceId) && !hasVisibleConversation();
 }
 
+function isNativeNavigationControl(element) {
+  return typeof element?.matches === 'function' && element.matches(
+    '[data-testid="create-new-chat-button"], [data-testid="new-chat-button"]',
+  );
+}
+
 function labelOf(element) {
   return [element.getAttribute('aria-label'), element.getAttribute('title'), element.textContent]
     .filter(Boolean).join(' ').trim();
@@ -75,9 +81,8 @@ function navigateInPage(targetUrl, { preferNewChat = false, workspaceId = null }
       return false;
     }
   }) : null;
-  const newChatControl = controls.find((element) => element.matches(
-    '[data-testid="create-new-chat-button"], [data-testid="new-chat-button"]',
-  ) || /^(?:new chat|start new chat|new conversation)$/i.test(labelOf(element)));
+  const newChatControl = controls.find((element) => isNativeNavigationControl(element)
+    || /^(?:new chat|start new chat|new conversation)$/i.test(labelOf(element)));
 
   // A project landing route with no conversation ID already is a fresh chat.
   // Clicking ChatGPT's global New chat control from here can leave the project,
@@ -128,9 +133,18 @@ function rememberPendingNavigation(pending) {
 }
 
 function takePendingNavigation() {
+  const pending = peekPendingNavigation();
+  forgetPendingNavigation();
+  return pending;
+}
+
+// Pending navigation is also the submission recovery marker. Do not consume it
+// merely because the userscript booted: a reload can happen after ChatGPT has
+// opened the fresh composer but before the task has been acknowledged by the
+// agent. It is cleared only after that acknowledgement succeeds.
+function peekPendingNavigation() {
   try {
     const raw = sessionStorage.getItem(PENDING_KEY);
-    sessionStorage.removeItem(PENDING_KEY);
     return raw ? JSON.parse(raw) : null;
   } catch {
     return null;
@@ -166,19 +180,21 @@ function projectUrl(project) {
 async function openFreshChat(project = null, pending = null) {
   const targetUrl = projectUrl(project);
   const workspaceId = project?.id || null;
+  // Set this before the fresh-route fast path as well. The page can reload while
+  // the package is being attached even when the requested fresh route was
+  // already open when submission began.
+  if (pending) rememberPendingNavigation(pending);
   if (freshRouteReady(workspaceId)) {
     return { navigated: true, method: 'reuse-fresh-route' };
   }
 
   // Record recovery before clicking anything: ChatGPT sometimes turns a
   // rendered project link into a document navigation instead of an SPA route.
-  if (pending) rememberPendingNavigation(pending);
   const inPage = navigateInPage(targetUrl, { preferNewChat: true, workspaceId });
   if (inPage.navigated && await waitForFreshRoute(workspaceId)) {
     // ChatGPT updates the route just before its composer render settles. Give
     // that render one turn so the upload cannot bind to the outgoing composer.
     await delay(100);
-    forgetPendingNavigation();
     return inPage;
   }
 
@@ -187,19 +203,15 @@ async function openFreshChat(project = null, pending = null) {
   // authenticated page or waiting through a complete document load.
   if (activateRouteInPage(targetUrl) && await waitForFreshRoute(workspaceId, 2_000)) {
     await delay(100);
-    forgetPendingNavigation();
     return { navigated: true, method: 'in-page-route' };
   }
 
-  // If ChatGPT's router is unhealthy, preserve enough state for the new page to
-  // resume the submission instead of silently abandoning it during navigation.
-  location.assign(targetUrl);
-  await delay(5_000);
-  if (!freshRouteReady(workspaceId)) {
-    throw new Error('ChatGPT did not open a fresh chat. The existing conversation was left unchanged.');
-  }
-  forgetPendingNavigation();
-  return { navigated: true, method: 'hard-load' };
+  // Never hard-reload for an automated task submission. A full document load can
+  // tear down ChatGPT's composer while the package is being attached, which
+  // looks like the task was erased and can leave the user clicking Send again.
+  // The task is already durable in the agent; fail in place so it remains
+  // retryable instead of replacing the page underneath the user.
+  throw new Error('ChatGPT did not open a fresh chat without reloading the page. The existing conversation was left unchanged.');
 }
 
 async function openConversation(conversationUrl) {
@@ -234,7 +246,9 @@ module.exports = {
   openConversation,
   openFreshChat,
   projectUrl,
+  forgetPendingNavigation,
   rememberPendingNavigation,
+  peekPendingNavigation,
   takePendingNavigation,
   waitForConversationUrl,
   waitForFreshRoute,

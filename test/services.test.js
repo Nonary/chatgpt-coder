@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
+// Git resolves symlinks in repository paths (including macOS /var).
+const temporaryRoot = require('node:fs').realpathSync(os.tmpdir());
 const path = require('node:path');
 const { test } = require('node:test');
 const AdmZip = require('adm-zip');
@@ -8,7 +10,7 @@ const AdmZip = require('adm-zip');
 // Patchwork never rewrites line endings, so the suite pins Git's line-ending
 // configuration for every repository it creates, clones, or patches. Without
 // this, a host with core.autocrlf=true fails content assertions.
-const gitConfigPath = path.join(os.tmpdir(), 'patchwork-test-gitconfig');
+const gitConfigPath = path.join(temporaryRoot, 'patchwork-test-gitconfig');
 require('node:fs').writeFileSync(gitConfigPath, '[core]\n\tautocrlf = false\n\teol = lf\n');
 process.env.GIT_CONFIG_GLOBAL = gitConfigPath;
 process.env.GIT_CONFIG_SYSTEM = gitConfigPath;
@@ -90,7 +92,7 @@ test('Git Summary prompts use the saved prompt when present and the built-in pro
 });
 
 test('Git Summary prompt service uses the saved prompt as the replaceable Source Control instruction', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-prompts-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-prompts-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const prompts = new PromptService(root);
   assert.equal(await prompts.gitSummaryPrompt(), null);
@@ -118,7 +120,7 @@ test('Git Summary result instructions do not ask for verification in the generat
 });
 
 test('follow-up turns persist Ask/Agent state without rewriting the legacy answerOnly flag', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-turns-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-follow-up-turns-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const contextRepositoryPath = await createRepository(path.join(root, 'context'));
@@ -216,7 +218,7 @@ test('follow-up turns persist Ask/Agent state without rewriting the legacy answe
 });
 
 test('a stale Agent follow-up result fails only the active turn', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-stale-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-follow-up-stale-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -293,7 +295,7 @@ function plainTextMultiRepositoryResult(task, patches, commitMessage = 'feat(wor
 }
 
 test('Git Summary tasks package staged and unstaged changes into a visible read-only task', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-summary-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-git-summary-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const resolvedRepositoryPath = await fs.realpath(repositoryPath);
@@ -343,7 +345,7 @@ test('Git Summary tasks package staged and unstaged changes into a visible read-
 });
 
 test('outbound task packages are ZIP archives containing real Git bundles', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const history = await createDivergentHistory(repositoryPath);
@@ -390,7 +392,7 @@ test('outbound task packages are ZIP archives containing real Git bundles', asyn
 });
 
 test('bundle creation keeps a detached HEAD commit alongside repository refs', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-detached-bundle-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-detached-bundle-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   await runGit(repositoryPath, ['switch', '--detach', 'HEAD']);
@@ -411,7 +413,7 @@ test('bundle creation keeps a detached HEAD commit alongside repository refs', a
 });
 
 test('answer-only tasks package repositories as read-only context without a result-file protocol', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-answer-only-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-answer-only-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -441,7 +443,7 @@ test('answer-only tasks package repositories as read-only context without a resu
 });
 
 test('tasks can package multiple repositories into one ZIP', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-repository-task-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-multi-repository-task-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const firstRepositoryPath = await createRepository(root);
   const secondRepositoryPath = path.join(root, 'second-repository');
@@ -495,7 +497,7 @@ test('tasks can package multiple repositories into one ZIP', async (context) => 
 });
 
 test('tasks can include configured IaC repositories as read-only bundle context', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-context-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-iac-context-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const iacRepositoryPath = await createRepository(path.join(root, 'iac-root'));
@@ -540,7 +542,7 @@ test('tasks can include configured IaC repositories as read-only bundle context'
 });
 
 test('IaC bundles preserve local working changes without making the IaC repository patchable', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-dirty-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-iac-dirty-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const iacRepositoryPath = await createRepository(path.join(root, 'iac-root'));
@@ -575,7 +577,7 @@ test('IaC bundles preserve local working changes without making the IaC reposito
 });
 
 test('IaC configuration stays opt-in and malformed settings are rejected', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-iac-settings-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-iac-settings-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const settingsPath = path.join(root, 'settings.json');
   const service = new IacService({ settingsPath });
@@ -601,7 +603,7 @@ test('IaC configuration stays opt-in and malformed settings are rejected', async
 });
 
 test('task attachments are copied into task storage and included in the submitted ZIP', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-attachments-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-attachments-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const attachmentPath = path.join(root, 'requirements.txt');
@@ -635,7 +637,7 @@ test('task attachments are copied into task storage and included in the submitte
 });
 
 test('task model and reasoning selections are persisted with the task', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-model-selection-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-model-selection-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -672,6 +674,28 @@ test('task model and reasoning selections are persisted with the task', async (c
     reasoningMode: 'pro',
   });
   assert.equal(proTask.reasoningMode, 'pro');
+  for (const reasoningMode of ['standard', 'extended']) {
+    const astraTask = await tasks.createTask({
+      taskText: `Use Astra with ${reasoningMode} thinking.`,
+      repositories: [repository],
+      model: 'astra',
+      reasoningMode,
+    });
+    assert.equal(astraTask.model, 'astra');
+    assert.equal(astraTask.reasoningMode, reasoningMode);
+    const storedAstraTask = await tasks.getTask(astraTask.taskId);
+    assert.equal(storedAstraTask.model, 'astra');
+    assert.equal(storedAstraTask.reasoningMode, reasoningMode);
+  }
+  await assert.rejects(
+    tasks.createTask({
+      taskText: 'Astra cannot use Instant.',
+      repositories: [repository],
+      model: 'astra',
+      reasoningMode: 'instant',
+    }),
+    /Unsupported ChatGPT reasoning mode for astra: instant/,
+  );
   await assert.rejects(
     tasks.createTask({
       taskText: 'Luna cannot use Pro.',
@@ -684,7 +708,7 @@ test('task model and reasoning selections are persisted with the task', async (c
 });
 
 test('task mutations serialize updates and reject terminal lifecycle regressions', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-state-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-task-state-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -725,7 +749,7 @@ test('task mutations serialize updates and reject terminal lifecycle regressions
 });
 
 test('result application and rollback share one task mutation owner', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-result-state-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-result-state-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -756,7 +780,7 @@ test('result application and rollback share one task mutation owner', async (con
 });
 
 test('submitted tasks can change their apply target without rebuilding the task package', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-target-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-task-target-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -796,7 +820,7 @@ test('submitted tasks can change their apply target without rebuilding the task 
 });
 
 test('selected local skills are discovered, copied into the task package, and described in the prompt', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-skills-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-skills-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const homeDirectory = path.join(root, 'home');
@@ -866,7 +890,7 @@ test('selected local skills are discovered, copied into the task package, and de
 });
 
 test('dirty repositories keep their full history and capture unstaged files as a task tip', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-working-snapshot-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-working-snapshot-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const history = await createDivergentHistory(repositoryPath);
@@ -914,7 +938,7 @@ test('dirty repositories keep their full history and capture unstaged files as a
 
 
 test('workspace submodules are discovered from Git metadata and resolved as ordinary task repositories', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-submodule-workspace-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-submodule-workspace-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const parentPath = await createRepository(path.join(root, 'parent'));
   const childSourcePath = await createRepository(path.join(root, 'child-source'));
@@ -988,7 +1012,7 @@ test('workspace submodules are discovered from Git metadata and resolved as ordi
 });
 
 test('coding tree repository resolution rejects more than one editable repository', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-multi-tree-guard-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-multi-tree-guard-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const firstPath = await createRepository(path.join(root, 'first'));
   const secondPath = await createRepository(path.join(root, 'second'));
@@ -1003,7 +1027,7 @@ test('coding tree repository resolution rejects more than one editable repositor
 });
 
 test('multi-repository apply preflights every repository before touching the first', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-atomic-multi-apply-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-atomic-multi-apply-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const firstPath = await createRepository(path.join(root, 'first'));
   const secondPath = await createRepository(path.join(root, 'second'));
@@ -1011,6 +1035,7 @@ test('multi-repository apply preflights every repository before touching the fir
   await tasks.initialize();
   const task = await tasks.createTask({
     taskText: 'Change both greetings.',
+    autoApply: false,
     repositories: [{ path: firstPath }, { path: secondPath }],
   });
 
@@ -1055,7 +1080,7 @@ test('multi-repository apply preflights every repository before touching the fir
 });
 
 test('results apply and commit after the coding tree HEAD advances', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-advanced-head-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-advanced-head-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1088,7 +1113,7 @@ test('results apply and commit after the coding tree HEAD advances', async (cont
 });
 
 test('conflict resolution reapplies a result blocked by dirty changes before packaging', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-reapply-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-conflict-reapply-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1155,7 +1180,7 @@ test('conflict resolution reapplies a result blocked by dirty changes before pac
 });
 
 test('conflicting results remain in the tree and can be resubmitted with unstaged context', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-conflict-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1182,7 +1207,9 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
   const conflicted = await ingestDownloadedText(new ResultService(tasks), tasks, task, plainTextResult(task, patchBody, 'fix(greeting): change greeting'));
   assert.equal(conflicted.state, 'conflicted');
   assert.match(conflicted.error, /retry the saved result/i);
-  assert.deepEqual(conflicted.result.conflicts[0].files, ['hello.txt']);
+  assert.deepEqual(conflicted.result.conflicts[0].files, []);
+  assert.equal(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), 'newer coding tree version\n');
+  await new ResultService(tasks).prepareConflictResolution(task.taskId);
   assert.match(await fs.readFile(path.join(tree.path, 'hello.txt'), 'utf8'), /<<<<<<<|>>>>>>>/);
 
   const resolutionTask = await tasks.createTask({
@@ -1228,7 +1255,7 @@ test('conflicting results remain in the tree and can be resubmitted with unstage
 });
 
 test('a conflict-resolution result falls back to the original repository when its worktree is deleted', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-resolution-target-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-resolution-target-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1290,7 +1317,7 @@ test('a conflict-resolution result falls back to the original repository when it
 });
 
 test('a conflicted result can be retried after the target is cleaned up', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-retry-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-conflict-retry-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1324,7 +1351,7 @@ test('a conflicted result can be retried after the target is cleaned up', async 
 });
 
 test('an unborn repository is snapshotted without changing the source and accepts its result', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-unborn-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-unborn-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = path.join(root, 'brand-new-repository');
   await fs.mkdir(repositoryPath, { recursive: true });
@@ -1392,7 +1419,7 @@ test('an unborn repository is snapshotted without changing the source and accept
 });
 
 test('a matching ChatGPT result validates, applies, and rolls back', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-result-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -1434,7 +1461,7 @@ test('a matching ChatGPT result validates, applies, and rolls back', async (cont
 });
 
 test('an applied source task accepts a newer cumulative follow-up result', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-result-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-follow-up-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -1486,7 +1513,7 @@ test('an applied source task accepts a newer cumulative follow-up result', async
 });
 
 test('an invalid Agent follow-up preserves the previously applied result', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-follow-up-invalid-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-follow-up-invalid-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -1527,7 +1554,7 @@ test('an invalid Agent follow-up preserves the previously applied result', async
     .replace(repository.baseCommit, '0'.repeat(repository.baseCommit.length));
   await assert.rejects(
     ingestDownloadedText(results, tasks, submitted, invalidResult),
-    /Follow-up result ignored/i,
+    /patch targets the wrong base commit/i,
   );
 
   current = await tasks.getTask(task.taskId);
@@ -1535,12 +1562,13 @@ test('an invalid Agent follow-up preserves the previously applied result', async
   assert.equal(current.result.contentHash, firstContentHash);
   assert.equal(current.activeTurnId, null);
   assert.equal(current.turns.at(-1).state, 'failed');
+  assert.match(current.turns.at(-1).error, /Follow-up result ignored/i);
   assert.equal(current.appliedResult, null, 'the existing applied result remains the active result record');
   assert.equal(await fs.readFile(path.join(repositoryPath, 'hello.txt'), 'utf8'), 'first result\n');
 });
 
 test('coding tree follow-up results accumulate commits and roll back as one task', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-follow-up-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-tree-follow-up-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1588,7 +1616,7 @@ test('coding tree follow-up results accumulate commits and roll back as one task
 });
 
 test('a downloaded text result file validates and applies automatically', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -1642,7 +1670,7 @@ test('plain-text result fields may mention the result end marker', () => {
 });
 
 test('legacy whole-payload base64 results remain ingestible', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-legacy-text-result-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-legacy-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -1676,7 +1704,7 @@ test('legacy whole-payload base64 results remain ingestible', async (context) =>
 });
 
 test('a corrected result can replace an invalid result on a failed task', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-result-retry-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-result-retry-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -1718,7 +1746,7 @@ test('a corrected result can replace an invalid result on a failed task', async 
 });
 
 test('coding trees commit task results, accept follow-ups, and squash merge', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -1810,7 +1838,7 @@ test('coding trees commit task results, accept follow-ups, and squash merge', as
 });
 
 test('coding tree merge leaves conflicting source changes untouched', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-tree-conflict-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-tree-conflict-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const trees = new WorktreeService(path.join(root, 'data'));
@@ -1849,7 +1877,7 @@ test('coding tree merge leaves conflicting source changes untouched', async (con
 });
 
 test('coding tree merge combines tree-only insertions with nearby source edits', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-insertion-merge-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-insertion-merge-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   await fs.writeFile(path.join(repositoryPath, 'workflow.test.js'), [
@@ -1896,7 +1924,7 @@ test('coding tree merge combines tree-only insertions with nearby source edits',
 });
 
 test('a resolved tree can immediately prepare the resumed final merge', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-resumed-merge-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-resumed-merge-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const trees = new WorktreeService(path.join(root, 'data'));
@@ -1914,7 +1942,7 @@ test('a resolved tree can immediately prepare the resumed final merge', async (c
 });
 
 test('unmanaged Git worktrees are not added to the coding-tree catalog', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-discovered-tree-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-discovered-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const existingPath = path.join(root, 'existing-worktree');
@@ -1932,7 +1960,7 @@ test('unmanaged Git worktrees are not added to the coding-tree catalog', async (
 });
 
 test('tree listing reads explicit records without invoking repository discovery', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-discovery-coalesce-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-discovery-coalesce-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const trees = new WorktreeService(path.join(root, 'data'), () => {});
   await trees.initialize();
@@ -1940,7 +1968,7 @@ test('tree listing reads explicit records without invoking repository discovery'
 });
 
 test('creating a task tree with the same repository and name reuses the existing tree', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-reused-tree-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-reused-tree-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const trees = new WorktreeService(path.join(root, 'data'));
@@ -1971,7 +1999,7 @@ test('commit messages used for coding trees must be conventional', () => {
 });
 
 test('source control stages, diffs, commits, and records history', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-git-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   await fs.writeFile(path.join(repositoryPath, 'hello.txt'), 'changed greeting\n');
@@ -2025,7 +2053,7 @@ test('source control stages, diffs, commits, and records history', async (contex
 });
 
 test('adding a repository does not re-inspect existing workspace repositories', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-add-repository-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-add-repository-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const firstRepositoryPath = await createRepository(root);
   const secondRepositoryPath = await createRepository(path.join(root, 'other'));
@@ -2042,7 +2070,7 @@ test('adding a repository does not re-inspect existing workspace repositories', 
 });
 
 test('source control status does not repeat repository discovery for history', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-status-discovery-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-status-discovery-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const git = new GitService(path.join(root, 'data'));
@@ -2057,7 +2085,7 @@ test('source control status does not repeat repository discovery for history', a
 });
 
 test('source control keeps removed and discovered repositories in a durable picker catalog', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-known-repositories-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-known-repositories-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const firstRepositoryPath = await createRepository(root);
   const secondRepositoryPath = await createRepository(path.join(root, 'other'));
@@ -2088,7 +2116,7 @@ test('source control keeps removed and discovered repositories in a durable pick
 });
 
 test('workspace catalog mutations serialize whole-document persistence', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-workspace-state-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-workspace-state-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const firstRepositoryPath = await createRepository(root);
   const secondRepositoryPath = await createRepository(path.join(root, 'other'));
@@ -2117,7 +2145,7 @@ test('workspace catalog mutations serialize whole-document persistence', async (
 });
 
 test('source control can unstage and create the first commit', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-git-unborn-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-git-unborn-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = path.join(root, 'unborn');
   await fs.mkdir(repositoryPath);
@@ -2159,7 +2187,7 @@ test('source control compare rows align replacements for red and green split vie
 });
 
 test('task packages contain instructions and Git bundles in one ZIP', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-package-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-package-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -2197,7 +2225,7 @@ test('task packages contain instructions and Git bundles in one ZIP', async (con
 });
 
 test('task deletion removes history and task files', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-delete-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-task-delete-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const dataRoot = path.join(root, 'data');
   const tasks = new TaskService(dataRoot);
@@ -2218,7 +2246,7 @@ test('task deletion removes history and task files', async (context) => {
 });
 
 test('conflict resolution can recover a coding tree from the original task association', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-tree-recovery-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-conflict-tree-recovery-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const trees = new WorktreeService(path.join(root, 'data'));
@@ -2235,7 +2263,7 @@ test('conflict resolution can recover a coding tree from the original task assoc
 });
 
 test('worktree lookup skips unavailable matching records so conflict resolution can fall back', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-missing-tree-lookup-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-missing-tree-lookup-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const trees = new WorktreeService(path.join(root, 'data'));
@@ -2255,7 +2283,7 @@ test('worktree lookup skips unavailable matching records so conflict resolution 
 });
 
 test('conflict resolution preparation falls back to the original repository when its worktree is deleted', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-conflict-target-rebind-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-conflict-target-rebind-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const dataRoot = path.join(root, 'data');
@@ -2319,7 +2347,7 @@ test('conflict resolution preparation falls back to the original repository when
 });
 
 test('task history persists across service instances and lists newest tasks first', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-task-history-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-task-history-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const dataRoot = path.join(root, 'data');
   const tasks = new TaskService(dataRoot);
@@ -2346,7 +2374,7 @@ test('task history persists across service instances and lists newest tasks firs
 });
 
 test('conflict-resolution tasks bundle the original checkout as read-only context', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-read-only-context-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-read-only-context-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const writablePath = await createRepository(path.join(root, 'writable'));
   const contextPath = await createRepository(path.join(root, 'context'));
@@ -2388,7 +2416,7 @@ test('conflict-resolution tasks bundle the original checkout as read-only contex
 });
 
 test('a downloaded plain-text ChatGPT result validates and applies automatically', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-text-result-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-text-result-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));
@@ -2425,7 +2453,7 @@ test('a downloaded plain-text ChatGPT result validates and applies automatically
 });
 
 test('plain-text task results require a valid Conventional Commit message in the payload', async (context) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'patchwork-required-commit-message-'));
+  const root = await fs.mkdtemp(path.join(temporaryRoot, 'patchwork-required-commit-message-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
   const repositoryPath = await createRepository(root);
   const tasks = new TaskService(path.join(root, 'data'));

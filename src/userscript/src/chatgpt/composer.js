@@ -236,18 +236,21 @@ function sendButtonState(allowClick) {
   return { found: true, enabled: true, submitted: false, clicked: true };
 }
 
-async function clickSend({ isConversationOpen, timeoutMilliseconds = 90_000 } = {}) {
+async function clickSend({ isConversationOpen, isSubmissionObserved, timeoutMilliseconds = 90_000 } = {}) {
   const startedAt = Date.now();
   let clicked = false;
-  let lastClickedAt = 0;
   while (Date.now() - startedAt < timeoutMilliseconds) {
-    if (clicked && isConversationOpen?.()) return true;
-    const allowClick = !clicked || Date.now() - lastClickedAt >= 1_500;
-    const state = sendButtonState(allowClick);
+    if (clicked && (isConversationOpen?.() || isSubmissionObserved?.())) return true;
+    // A second click is not a retry. ChatGPT can leave Send enabled for a short
+    // time while it is preparing the request, and clicking again in that window
+    // creates a second turn (or clears the first one). Once the real control has
+    // been clicked, only observe the composer until the request or generation is
+    // visibly underway.
+    const state = sendButtonState(!clicked);
     if (state.submitted || (clicked && state.found && !state.enabled)) return true;
+    if (clicked && isSubmissionObserved?.()) return true;
     if (state.clicked) {
       clicked = true;
-      lastClickedAt = Date.now();
     }
     await delay(clicked ? 250 : 500);
   }

@@ -357,6 +357,32 @@ test('task request configuration maps models and reasoning to ChatGPT slugs', ()
   assert.throws(() => taskRequestConfiguration('sol', 'ludicrous'), /Unsupported ChatGPT reasoning mode/);
 });
 
+test('Astra sends the Pro slug with Standard or Extended thinking', () => {
+  const picker = require('../src/userscript/src/chatgpt/model-picker');
+  const current = { model: 'sol', reasoningMode: 'pro' };
+  picker.applyChoice('model:astra', current);
+  assert.deepEqual(current, { model: 'astra', reasoningMode: 'standard' });
+  assert.equal(picker.displayLabel(current), 'Astra · Standard');
+  assert.deepEqual(picker.menuItems(current).filter((item) => item.choice?.startsWith('reasoning:'))
+    .map((item) => item.choice), ['reasoning:standard', 'reasoning:extended']);
+  for (const effort of ['standard', 'extended']) {
+    picker.applyChoice(`reasoning:${effort}`, current);
+    const configuration = taskRequestConfiguration(current.model, current.reasoningMode);
+    assert.equal(picker.selectedSlug(current), 'gpt-6-pro');
+    assert.equal(configuration.modelSlug, 'gpt-6-pro');
+    const payload = JSON.parse(rewriteConversationRequestBody(
+      JSON.stringify({ model: 'gpt-5-6', thinking_effort: 'max', messages: [] }), configuration,
+    ).text);
+    assert.equal(payload.model, 'gpt-6-pro');
+    assert.equal(payload.thinking_effort, effort);
+  }
+  for (const mode of ['default', 'instant', 'low', 'medium', 'high', 'extra-high', 'pro']) {
+    assert.throws(() => taskRequestConfiguration('astra', mode), /Unsupported ChatGPT reasoning mode/);
+  }
+  picker.applyChoice('model:luna', current);
+  assert.deepEqual(current, { model: 'luna', reasoningMode: 'default' });
+});
+
 test('the fetch interceptor rewrites the outgoing conversation body in place', () => {
   const configuration = taskRequestConfiguration('luna', 'low');
   const rewritten = rewriteConversationRequestBody(
@@ -750,7 +776,14 @@ test('an applied task permanently supersedes an older Git Summary, even when tha
   assert.equal(latestSourceSuggestionTask([summaryTask, appliedTask, regeneratedSummary], '/repo/a')?.taskId, 'summary-new');
 });
 
-test('repository additions merge into the existing workspace catalog', () => {
+test('repository additions merge into the existing workspace catalog', (context) => {
+  const stylesPath = require.resolve('../src/userscript/src/ui/styles.css');
+  const previousStyles = require.cache[stylesPath];
+  require.cache[stylesPath] = { exports: fs.readFileSync(stylesPath, 'utf8') };
+  context.after(() => {
+    if (previousStyles) require.cache[stylesPath] = previousStyles;
+    else delete require.cache[stylesPath];
+  });
   const { App } = require('../src/userscript/src/app');
   const store = {
     state: {
@@ -831,7 +864,7 @@ test('Git Summary source-control state stays tied to its originating repository 
     taskId: 'summary-running',
     state: 'submitted',
     chatStatus: 'streaming',
-  }], '/repo/a')?.taskId, null);
+  }], '/repo/a'), null);
   assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-a' }, changeFingerprint: 'snapshot-a' }), false);
   assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-a' }, changeFingerprint: 'snapshot-b' }), true);
   assert.equal(gitSummaryIsStale(repositoryTask, { repository: { baseCommit: 'head-b' }, changeFingerprint: 'snapshot-a' }), true);
@@ -1015,12 +1048,12 @@ test('composer command state stays ID-backed for skills and saved prompts', () =
   assert.deepEqual(filterComposerCommands(commands, 'Git Summary'), [commands[1]]);
 
   assert.equal(findSlashCommand('/code-review').query, 'code-review');
-  assert.equal(findSlashCommand('Please /code-review here').query, 'code-review');
+  assert.equal(findSlashCommand('Please /code-review here', 19).query, 'code-review');
   assert.equal(findSlashCommand('https://example.com/code'), null);
   assert.equal(findSlashCommand('C:/repo/src'), null);
   assert.equal(findSlashCommand('/repo/src'), null);
 
-  const token = findSlashCommand('Please /code-review here');
+  const token = findSlashCommand('Please /code-review here', 19);
   assert.deepEqual(removeSlashCommandToken('Please /code-review here', token), {
     text: 'Please here',
     cursor: 7,
@@ -1695,7 +1728,8 @@ test('the composer picker maps every menu choice to the slug ChatGPT expects', (
 
   const choices = picker.MENU_ITEMS.filter((item) => item.choice).map((item) => item.choice);
   assert.deepEqual(choices, [
-    'model:sol', 'model:luna',
+    'model:astra', 'model:sol', 'model:luna',
+    'reasoning:standard', 'reasoning:extended',
     'reasoning:default', 'reasoning:instant', 'reasoning:low',
     'reasoning:medium', 'reasoning:high', 'reasoning:extra-high',
     'reasoning:pro',
@@ -1705,7 +1739,7 @@ test('the composer picker maps every menu choice to the slug ChatGPT expects', (
 
 test('the picker recognizes ChatGPT model controls without matching ordinary buttons', () => {
   const { NATIVE_PICKER_LABEL, NATIVE_PICKER_SELECTOR } = require('../src/userscript/src/chatgpt/model-picker');
-  for (const label of ['ChatGPT', 'ChatGPT 5.6', 'GPT-5.6 Sol', '5.6 Luna', 'Thinking', 'Thinking mini', 'Auto', 'Pro', 'Instant']) {
+  for (const label of ['ChatGPT', 'ChatGPT 5.6', 'ChatGPT 6', 'GPT-6 Astra', 'GPT-6 Pro', '6 Astra', 'GPT-5.6 Sol', '5.6 Luna', 'Thinking', 'Thinking mini', 'Auto', 'Pro', 'Instant']) {
     assert.equal(NATIVE_PICKER_LABEL.test(label), true, `${label} should be recognized`);
   }
   for (const label of ['Send', 'Attach files', 'Share', 'New chat', 'Sol Invictus', 'ChatGPT said:']) {

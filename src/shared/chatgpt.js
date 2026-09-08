@@ -8,6 +8,12 @@ const RESULT_NAME_PATTERN = /chatgpt-ide-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.
 const MERGE_RESULT_NAME_PATTERN = /chatgpt-ide-merge-result-([0-9a-f-]{36})(?:\s*\(\d+\))?\.txt/i;
 
 const TASK_MODEL_PICKER_OPTIONS = {
+  astra: {
+    label: 'GPT-6 Astra',
+    defaultSlug: 'gpt-6-pro',
+    thinkingSlug: 'gpt-6-pro',
+    reasoningModes: ['standard', 'extended'],
+  },
   sol: {
     label: 'GPT-5.6 Sol',
     defaultSlug: 'gpt-5-6',
@@ -26,6 +32,8 @@ const TASK_MODEL_PICKER_OPTIONS = {
 };
 
 const TASK_REASONING_PICKER_OPTIONS = {
+  standard: { label: 'Standard', thinkingEffort: 'standard' },
+  extended: { label: 'Extended', thinkingEffort: 'extended' },
   instant: { label: 'Instant', thinkingEffort: null },
   low: { label: 'Low', thinkingEffort: 'min' },
   medium: { label: 'Medium', thinkingEffort: 'standard' },
@@ -37,6 +45,11 @@ const TASK_REASONING_PICKER_OPTIONS = {
 function taskModelSupportsReasoning(model, reasoningMode) {
   const modelKey = String(model || 'default').toLowerCase() === 'default' ? 'sol' : String(model || '').toLowerCase();
   return Boolean(TASK_MODEL_PICKER_OPTIONS[modelKey]?.reasoningModes.includes(reasoningMode));
+}
+
+function taskModelDefaultReasoning(model) {
+  const modelKey = String(model || 'default').toLowerCase();
+  return TASK_MODEL_PICKER_OPTIONS[modelKey]?.reasoningModes[0] || 'default';
 }
 
 function basename(value) {
@@ -180,6 +193,7 @@ module.exports = {
   TASK_MODEL_PICKER_OPTIONS,
   TASK_REASONING_PICKER_OPTIONS,
   taskModelSupportsReasoning,
+  taskModelDefaultReasoning,
   chatGPTProjectUrl,
   conversationIdFromRouteUrl,
   conversationRequestIncludesAttachment,
