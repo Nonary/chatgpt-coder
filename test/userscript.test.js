@@ -220,6 +220,51 @@ test('a fresh route is not ready while the previous conversation is still render
   }
 });
 
+test('a project route is not ready until ChatGPT renders the selected project context', () => {
+  const { projectContextReady } = require('../src/userscript/src/chatgpt/navigate');
+  const projectId = 'g-p-6a81d72f0e9c81918ec8a18a72244337';
+  const project = {
+    id: projectId,
+    shortUrl: `${projectId}-coding`,
+    name: 'Coding',
+  };
+  const previous = {
+    document: global.document,
+    getComputedStyle: global.getComputedStyle,
+    location: global.location,
+  };
+  let ariaCurrent = 'false';
+  const projectLink = {
+    href: `https://chatgpt.com/g/${project.shortUrl}/project`,
+    textContent: project.name,
+    className: '',
+    getAttribute: (name) => (name === 'aria-current' ? ariaCurrent : null),
+  };
+  global.document = {
+    querySelectorAll: (selector) => {
+      if (selector === 'a[href]') return [projectLink];
+      return [];
+    },
+  };
+  global.getComputedStyle = () => ({ display: 'block', visibility: 'visible' });
+  global.location = {
+    href: `https://chatgpt.com/g/${project.shortUrl}/project`,
+    origin: 'https://chatgpt.com',
+    pathname: `/g/${project.shortUrl}/project`,
+    search: '',
+    hash: '',
+  };
+  try {
+    assert.equal(projectContextReady(project), false, 'the route can settle before the project context is active');
+    ariaCurrent = 'page';
+    assert.equal(projectContextReady(project), true, 'an active project navigation marker confirms the swap');
+  } finally {
+    global.document = previous.document;
+    global.getComputedStyle = previous.getComputedStyle;
+    global.location = previous.location;
+  }
+});
+
 test('conversation titles come from the matching ChatGPT DOM entry before falling back to the page title', () => {
   const { conversationTitleFromDom } = require('../src/userscript/src/chatgpt/conversation-title');
   const taskId = '3f2b7f68-6d1a-4a7e-9d5e-0d3a5f7b1c22';
@@ -1249,6 +1294,16 @@ test('typing a follow-up uses the same composer refresh path as model and mode c
 
   assert.match(inputSource, /setFollowUp\(\{ taskText: taskText\.value \}, 'silent'\);\s*refreshTaskFollowUp\(\);/);
   assert.doesNotMatch(source, /function syncSendButton\(/);
+});
+
+test('follow-up model control imports the shared model menu implementation', () => {
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'userscript', 'src', 'ui', 'views', 'task-follow-up.js'),
+    'utf8',
+  );
+
+  assert.match(source, /openModelMenu: openSharedModelMenu/);
+  assert.match(source, /openSharedModelMenu\(\{[\s\S]*anchor: modelButton/);
 });
 
 test('follow-up send state ignores stale active-turn references instead of treating the latest completed turn as running', () => {

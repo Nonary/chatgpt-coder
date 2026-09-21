@@ -22,6 +22,12 @@ const { reportLayout } = require('./ui/layout-report');
 const { conversationIdFromRouteUrl, taskRequestConfiguration } = require('../../shared/chatgpt');
 const { createTaskInput } = require('./task-input');
 const { repositoryPathKey } = require('../../shared/repository-paths');
+const { parseHarText } = require('./chatgpt/har');
+const {
+  mergeSavedConversations,
+  removeSavedConversation: removeSavedConversationRecord,
+  writeSavedConversations,
+} = require('./chatgpt/saved-conversations');
 
 const ELAPSED_TICK_MILLISECONDS = 1_000;
 const UPDATE_CHECK_INTERVAL_MILLISECONDS = 30 * 60 * 1_000;
@@ -682,6 +688,51 @@ class App {
         const task = app.store.task(taskId);
         if (!task?.conversationUrl) return;
         navigate.openConversation(task.conversationUrl);
+      },
+
+      importConversationHar() {
+        const input = h('input', {
+          type: 'file',
+          accept: '.har,.json,application/json,application/har+json',
+          style: { display: 'none' },
+        });
+        input.addEventListener('change', async () => {
+          const file = input.files?.[0];
+          if (!file) return;
+          await app.run(async () => {
+            const imported = parseHarText(await file.text(), file.name);
+            if (!imported.length) throw new Error('No ChatGPT conversation IDs were found in that HAR.');
+            const savedConversations = mergeSavedConversations(
+              app.store.state.savedConversations,
+              imported,
+            );
+            writeSavedConversations(savedConversations);
+            app.store.set({ savedConversations }, 'history');
+            return imported.length;
+          }, {
+            success: (count) => `Saved ${count} conversation${count === 1 ? '' : 's'} from the HAR.`,
+            failure: 'The HAR could not be imported.',
+          });
+        });
+        input.click();
+      },
+
+      openSavedConversation(conversationId) {
+        const saved = app.store.state.savedConversations.find((item) => item.id === conversationId);
+        if (!saved) return;
+        return app.run(
+          () => navigate.openConversation(saved.conversationUrl),
+          { failure: 'The saved conversation could not be opened.' },
+        );
+      },
+
+      removeSavedConversation(conversationId) {
+        const savedConversations = removeSavedConversationRecord(
+          app.store.state.savedConversations,
+          conversationId,
+        );
+        writeSavedConversations(savedConversations);
+        app.store.set({ savedConversations }, 'history');
       },
 
       async copyPrompt(taskId) {

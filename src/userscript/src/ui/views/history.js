@@ -29,6 +29,7 @@ function searchText(task) {
 
 function renderHistory(ctx) {
   const { state } = ctx.store;
+  const savedConversations = state.savedConversations || [];
   const search = h('input', {
     type: 'search',
     class: 'field-control',
@@ -72,6 +73,60 @@ function renderHistory(ctx) {
   ));
 
   return [
+    h(
+      'div',
+      { class: 'card' },
+      h(
+        'div',
+        { class: 'row' },
+        h('h3', {}, 'Saved conversations'),
+        h('span', { class: 'spacer' }),
+        h(
+          'button',
+          { class: 'secondary', onclick: () => ctx.actions.importConversationHar() },
+          'Import HAR',
+        ),
+      ),
+      h(
+        'p',
+        { class: 'field-help' },
+        'Stores only conversation IDs and titles locally. HAR cookies, headers, tokens, and message bodies are not retained.',
+      ),
+      ...(savedConversations.length
+        ? savedConversations.map((saved) => h(
+          'div',
+          { class: 'list-item' },
+          h(
+            'span',
+            { class: 'grow' },
+            h('span', { class: 'title' }, saved.title),
+            h(
+              'span',
+              { class: 'subtitle' },
+              `${saved.sourceName} · ${saved.id}`,
+            ),
+          ),
+          h(
+            'button',
+            {
+              class: 'icon-button',
+              title: 'Open saved conversation',
+              onclick: () => ctx.actions.openSavedConversation(saved.id),
+            },
+            '→',
+          ),
+          h(
+            'button',
+            {
+              class: 'icon-button',
+              title: 'Forget saved conversation',
+              onclick: () => ctx.actions.removeSavedConversation(saved.id),
+            },
+            '×',
+          ),
+        ))
+        : [h('p', { class: 'field-help' }, 'No imported conversations yet.')]),
+    ),
     h('div', { class: 'row' }, search, stateSelect),
     h('p', { class: 'field-help' }, `${tasks.length} of ${state.tasks.length} task${state.tasks.length === 1 ? '' : 's'}`),
     ...(list.length ? list : [h('div', { class: 'empty-state' }, 'No tasks match this filter.')]),

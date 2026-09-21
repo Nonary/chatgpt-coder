@@ -1,5 +1,6 @@
 const PREFERENCE_PREFIX = 'patchwork.';
 const { readStorage, writeStorage } = require('./ui/storage');
+const { readSavedConversations } = require('./chatgpt/saved-conversations');
 
 function readPreference(key, fallback = '') {
   return readStorage(PREFERENCE_PREFIX + key, fallback);
@@ -38,6 +39,7 @@ class Store {
       prompts: [],
       skills: [],
       projects: [],
+      savedConversations: readSavedConversations(),
       iac: { exists: false, valid: true, selectors: [] },
       activity: [],
       activeTaskId: null,

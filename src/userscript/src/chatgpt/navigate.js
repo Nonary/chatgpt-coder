@@ -46,6 +46,52 @@ function freshRouteReady(workspaceId = null) {
   return workspaceRouteMatches(location.href, workspaceId) && !hasVisibleConversation();
 }
 
+function normalizedText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function hasActiveMarker(element) {
+  if (!element) return false;
+  const ariaCurrent = normalizedText(element.getAttribute?.('aria-current'));
+  if (ariaCurrent && ariaCurrent !== 'false') return true;
+  if (element.getAttribute?.('aria-selected') === 'true') return true;
+  if (element.getAttribute?.('data-active') === 'true') return true;
+  if (element.getAttribute?.('data-state') === 'active') return true;
+  const className = typeof element.className === 'string' ? element.className : '';
+  return className.split(/\s+/).some((token) => /^(?:is-)?(?:active|selected)$/i.test(token));
+}
+
+function activeProjectLinkReady(project) {
+  if (!project?.id) return false;
+  return [...document.querySelectorAll('a[href]')].some((element) => {
+    if (!isVisible(element) || !hasActiveMarker(element)) return false;
+    try {
+      const url = new URL(element.href || element.getAttribute('href') || '', location.href);
+      return url.origin === CHATGPT_ORIGIN
+        && workspaceRouteMatches(url.href, project.id);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function projectNameVisibleInMain(project) {
+  const name = normalizedText(project?.name);
+  if (!name) return false;
+  const candidates = document.querySelectorAll('main h1, main h2, [role="main"] h1, [role="main"] h2');
+  return [...candidates].some((element) => isVisible(element) && normalizedText(element.textContent) === name);
+}
+
+function projectContextReady(project = null) {
+  const workspaceId = project?.id || null;
+  if (!freshRouteReady(workspaceId)) return false;
+  if (!project) return true;
+  // The URL can update before ChatGPT has committed the new project to the page
+  // state. Require rendered evidence from the target project before a task can
+  // start filling or sending the composer.
+  return activeProjectLinkReady(project) || projectNameVisibleInMain(project);
+}
+
 function isNativeNavigationControl(element) {
   return typeof element?.matches === 'function' && element.matches(
     '[data-testid="create-new-chat-button"], [data-testid="new-chat-button"]',
@@ -124,6 +170,18 @@ async function waitForFreshRoute(workspaceId = null, timeoutMilliseconds = 5_000
   return false;
 }
 
+async function waitForProjectContext(project, timeoutMilliseconds = 5_000) {
+  if (!project) return waitForFreshRoute(null, timeoutMilliseconds);
+  const startedAt = Date.now();
+  let readyChecks = 0;
+  while (Date.now() - startedAt < timeoutMilliseconds) {
+    readyChecks = projectContextReady(project) ? readyChecks + 1 : 0;
+    if (readyChecks >= 2) return true;
+    await delay(100);
+  }
+  return false;
+}
+
 function rememberPendingNavigation(pending) {
   try {
     sessionStorage.setItem(PENDING_KEY, JSON.stringify(pending));
@@ -184,16 +242,16 @@ async function openFreshChat(project = null, pending = null) {
   // the package is being attached even when the requested fresh route was
   // already open when submission began.
   if (pending) rememberPendingNavigation(pending);
-  if (freshRouteReady(workspaceId)) {
+  if (projectContextReady(project)) {
     return { navigated: true, method: 'reuse-fresh-route' };
   }
 
   // Record recovery before clicking anything: ChatGPT sometimes turns a
   // rendered project link into a document navigation instead of an SPA route.
   const inPage = navigateInPage(targetUrl, { preferNewChat: true, workspaceId });
-  if (inPage.navigated && await waitForFreshRoute(workspaceId)) {
-    // ChatGPT updates the route just before its composer render settles. Give
-    // that render one turn so the upload cannot bind to the outgoing composer.
+  if (inPage.navigated && await waitForProjectContext(project)) {
+    // Give the settled project render one more turn so the upload cannot bind to
+    // a composer that belongs to the outgoing project.
     await delay(100);
     return inPage;
   }
@@ -201,7 +259,7 @@ async function openFreshChat(project = null, pending = null) {
   // This is the same-document fallback used by the hardened browser branches:
   // it asks ChatGPT's router to activate the project without replacing the
   // authenticated page or waiting through a complete document load.
-  if (activateRouteInPage(targetUrl) && await waitForFreshRoute(workspaceId, 2_000)) {
+  if (activateRouteInPage(targetUrl) && await waitForProjectContext(project, 2_000)) {
     await delay(100);
     return { navigated: true, method: 'in-page-route' };
   }
@@ -246,11 +304,13 @@ module.exports = {
   openConversation,
   openFreshChat,
   projectUrl,
+  projectContextReady,
   forgetPendingNavigation,
   rememberPendingNavigation,
   peekPendingNavigation,
   takePendingNavigation,
   waitForConversationUrl,
+  waitForProjectContext,
   waitForFreshRoute,
   workspaceRouteMatches,
 };

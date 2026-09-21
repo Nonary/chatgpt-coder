@@ -113,6 +113,10 @@ what the request is sent with.
 7. **Merge tree** opens a fresh chat with the tree's commit history and diff summary,
    reads the returned merge envelope, creates one squash commit on the original
    branch through a temporary integration worktree, and removes the tree.
+8. **History → Saved conversations** can import a HAR captured from ChatGPT. Patchwork
+   extracts only conversation IDs and titles, stores them in browser-local storage,
+   and can reopen the saved `/c/<id>` route later. Temporary-chat retention still
+   depends on ChatGPT; an ID is a pointer, not a transcript backup.
 
 If Git reports conflicts, Patchwork leaves the markers in place, reports the affected
 files, and offers **Retry apply**. **Resolve with ChatGPT** opens a follow-up task

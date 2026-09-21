@@ -18,6 +18,7 @@ const {
   openAttachmentMenu: openSharedAttachmentMenu,
   openCommandPicker: openSharedCommandPicker,
   openModeMenu: openSharedModeMenu,
+  openModelMenu: openSharedModelMenu,
   promptDescription,
 } = require('../composer-common');
 
