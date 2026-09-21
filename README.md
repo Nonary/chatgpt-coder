@@ -209,8 +209,9 @@ Reaching the agent is constrained by chatgpt.com's policy, not by preference: it
 `connect-src` has no loopback entry, so the page cannot call `127.0.0.1` directly.
 With a userscript manager, `GM_xmlhttpRequest` sidesteps that entirely. Without one,
 the bookmarklet uses the one route the policy leaves open — a popup bridge plus a
-`blob:` script element. ChatGPT tabs coordinate before opening it, so later tabs
-reuse the first tab's bridge without foregrounding the window.
+`blob:` script element carrying ChatGPT's active CSP nonce. ChatGPT tabs coordinate
+before opening it, so later tabs reuse the first tab's bridge without foregrounding
+the window.
 `docs/ARCHITECTURE-V3.md` shows the exact directives.
 
 The dock renders inside a shadow root with a constructible stylesheet, so Patchwork's

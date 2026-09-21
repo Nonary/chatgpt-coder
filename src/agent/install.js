@@ -58,9 +58,20 @@ function bookmarkletSource(config) {
   const origin = ${JSON.stringify(origin)};
   const token = ${JSON.stringify(token)};
   if (window.__patchworkBooted) { window.__patchworkPanel?.toggle?.(); return; }
+  const pageNonce = () => {
+    const node = typeof document.querySelector === 'function'
+      ? document.querySelector('script[nonce]')
+      : null;
+    return node && (node.nonce || node.getAttribute('nonce')) || '';
+  };
 
   const inject = (source) => {
     const element = document.createElement('script');
+    const nonce = pageNonce();
+    if (nonce) {
+      element.nonce = nonce;
+      element.setAttribute('nonce', nonce);
+    }
     element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     element.addEventListener('load', () => URL.revokeObjectURL(element.src));
     element.addEventListener('error', () => {

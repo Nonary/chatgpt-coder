@@ -108,7 +108,8 @@ Three consequences drive the design:
   is a potentially trustworthy origin.)
 - **`script-src` has no `'unsafe-eval'`** (`'wasm-unsafe-eval'` does not cover JS),
   so `eval()`-ing a downloaded bundle is blocked — but **`script-src-elem` lists
-  `blob:`**, so a Blob script element is allowed.
+  `blob:`**, so a Blob script element is allowed when it carries the page's
+  active CSP nonce.
 - **COOP is `same-origin-allow-popups`**, so a popup keeps its `window.opener`, and
   neither `window.open` navigation nor `postMessage` is a CSP-controlled channel.
 
@@ -135,8 +136,9 @@ Three transports, probed in order at boot:
 
 The first bookmarklet install, for users without a userscript manager, follows the
 only path the CSP leaves open: open the bridge popup → receive the bundle over
-`postMessage` → inject it as a `blob:` script → use the already-open bridge as the
-transport. Later tabs receive that same bundle and transport through the owner tab.
+`postMessage` → copy ChatGPT's active script nonce onto a `blob:` script → use the
+already-open bridge as the transport. Later tabs receive that same bundle and
+transport through the owner tab.
 
 ### 4. Auth
 

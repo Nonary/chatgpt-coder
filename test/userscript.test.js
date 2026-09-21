@@ -1397,6 +1397,10 @@ test('the userscript bundles every module it requires and keeps its install plac
   assert.match(loader, /patchwork\.runtime\.js/);
   assert.ok(loader.includes('__PATCHWORK_TOKEN__'), 'the agent injects the token at download time');
   assert.ok(loader.includes('__PATCHWORK_ORIGIN__'), 'the agent injects its own origin at download time');
+  assert.match(loader, /var URL = window\.URL;/, 'blob URLs use ChatGPT\'s page realm');
+  assert.match(loader, /var Blob = window\.Blob;/, 'blobs use ChatGPT\'s page realm');
+  assert.match(loader, /script\[nonce\]/, 'loader reads ChatGPT\'s CSP nonce');
+  assert.match(loader, /element\.nonce = nonce;/, 'loader applies ChatGPT\'s CSP nonce');
 
   const modules = build.collect(build.ENTRY);
   const ids = [...modules.keys()];
@@ -1498,6 +1502,8 @@ test('the bookmarklet uses only injection routes chatgpt.com actually permits', 
 
   assert.match(source, /window\.open\(/, 'popups are not governed by connect-src');
   assert.match(source, /createObjectURL\(new Blob\(/, 'script-src-elem allows blob:');
+  assert.match(source, /script\[nonce\]/, 'bookmarklet reads ChatGPT\'s CSP nonce');
+  assert.match(source, /element\.nonce = nonce;/, 'bookmarklet applies ChatGPT\'s CSP nonce');
   assert.doesNotMatch(source, /\beval\b/, "chatgpt.com's script-src has no 'unsafe-eval'");
   assert.doesNotMatch(source, /element\.src = origin/, 'script-src-elem has no loopback entry');
   assert.doesNotMatch(source, /\bimport\(/, 'dynamic import is governed by script-src too');

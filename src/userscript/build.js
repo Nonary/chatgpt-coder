@@ -145,8 +145,28 @@ function loader() {
   'use strict';
   var token = '__PATCHWORK_TOKEN__';
   var origin = '__PATCHWORK_ORIGIN__';
+  // Tampermonkey and Violentmonkey may evaluate this loader in an isolated
+  // realm. A blob URL created there is not reliably executable by a page
+  // <script> element, so always create it with ChatGPT's page-realm APIs.
+  var URL = window.URL;
+  var Blob = window.Blob;
+  function pageNonce() {
+    var node = typeof document.querySelector === 'function'
+      ? document.querySelector('script[nonce]')
+      : null;
+    return node && (node.nonce || node.getAttribute('nonce')) || '';
+  }
+  function prepareScript(element) {
+    var nonce = pageNonce();
+    if (nonce) {
+      element.nonce = nonce;
+      element.setAttribute('nonce', nonce);
+    }
+    return element;
+  }
   var socketBootstrapUrl = URL.createObjectURL(new Blob([${JSON.stringify(webSocketBootstrap())}], { type: 'text/javascript' }));
   var socketBootstrap = document.createElement('script');
+  prepareScript(socketBootstrap);
   socketBootstrap.src = socketBootstrapUrl;
   socketBootstrap.async = false;
   socketBootstrap.addEventListener('load', function () {
@@ -169,6 +189,7 @@ function loader() {
   function injectRuntime(source) {
     window.__patchworkBootstrap = { origin: origin, token: token, transport: 'gm' };
     var element = document.createElement('script');
+    prepareScript(element);
     element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     element.addEventListener('load', function () { URL.revokeObjectURL(element.src); });
     element.addEventListener('error', function () {
