@@ -1209,6 +1209,20 @@ test('the active composer selection owner routes picker changes to the visible d
   );
 });
 
+test('opening a task activates follow-up model ownership before picker sync', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'userscript', 'src', 'app.js'), 'utf8');
+  const start = source.indexOf('showTask(taskId)');
+  const end = source.indexOf('\n      checkForUpdates()', start);
+  const body = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.ok(
+    body.indexOf("app.store.set({ activeTaskId: taskId, activity: [] }, 'tasks');")
+      < body.indexOf("app.store.resetFollowUp(task, 'silent')"),
+    'active task state must be set before follow-up model state is synced',
+  );
+});
+
 test('task store ignores stale event snapshots', () => {
   const { Store } = require('../src/userscript/src/store');
   const store = new Store();

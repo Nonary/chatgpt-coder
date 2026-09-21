@@ -436,8 +436,8 @@ class App {
 
       showTask(taskId) {
         const task = app.store.task(taskId);
-        if (task) app.store.resetFollowUp(task, 'silent');
         app.store.set({ activeTaskId: taskId, activity: [] }, 'tasks');
+        if (task) app.store.resetFollowUp(task, 'silent');
         app.shell.show('tasks');
       },
 
