@@ -42,7 +42,15 @@ function activeTurn(task) {
 function canSendFollowUp(task, followUp) {
   return canFollowUp(task)
     && !activeTurn(task)
-    && Boolean(String(followUp?.taskText || '').trim());
+    && hasNonWhitespace(followUp?.taskText);
+}
+
+function hasNonWhitespace(value) {
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    if (!/\s/.test(text[index])) return true;
+  }
+  return false;
 }
 
 function renderTurnState(turn) {
@@ -100,6 +108,7 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
   let modelController = null;
   let modeController = null;
   let plusController = null;
+  let renderedChipSignature = null;
 
   const attachmentInput = h('input', {
     type: 'file',
@@ -241,6 +250,19 @@ function renderTaskFollowUpComposer(ctx, task, existing = null) {
   function renderFollowUpChips() {
     const currentState = ctx.store.state;
     const currentFollowUp = currentState.followUp;
+    const chipSignature = JSON.stringify({
+      skills: currentFollowUp.skillIds.map((skillId) => {
+        const skill = taskRef.skills?.find((item) => String(item.id) === String(skillId));
+        return [skillId, skill?.name || '', skill?.description || ''];
+      }),
+      prompts: currentFollowUp.promptIds.map((promptId) => {
+        const prompt = currentState.prompts.find((item) => item.id === promptId);
+        return [promptId, prompt?.name || '', prompt?.description || ''];
+      }),
+      attachments: currentFollowUp.attachments.map((file) => [file.name, file.size, file.path || '']),
+    });
+    if (chipSignature === renderedChipSignature) return;
+    renderedChipSignature = chipSignature;
     const selectedSkillChips = currentFollowUp.skillIds.map((skillId) => {
       const skill = taskRef.skills?.find((item) => String(item.id) === String(skillId));
       const command = skillCommandName(skill || { id: skillId });

@@ -606,6 +606,53 @@ test('attachment confirmation waits for the upload chip and reports busy process
   }
 });
 
+test('large prompts are inserted into ChatGPT in cooperative contenteditable chunks', async () => {
+  const composer = require('../src/userscript/src/chatgpt/composer');
+  const previous = {
+    document: global.document,
+    window: global.window,
+    InputEvent: global.InputEvent,
+    HTMLTextAreaElement: global.HTMLTextAreaElement,
+    HTMLInputElement: global.HTMLInputElement,
+  };
+  const chunks = [];
+  const inputEvents = [];
+  const prompt = 'follow-up line\n'.repeat(2_000) + 'finish';
+  const nativeComposer = element('div', { id: 'prompt-textarea', contenteditable: 'true' });
+  nativeComposer.focus = () => {};
+  nativeComposer.dispatchEvent = (event) => { inputEvents.push(event.type); return true; };
+  const root = element('body', {}, [nativeComposer]);
+  global.document = {
+    querySelectorAll: (selector) => root.querySelectorAll(selector),
+    createRange: () => ({ selectNodeContents() {} }),
+    execCommand: (_command, _showUi, value) => { chunks.push(value); return true; },
+  };
+  global.window = {
+    getSelection: () => ({ removeAllRanges() {}, addRange() {} }),
+  };
+  global.InputEvent = class StubInputEvent {
+    constructor(type) { this.type = type; }
+  };
+  global.HTMLTextAreaElement = class HTMLTextAreaElement {};
+  global.HTMLInputElement = class HTMLInputElement {};
+
+  try {
+    const pending = composer.setPrompt(prompt);
+    assert.equal(typeof pending?.then, 'function', 'large prompts should yield to the browser');
+    assert.equal(chunks.length, 1, 'the first chunk is inserted before the first yield');
+    await pending;
+    assert.equal(chunks.join(''), prompt);
+    assert.ok(chunks.every((chunk) => chunk.length <= 16 * 1024));
+    assert.deepEqual(inputEvents, ['input']);
+  } finally {
+    global.document = previous.document;
+    global.window = previous.window;
+    global.InputEvent = previous.InputEvent;
+    global.HTMLTextAreaElement = previous.HTMLTextAreaElement;
+    global.HTMLInputElement = previous.HTMLInputElement;
+  }
+});
+
 test('the Send control is found by test id and never clicked while generation runs', () => {
   const composer = require('../src/userscript/src/chatgpt/composer');
 
@@ -1123,6 +1170,19 @@ test('composer command state stays ID-backed for skills and saved prompts', () =
   assert.deepEqual(removeSlashCommandToken('Please /code-review here', token), {
     text: 'Please here',
     cursor: 7,
+  });
+});
+
+test('slash-command lookup does not scan an unbounded pasted token', () => {
+  const { findSlashCommand } = require('../src/userscript/src/ui/composer-controls');
+  const longToken = `/${'x'.repeat(100_000)}`;
+  assert.equal(findSlashCommand(longToken, longToken.length), null);
+  assert.deepEqual(findSlashCommand('before /skill after', 13), {
+    start: 7,
+    end: 13,
+    token: '/skill',
+    query: 'skill',
+    cursor: 13,
   });
 });
 

@@ -11,6 +11,12 @@ const FILE_INPUT_SELECTORS = [
   'input[type="file"]',
 ];
 
+// execCommand is still the most compatible way to put text into ChatGPT's
+// contenteditable composer, but one very large command monopolizes the page's
+// main thread. Keep each native edit bounded and yield between edits so the
+// browser can paint and process input while a large task/follow-up is loaded.
+const PROMPT_INSERT_CHUNK_SIZE = 16 * 1024;
+
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -58,25 +64,55 @@ async function waitForComposer(timeoutMilliseconds = 15_000) {
 function setPrompt(prompt) {
   const composer = findComposer();
   if (!composer) throw new Error('Could not find the prompt composer. Reload the page and try again.');
+  const value = String(prompt ?? '');
   composer.focus();
   if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
     const prototype = composer instanceof HTMLTextAreaElement
       ? HTMLTextAreaElement.prototype
       : HTMLInputElement.prototype;
     // React tracks the last value it wrote, so the native setter is required.
-    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(composer, prompt);
+    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(composer, value);
     composer.dispatchEvent(new Event('input', { bubbles: true }));
     composer.dispatchEvent(new Event('change', { bubbles: true }));
     return composer;
   }
+
   const selection = window.getSelection();
   const range = document.createRange();
   range.selectNodeContents(composer);
   selection.removeAllRanges();
   selection.addRange(range);
-  document.execCommand('insertText', false, prompt);
-  composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
-  return composer;
+
+  const insertChunk = (chunk) => {
+    document.execCommand('insertText', false, chunk);
+  };
+  if (value.length <= PROMPT_INSERT_CHUNK_SIZE) {
+    insertChunk(value);
+    composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+    return composer;
+  }
+
+  return (async () => {
+    for (let offset = 0; offset < value.length;) {
+      let end = Math.min(offset + PROMPT_INSERT_CHUNK_SIZE, value.length);
+      // Do not split a UTF-16 surrogate pair across native edits. ChatGPT's
+      // editor normally handles Unicode as text, but separate insertions can
+      // otherwise turn an emoji at a chunk boundary into replacement glyphs.
+      if (end < value.length) {
+        const previousCodeUnit = value.charCodeAt(end - 1);
+        if (previousCodeUnit >= 0xd800 && previousCodeUnit <= 0xdbff) end -= 1;
+      }
+      if (end === offset) end = Math.min(offset + PROMPT_INSERT_CHUNK_SIZE + 1, value.length);
+      if (offset > 0) await delay(0);
+      insertChunk(value.slice(offset, end));
+      offset = end;
+    }
+    // execCommand emits input in current Chromium builds, but dispatching one
+    // final event keeps React-based composers that only observe synthetic input
+    // in sync across browsers and after a chunked insertion.
+    composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+    return composer;
+  })();
 }
 
 function findFileInput() {

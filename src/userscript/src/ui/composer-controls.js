@@ -1,5 +1,10 @@
 let activePopover = null;
 
+// Command names come from local skill and prompt ids. Once the token is this
+// long it cannot be a useful command, and continuing to scan an unbroken paste
+// would make every input event proportional to the whole draft.
+const MAX_SLASH_COMMAND_TOKEN_LENGTH = 512;
+
 function normalizeCommandName(value) {
   return String(value || '')
     .trim()
@@ -53,10 +58,16 @@ function findSlashCommand(text, cursor = String(text || '').length) {
   const value = String(text || '');
   const position = Math.max(0, Math.min(Number(cursor) || 0, value.length));
   let start = position;
-  while (start > 0 && !/\s/.test(value[start - 1])) start -= 1;
+  while (start > 0 && !/\s/.test(value[start - 1])) {
+    start -= 1;
+    if (position - start >= MAX_SLASH_COMMAND_TOKEN_LENGTH) return null;
+  }
 
   let end = position;
-  while (end < value.length && !/\s/.test(value[end])) end += 1;
+  while (end < value.length && !/\s/.test(value[end])) {
+    end += 1;
+    if (end - start > MAX_SLASH_COMMAND_TOKEN_LENGTH) return null;
+  }
 
   const token = value.slice(start, end);
   if (!token.startsWith('/')) return null;

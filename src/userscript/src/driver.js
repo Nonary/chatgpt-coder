@@ -155,7 +155,7 @@ class Driver {
 
     let verified;
     try {
-      composer.setPrompt(task.handoffPrompt);
+      await composer.setPrompt(task.handoffPrompt);
 
       this.report({ type: 'automation-progress', taskId: task.taskId, message: 'Attaching the task package…' });
       const zipName = packageFilename(task);
@@ -273,7 +273,7 @@ class Driver {
           };
         },
       });
-      composer.setPrompt(turn.resolvedPrompt || turn.prompt);
+      await composer.setPrompt(turn.resolvedPrompt || turn.prompt);
       const promptFiles = Array.isArray(turn.promptFiles) ? turn.promptFiles : [];
       for (const promptFile of promptFiles) {
         this.report({ type: 'automation-progress', taskId: task.taskId, message: `Attaching ${promptFile.name}…` });
@@ -364,7 +364,7 @@ class Driver {
     if (!await composer.waitForComposer()) {
       throw new Error('Not signed in. Sign in and try again.');
     }
-    composer.setPrompt(request.prompt);
+    await composer.setPrompt(request.prompt);
     await composer.clickSend({
       isConversationOpen: () => Boolean(conversationIdFromRouteUrl(location.href)),
     });
