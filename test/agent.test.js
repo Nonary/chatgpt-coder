@@ -901,7 +901,7 @@ test('install assets carry the token and describe both injection routes', async 
   const source = await bookmarklet.text();
   assert.ok(source.includes(agent.config.token), 'the bookmarklet carries the agent token');
   assert.match(source, /window\.open\(/);
-  assert.match(source, /createObjectURL/);
+  assert.match(source, /textContent = source/);
   assert.doesNotMatch(source, /\beval\b/);
 
   const bridge = await fetch(`http://127.0.0.1:${agent.port}/bridge`);
@@ -985,7 +985,7 @@ test('the install page embeds the bootstrap instead of loading it from the agent
   assert.doesNotMatch(source, /\.src = ['"]?\s*origin/);
   assert.doesNotMatch(source, /\beval\b/);
   assert.match(source, /window\.open\(/);
-  assert.match(source, /createObjectURL\(new Blob\(/);
+  assert.match(source, /textContent = source/);
   assert.ok(source.includes(agent.config.token));
 });
 

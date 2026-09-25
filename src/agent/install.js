@@ -48,12 +48,12 @@ function bookmarkletSource(config) {
   //
   //   connect-src   has no loopback entry  -> fetch/WebSocket to the agent is blocked
   //   script-src    has no 'unsafe-eval'   -> eval() of downloaded source is blocked
-  //   script-src-elem lists blob:          -> a Blob script element IS allowed
+  //   script-src-elem requires a nonce      -> inline code with ChatGPT's nonce runs
   //
   // Popups are governed by none of those (COOP is same-origin-allow-popups, so the
   // opener link survives) and postMessage is not a CSP-controlled channel. So the
   // bookmarklet opens the agent's bridge window, receives the bundle through
-  // postMessage, and injects it as a blob: script.
+  // postMessage, and injects it as a nonce-authorized inline script.
   return `(async () => {
   const origin = ${JSON.stringify(origin)};
   const token = ${JSON.stringify(token)};
@@ -72,8 +72,7 @@ function bookmarkletSource(config) {
       element.nonce = nonce;
       element.setAttribute('nonce', nonce);
     }
-    element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-    element.addEventListener('load', () => URL.revokeObjectURL(element.src));
+    element.textContent = source;
     element.addEventListener('error', () => {
       alert('chatgpt.com blocked the Patchwork script (script-src). Install the userscript with Tampermonkey instead: ' + origin + '/install');
     });

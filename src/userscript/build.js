@@ -145,11 +145,9 @@ function loader() {
   'use strict';
   var token = '__PATCHWORK_TOKEN__';
   var origin = '__PATCHWORK_ORIGIN__';
-  // Tampermonkey and Violentmonkey may evaluate this loader in an isolated
-  // realm. A blob URL created there is not reliably executable by a page
-  // <script> element, so always create it with ChatGPT's page-realm APIs.
-  var URL = window.URL;
-  var Blob = window.Blob;
+  // ChatGPT's CSP currently rejects blob: script URLs. Reuse the page nonce
+  // on inline scripts instead; nonce-authorized inline scripts run in the
+  // page realm without requiring blob: in script-src-elem.
   function pageNonce() {
     var node = typeof document.querySelector === 'function'
       ? document.querySelector('script[nonce]')
@@ -164,39 +162,34 @@ function loader() {
     }
     return element;
   }
-  var socketBootstrapUrl = URL.createObjectURL(new Blob([${JSON.stringify(webSocketBootstrap())}], { type: 'text/javascript' }));
-  var socketBootstrap = document.createElement('script');
-  prepareScript(socketBootstrap);
-  socketBootstrap.src = socketBootstrapUrl;
-  socketBootstrap.async = false;
-  socketBootstrap.addEventListener('load', function () {
-    URL.revokeObjectURL(socketBootstrapUrl);
-    socketBootstrap.remove();
-  });
-  socketBootstrap.addEventListener('error', function () {
-    URL.revokeObjectURL(socketBootstrapUrl);
-    socketBootstrap.remove();
-  });
+  function appendInlineScript(source, root, onError) {
+    var element = document.createElement('script');
+    prepareScript(element);
+    element.async = false;
+    element.textContent = source;
+    if (typeof onError === 'function') element.addEventListener('error', onError, { once: true });
+    root.append(element);
+    return element;
+  }
   var socketRoot = document.documentElement || document.head || document.body;
-  if (socketRoot) socketRoot.append(socketBootstrap);
+  if (socketRoot) appendInlineScript(${JSON.stringify(webSocketBootstrap())}, socketRoot);
   else {
     document.addEventListener('readystatechange', function installSocketBootstrap() {
       var root = document.documentElement || document.head || document.body;
-      if (root) root.append(socketBootstrap);
+      if (root) appendInlineScript(${JSON.stringify(webSocketBootstrap())}, root);
     }, { once: true });
   }
 
   function injectRuntime(source) {
     window.__patchworkBootstrap = { origin: origin, token: token, transport: 'gm' };
-    var element = document.createElement('script');
-    prepareScript(element);
-    element.src = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-    element.addEventListener('load', function () { URL.revokeObjectURL(element.src); });
-    element.addEventListener('error', function () {
-      URL.revokeObjectURL(element.src);
+    var root = document.documentElement || document.head || document.body;
+    if (!root) {
+      console.error('[patchwork] ChatGPT did not provide a script injection root.');
+      return;
+    }
+    appendInlineScript(source, root, function () {
       console.error('[patchwork] ChatGPT blocked the local Patchwork runtime.');
     });
-    document.documentElement.append(element);
   }
 
   var request = typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'
