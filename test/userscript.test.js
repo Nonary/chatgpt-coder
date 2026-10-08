@@ -1725,6 +1725,12 @@ test('bookmarklets in later ChatGPT tabs reuse the existing popup without openin
 
   const owner = fakeTab();
   await runBookmarklet(owner, 'owner');
+  owner.window.__patchworkPanel = { app: { transport: {
+    request: async (request) => {
+      assert.equal(request.path, '/patchwork.runtime.js');
+      return { status: 200, text: 'void 1;' };
+    },
+  } } };
   const follower = fakeTab();
   await runBookmarklet(follower, 'follower');
 
@@ -1733,6 +1739,7 @@ test('bookmarklets in later ChatGPT tabs reuse the existing popup without openin
   assert.equal(follower.window.__patchworkBootstrap.transport, 'tab-relay');
   assert.equal(owner.appended.length, 1);
   assert.equal(follower.appended.length, 1);
+  assert.equal(follower.appended[0].textContent, 'void 1;', 'follower loads the current runtime, not its owner’s stale copy');
   assert.deepEqual([...owner.alerts, ...follower.alerts], []);
 });
 

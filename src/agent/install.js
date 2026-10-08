@@ -103,7 +103,7 @@ function bookmarkletSource(config) {
     tabChannel.postMessage({ type: 'discover', discoveryId, token });
   });
 
-  const useOwner = (owner) => {
+  const useOwner = async (owner) => {
     const relayRequest = (request) => new Promise((resolve, reject) => {
       const requestId = crypto.randomUUID();
       const timer = setTimeout(() => {
@@ -123,12 +123,20 @@ function bookmarkletSource(config) {
         type: 'request', requestId, ownerId: owner.ownerId, token, request,
       });
     });
-    window.__patchworkBootstrap = { origin, token, transport: 'tab-relay', relayRequest };
-    inject(owner.source);
+    try {
+      // The owning tab may have booted before the agent was rebuilt. Fetch the
+      // current runtime through its bridge instead of copying its old bundle.
+      const response = await relayRequest({ path: '/patchwork.runtime.js' });
+      if (response.status !== 200 || !response.text) throw new Error('The local agent did not return the current runtime.');
+      window.__patchworkBootstrap = { origin, token, transport: 'tab-relay', relayRequest };
+      inject(response.text);
+    } catch (error) {
+      alert('Patchwork could not load the current runtime.\\n\\n' + error.message);
+    }
   };
 
   let existingOwner = await findOwner();
-  if (existingOwner) { useOwner(existingOwner); return; }
+  if (existingOwner) { await useOwner(existingOwner); return; }
 
   // Close the small race where two tabs launch the bookmarklet together. Web
   // Locks elects one popup owner; the loser waits for that owner to announce
@@ -144,7 +152,7 @@ function bookmarkletSource(config) {
     const ownsLock = await lockReady;
     if (!ownsLock) {
       existingOwner = await findOwner(1200);
-      if (existingOwner) { useOwner(existingOwner); return; }
+      if (existingOwner) { await useOwner(existingOwner); return; }
     }
   }
 

@@ -18,6 +18,7 @@ const MENU_HEIGHT = 412;
 const MENU_WIDTH = 260;
 
 const NATIVE_PICKER_SELECTOR = [
+  '[aria-label="Select ChatGPT model" i]',
   '[aria-label^="Model selector" i]',
   '[aria-label*="current model" i]',
   '[style*="--vt-thread-model-switcher"]',

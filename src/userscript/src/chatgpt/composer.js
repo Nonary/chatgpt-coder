@@ -44,8 +44,14 @@ function deepQuery(selector, root = document) {
 }
 
 function findComposer() {
+  const belongsToDock = (element) => {
+    for (let current = element; current; current = current.parentElement || current.host || current.getRootNode?.()?.host) {
+      if (current.id === 'patchwork-root') return true;
+    }
+    return false;
+  };
   for (const selector of COMPOSER_SELECTORS) {
-    const element = deepQuery(selector);
+    const element = deepQueryAll(selector).find((candidate) => !belongsToDock(candidate));
     if (element) return element;
   }
   return null;
